@@ -1,0 +1,546 @@
+const std = @import("std");
+
+pub const IPv4MinimumSize = 20;
+pub const IPv4MaximumHeaderSize = 60;
+pub const IPv4AddressSize = 4;
+pub const IPv4Version = 4;
+
+pub const IPv4TotalLenOffset = 2;
+const idOffset = 4;
+const flagsFOOffset = 6;
+const ttlOffset = 8;
+const protocolOffset = 9;
+const checksumOffset = 10;
+const srcAddrOffset = 12;
+const dstAddrOffset = 16;
+
+pub const IPv4 = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) IPv4 {
+        return .{ .data = data };
+    }
+
+    pub fn headerLength(self: IPv4) u8 {
+        return (self.data[0] & 0xf) * 4;
+    }
+
+    pub fn totalLength(self: IPv4) u16 {
+        return std.mem.readIntBig(u16, self.data[IPv4TotalLenOffset..][0..2]);
+    }
+
+    pub fn protocol(self: IPv4) u8 {
+        return self.data[protocolOffset];
+    }
+
+    pub fn checksum(self: IPv4) u16 {
+        return std.mem.readIntBig(u16, self.data[checksumOffset..][0..2]);
+    }
+
+    pub fn sourceAddress(self: IPv4) [4]u8 {
+        var addr: [4]u8 = undefined;
+        @memcpy(&addr, self.data[srcAddrOffset..][0..4]);
+        return addr;
+    }
+
+    pub fn destinationAddress(self: IPv4) [4]u8 {
+        var addr: [4]u8 = undefined;
+        @memcpy(&addr, self.data[dstAddrOffset..][0..4]);
+        return addr;
+    }
+
+    pub fn setChecksum(self: IPv4, c: u16) void {
+        std.mem.writeIntBig(u16, self.data[checksumOffset..][0..2], c);
+    }
+
+    pub fn calculateChecksum(self: IPv4) u16 {
+        return ~internetChecksum(self.data[0..self.headerLength()], 0);
+    }
+
+    pub fn flagsFragmentOffset(self: IPv4) u16 {
+        return std.mem.readIntBig(u16, self.data[flagsFOOffset..][0..2]);
+    }
+
+    pub fn moreFragments(self: IPv4) bool {
+        return (self.flagsFragmentOffset() & 0x2000) != 0;
+    }
+
+    pub fn fragmentOffset(self: IPv4) u16 {
+        return (self.flagsFragmentOffset() & 0x1fff) * 8;
+    }
+
+    pub fn id(self: IPv4) u16 {
+        return std.mem.readIntBig(u16, self.data[idOffset..][0..2]);
+    }
+
+    pub fn isValid(self: IPv4, pkt_size: usize) bool {
+        if (self.data.len < IPv4MinimumSize) return false;
+        const hlen = self.headerLength();
+        const tlen = self.totalLength();
+        if (hlen < IPv4MinimumSize or hlen > tlen or tlen > pkt_size) return false;
+        if ((self.data[0] >> 4) != IPv4Version) return false;
+        return true;
+    }
+};
+
+pub const TCPMinimumSize = 20;
+pub const TCPSrcPortOffset = 0;
+pub const TCPDstPortOffset = 2;
+pub const TCPSeqNumOffset = 4;
+pub const TCPAckNumOffset = 8;
+pub const TCPDataOffset = 12;
+pub const TCPFlagsOffset = 13;
+pub const TCPWinSizeOffset = 14;
+pub const TCPChecksumOffset = 16;
+
+pub const TCPFlagFin = 0x01;
+pub const TCPFlagSyn = 0x02;
+pub const TCPFlagRst = 0x04;
+pub const TCPFlagPsh = 0x08;
+pub const TCPFlagAck = 0x10;
+pub const TCPFlagUrg = 0x20;
+
+pub const TCP = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) TCP {
+        return .{ .data = data };
+    }
+
+    pub fn sourcePort(self: TCP) u16 {
+        return std.mem.readIntBig(u16, self.data[TCPSrcPortOffset..][0..2]);
+    }
+
+    pub fn destinationPort(self: TCP) u16 {
+        return std.mem.readIntBig(u16, self.data[TCPDstPortOffset..][0..2]);
+    }
+
+    pub fn sequenceNumber(self: TCP) u32 {
+        return std.mem.readIntBig(u32, self.data[TCPSeqNumOffset..][0..4]);
+    }
+
+    pub fn ackNumber(self: TCP) u32 {
+        return std.mem.readIntBig(u32, self.data[TCPAckNumOffset..][0..4]);
+    }
+
+    pub fn dataOffset(self: TCP) u8 {
+        return (self.data[TCPDataOffset] >> 4) * 4;
+    }
+
+    pub fn flags(self: TCP) u8 {
+        return self.data[TCPFlagsOffset];
+    }
+
+    pub fn windowSize(self: TCP) u16 {
+        return std.mem.readIntBig(u16, self.data[TCPWinSizeOffset..][0..2]);
+    }
+
+    pub fn checksum(self: TCP) u16 {
+        return std.mem.readIntBig(u16, self.data[TCPChecksumOffset..][0..2]);
+    }
+
+    pub fn encode(self: TCP, src: u16, dst: u16, seq: u32, ack: u32, fl: u8, win: u16) void {
+        std.mem.writeIntBig(u16, self.data[TCPSrcPortOffset..][0..2], src);
+        std.mem.writeIntBig(u16, self.data[TCPDstPortOffset..][0..2], dst);
+        std.mem.writeIntBig(u32, self.data[TCPSeqNumOffset..][0..4], seq);
+        std.mem.writeIntBig(u32, self.data[TCPAckNumOffset..][0..4], ack);
+        self.data[TCPDataOffset] = (5 << 4); // Default 20 bytes
+        self.data[TCPFlagsOffset] = fl;
+        std.mem.writeIntBig(u16, self.data[TCPWinSizeOffset..][0..2], win);
+    }
+};
+
+/// internetChecksum calculates the internet checksum of the given data.
+pub fn internetChecksum(data: []const u8, initial: u16) u16 {
+    var sum: u32 = initial;
+    var i: usize = 0;
+    while (i + 1 < data.len) : (i += 2) {
+        sum += std.mem.readIntBig(u16, data[i..][0..2]);
+    }
+    if (i < data.len) {
+        sum += @as(u32, data[i]) << 8;
+    }
+    while (sum > 0xffff) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return @as(u16, @intCast(sum));
+}
+
+pub const EthernetMinimumSize = 14;
+pub const EthernetAddressSize = 6;
+
+const dstMAC = 0;
+const srcMAC = 6;
+const ethType = 12;
+
+pub const Ethernet = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) Ethernet {
+        return .{ .data = data };
+    }
+
+    pub fn sourceAddress(self: Ethernet) [6]u8 {
+        var addr: [6]u8 = undefined;
+        @memcpy(&addr, self.data[srcMAC..][0..6]);
+        return addr;
+    }
+
+    pub fn destinationAddress(self: Ethernet) [6]u8 {
+        var addr: [6]u8 = undefined;
+        @memcpy(&addr, self.data[dstMAC..][0..6]);
+        return addr;
+    }
+
+    pub fn etherType(self: Ethernet) u16 {
+        return std.mem.readIntBig(u16, self.data[ethType..][0..2]);
+    }
+
+    pub fn encode(self: Ethernet, src: [6]u8, dst: [6]u8, eth_type: u16) void {
+        @memcpy(self.data[srcMAC..][0..6], &src);
+        @memcpy(self.data[dstMAC..][0..6], &dst);
+        std.mem.writeIntBig(u16, self.data[ethType..][0..2], eth_type);
+    }
+};
+
+pub const ARPProtocolNumber = 0x0806;
+pub const ARPSize = 28;
+
+pub const ARP = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) ARP {
+        return .{ .data = data };
+    }
+
+    pub fn hardwareAddressSpace(self: ARP) u16 {
+        return std.mem.readIntBig(u16, self.data[0..2]);
+    }
+
+    pub fn protocolAddressSpace(self: ARP) u16 {
+        return std.mem.readIntBig(u16, self.data[2..4]);
+    }
+
+    pub fn op(self: ARP) u16 {
+        return std.mem.readIntBig(u16, self.data[6..8]);
+    }
+
+    pub fn hardwareAddressSender(self: ARP) [6]u8 {
+        var addr: [6]u8 = undefined;
+        @memcpy(&addr, self.data[8..14]);
+        return addr;
+    }
+
+    pub fn protocolAddressSender(self: ARP) [4]u8 {
+        var addr: [4]u8 = undefined;
+        @memcpy(&addr, self.data[14..18]);
+        return addr;
+    }
+
+    pub fn hardwareAddressTarget(self: ARP) [6]u8 {
+        var addr: [6]u8 = undefined;
+        @memcpy(&addr, self.data[18..24]);
+        return addr;
+    }
+
+    pub fn protocolAddressTarget(self: ARP) [4]u8 {
+        var addr: [4]u8 = undefined;
+        @memcpy(&addr, self.data[24..28]);
+        return addr;
+    }
+
+    pub fn setIPv4OverEthernet(self: ARP) void {
+        std.mem.writeIntBig(u16, self.data[0..2], 1); // htypeEthernet
+        std.mem.writeIntBig(u16, self.data[2..4], 0x0800); // IPv4ProtocolNumber
+        self.data[4] = 6; // macSize
+        self.data[5] = 4; // IPv4AddressSize
+    }
+
+    pub fn setOp(self: ARP, operation: u16) void {
+        std.mem.writeIntBig(u16, self.data[6..8], operation);
+    }
+};
+
+pub const UDPMinimumSize = 8;
+
+pub const UDP = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) UDP {
+        return .{ .data = data };
+    }
+
+    pub fn sourcePort(self: UDP) u16 {
+        return std.mem.readIntBig(u16, self.data[0..2]);
+    }
+
+    pub fn destinationPort(self: UDP) u16 {
+        return std.mem.readIntBig(u16, self.data[2..4]);
+    }
+
+    pub fn length(self: UDP) u16 {
+        return std.mem.readIntBig(u16, self.data[4..6]);
+    }
+
+    pub fn checksum(self: UDP) u16 {
+        return std.mem.readIntBig(u16, self.data[6..8]);
+    }
+};
+
+pub const ICMPv4MinimumSize = 8;
+pub const ICMPv4EchoType = 8;
+pub const ICMPv4EchoReplyType = 0;
+
+pub const ICMPv4 = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) ICMPv4 {
+        return .{ .data = data };
+    }
+
+    pub fn @"type"(self: ICMPv4) u8 {
+        return self.data[0];
+    }
+
+    pub fn code(self: ICMPv4) u8 {
+        return self.data[1];
+    }
+
+    pub fn checksum(self: ICMPv4) u16 {
+        return std.mem.readIntBig(u16, self.data[2..4]);
+    }
+
+    pub fn setChecksum(self: ICMPv4, c: u16) void {
+        std.mem.writeIntBig(u16, self.data[2..4], c);
+    }
+
+    pub fn calculateChecksum(self: ICMPv4, payload: []const u8) u16 {
+        var c = internetChecksum(self.data[0..ICMPv4MinimumSize], 0);
+        c = internetChecksum(payload, c);
+        return ~c;
+    }
+};
+
+pub const IPv6MinimumSize = 40;
+pub const IPv6AddressSize = 16;
+pub const IPv6Version = 6;
+
+pub const IPv6PayloadLenOffset = 4;
+pub const IPv6NextHeaderOffset = 6;
+pub const IPv6HopLimitOffset = 7;
+pub const IPv6SrcAddrOffset = 8;
+pub const IPv6DstAddrOffset = 24;
+
+pub const IPv6 = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) IPv6 {
+        return .{ .data = data };
+    }
+
+    pub fn trafficClass(self: IPv6) u8 {
+        const v = std.mem.readIntBig(u32, self.data[0..4]);
+        return @as(u8, @intCast((v >> 20) & 0xff));
+    }
+
+    pub fn flowLabel(self: IPv6) u32 {
+        const v = std.mem.readIntBig(u32, self.data[0..4]);
+        return v & 0xfffff;
+    }
+
+    pub fn payloadLength(self: IPv6) u16 {
+        return std.mem.readIntBig(u16, self.data[IPv6PayloadLenOffset..][0..2]);
+    }
+
+    pub fn nextHeader(self: IPv6) u8 {
+        return self.data[IPv6NextHeaderOffset];
+    }
+
+    pub fn hopLimit(self: IPv6) u8 {
+        return self.data[IPv6HopLimitOffset];
+    }
+
+    pub fn sourceAddress(self: IPv6) [16]u8 {
+        var addr: [16]u8 = undefined;
+        @memcpy(&addr, self.data[IPv6SrcAddrOffset..][0..16]);
+        return addr;
+    }
+
+    pub fn destinationAddress(self: IPv6) [16]u8 {
+        var addr: [16]u8 = undefined;
+        @memcpy(&addr, self.data[IPv6DstAddrOffset..][0..16]);
+        return addr;
+    }
+
+    pub fn encode(self: IPv6, src: [16]u8, dst: [16]u8, next_header: u8, payload_len: u16) void {
+        std.mem.writeIntBig(u32, self.data[0..4], 0x60000000); // Ver 6, TC 0, FL 0
+        std.mem.writeIntBig(u16, self.data[IPv6PayloadLenOffset..][0..2], payload_len);
+        self.data[IPv6NextHeaderOffset] = next_header;
+        self.data[IPv6HopLimitOffset] = 64; // Default hop limit
+        @memcpy(self.data[IPv6SrcAddrOffset..][0..16], &src);
+        @memcpy(self.data[IPv6DstAddrOffset..][0..16], &dst);
+    }
+
+    pub fn isValid(self: IPv6, pkt_size: usize) bool {
+        if (self.data.len < IPv6MinimumSize) return false;
+        if ((self.data[0] >> 4) != IPv6Version) return false;
+        const plen = self.payloadLength();
+        if (pkt_size < IPv6MinimumSize + plen) return false;
+        return true;
+    }
+};
+
+pub const ICMPv6MinimumSize = 4;
+pub const ICMPv6EchoRequestType = 128;
+pub const ICMPv6EchoReplyType = 129;
+
+pub const ICMPv6 = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) ICMPv6 {
+        return .{ .data = data };
+    }
+
+    pub fn @"type"(self: ICMPv6) u8 {
+        return self.data[0];
+    }
+
+    pub fn code(self: ICMPv6) u8 {
+        return self.data[1];
+    }
+
+    pub fn checksum(self: ICMPv6) u16 {
+        return std.mem.readIntBig(u16, self.data[2..4]);
+    }
+
+    pub fn setChecksum(self: ICMPv6, c: u16) void {
+        std.mem.writeIntBig(u16, self.data[2..4], c);
+    }
+
+    // ICMPv6 checksum includes a pseudo-header
+    pub fn calculateChecksum(self: ICMPv6, src: [16]u8, dst: [16]u8, payload: []const u8) u16 {
+        var sum: u32 = 0;
+        
+        // Pseudo-header
+        var i: usize = 0;
+        while (i < 16) : (i += 2) {
+            sum += std.mem.readIntBig(u16, src[i..][0..2]);
+        }
+        i = 0;
+        while (i < 16) : (i += 2) {
+            sum += std.mem.readIntBig(u16, dst[i..][0..2]);
+        }
+        
+        const len = ICMPv6MinimumSize + payload.len;
+        sum += @as(u32, @intCast(len >> 16)); // Upper 16 bits of length (unlikely to be set for typical packets)
+        sum += @as(u32, @intCast(len & 0xffff));
+        sum += 58; // Next Header (ICMPv6)
+
+        // ICMPv6 Header + Payload
+        sum += internetChecksum(self.data[0..ICMPv6MinimumSize], 0);
+        if (sum > 0xffff) { sum = (sum & 0xffff) + (sum >> 16); }
+        
+        sum += internetChecksum(payload, 0);
+        while (sum > 0xffff) {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        
+        return ~@as(u16, @intCast(sum));
+    }
+};
+
+test "IPv6 header" {
+    var data = [_]u8{0} ** 40;
+    const ipv6 = IPv6.init(&data);
+    const src = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const dst = [_]u8{ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
+    
+    ipv6.encode(src, dst, 6, 100); // TCP (6), payload 100
+
+    try std.testing.expectEqual(@as(u8, 0), ipv6.trafficClass());
+    try std.testing.expectEqual(@as(u32, 0), ipv6.flowLabel());
+    try std.testing.expectEqual(@as(u16, 100), ipv6.payloadLength());
+    try std.testing.expectEqual(@as(u8, 6), ipv6.nextHeader());
+    try std.testing.expectEqual(@as(u8, 64), ipv6.hopLimit());
+    try std.testing.expectEqualStrings(&src, &ipv6.sourceAddress());
+    try std.testing.expectEqualStrings(&dst, &ipv6.destinationAddress());
+    try std.testing.expect(ipv6.isValid(140));
+}
+
+test "IPv4 header" {
+    var data = [_]u8{0} ** 20;
+    data[0] = 0x45; // Version 4, IHL 5 (20 bytes)
+    std.mem.writeIntBig(u16, data[2..4], 100); // Total length
+    data[9] = 6; // TCP
+    @memcpy(data[12..16], &[_]u8{ 192, 168, 1, 1 });
+    @memcpy(data[16..20], &[_]u8{ 192, 168, 1, 2 });
+
+    const ip = IPv4.init(&data);
+    try std.testing.expectEqual(@as(u8, 20), ip.headerLength());
+    try std.testing.expectEqual(@as(u16, 100), ip.totalLength());
+    try std.testing.expectEqual(@as(u8, 6), ip.protocol());
+    try std.testing.expectEqualStrings(&[_]u8{ 192, 168, 1, 1 }, &ip.sourceAddress());
+    try std.testing.expect(ip.isValid(100));
+}
+
+test "TCP header" {
+    var data = [_]u8{0} ** 20;
+    std.mem.writeIntBig(u16, data[0..2], 1234); // Src port
+    std.mem.writeIntBig(u16, data[2..4], 80);   // Dst port
+    std.mem.writeIntBig(u32, data[4..8], 0x11223344); // Seq
+    data[12] = 0x50; // Data offset 5 (20 bytes)
+    data[13] = 0x02; // SYN flag
+
+    const tcp = TCP.init(&data);
+    try std.testing.expectEqual(@as(u16, 1234), tcp.sourcePort());
+    try std.testing.expectEqual(@as(u16, 80), tcp.destinationPort());
+    try std.testing.expectEqual(@as(u32, 0x11223344), tcp.sequenceNumber());
+    try std.testing.expectEqual(@as(u8, 20), tcp.dataOffset());
+    try std.testing.expectEqual(@as(u8, 0x02), tcp.flags());
+}
+
+test "Ethernet header" {
+    var data = [_]u8{0} ** 14;
+    const eth = Ethernet.init(&data);
+    const src = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const dst = [_]u8{ 7, 8, 9, 10, 11, 12 };
+    eth.encode(src, dst, 0x0800);
+
+    try std.testing.expectEqualStrings(&src, &eth.sourceAddress());
+    try std.testing.expectEqualStrings(&dst, &eth.destinationAddress());
+    try std.testing.expectEqual(@as(u16, 0x0800), eth.etherType());
+}
+
+test "ARP header" {
+    var data = [_]u8{0} ** 28;
+    const arp = ARP.init(&data);
+    arp.setIPv4OverEthernet();
+    arp.setOp(1); // Request
+
+    try std.testing.expectEqual(@as(u16, 1), arp.hardwareAddressSpace());
+    try std.testing.expectEqual(@as(u16, 0x0800), arp.protocolAddressSpace());
+    try std.testing.expectEqual(@as(u16, 1), arp.op());
+}
+
+test "UDP header" {
+    var data = [_]u8{0} ** 8;
+    std.mem.writeIntBig(u16, data[0..2], 1234);
+    std.mem.writeIntBig(u16, data[2..4], 5678);
+    std.mem.writeIntBig(u16, data[4..6], 20);
+    std.mem.writeIntBig(u16, data[6..8], 0xabcd);
+
+    const udp = UDP.init(&data);
+    try std.testing.expectEqual(@as(u16, 1234), udp.sourcePort());
+    try std.testing.expectEqual(@as(u16, 5678), udp.destinationPort());
+    try std.testing.expectEqual(@as(u16, 20), udp.length());
+    try std.testing.expectEqual(@as(u16, 0xabcd), udp.checksum());
+}
+
+test "Checksum calculation" {
+    const data = [_]u8{ 0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xac, 0x10, 0x0a, 0x63, 0xac, 0x10, 0x0a, 0x0c };
+    // The above is an IPv4 header with zero checksum.
+    // Let's calculate its checksum.
+    const c = internetChecksum(&data, 0);
+    const expected: u16 = 0xb1e6; // Precalculated for this header
+    try std.testing.expectEqual(expected, ~c);
+}
