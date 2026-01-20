@@ -162,15 +162,15 @@ pub const Prependable = struct {
 
 test "VectorisedView basic" {
     const allocator = std.testing.allocator;
-    var v1 = try allocator.alloc(u8, 5);
+    const v1 = try allocator.alloc(u8, 5);
     defer allocator.free(v1);
-    @memcpy(v1, "hello");
+    @memcpy(@constCast(v1), "hello");
 
-    var v2 = try allocator.alloc(u8, 5);
+    const v2 = try allocator.alloc(u8, 5);
     defer allocator.free(v2);
-    @memcpy(v2, "world");
+    @memcpy(@constCast(v2), "world");
 
-    var views = try allocator.alloc(View, 2);
+    const views = try allocator.alloc(View, 2);
     defer allocator.free(views);
     views[0] = v1;
     views[1] = v2;

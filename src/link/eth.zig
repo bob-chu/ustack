@@ -20,16 +20,18 @@ pub const EthernetEndpoint = struct {
     pub fn linkEndpoint(self: *EthernetEndpoint) stack.LinkEndpoint {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .writePacket = writePacket,
-                .attach = attach,
-                .linkAddress = linkAddress,
-                .mtu = mtu,
-                .setMTU = setMTU,
-                .capabilities = capabilities,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.LinkEndpoint.VTable{
+        .writePacket = writePacket,
+        .attach = attach,
+        .linkAddress = linkAddress,
+        .mtu = mtu,
+        .setMTU = setMTU,
+        .capabilities = capabilities,
+    };
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));

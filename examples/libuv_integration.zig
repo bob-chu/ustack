@@ -2,10 +2,11 @@ const std = @import("std");
 // In a real project, import libuv C headers
 // const uv = @cImport(@cInclude("uv.h"));
 
-// Pseudo-code implementation of LibUV integration
 const TunTapEndpoint = @import("tun_tap_adapter.zig").TunTapEndpoint;
-const stack = @import("../src/stack.zig");
-const tcpip = @import("../src/tcpip.zig");
+const ustack = @import("ustack");
+const stack = ustack.stack;
+const tcpip = ustack.tcpip;
+
 
 // Mocking UV structs for syntax checking
 const uv_loop_t = opaque{};

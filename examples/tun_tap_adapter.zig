@@ -1,9 +1,10 @@
 const std = @import("std");
 const os = std.os;
-const stack = @import("../src/stack.zig");
-const tcpip = @import("../src/tcpip.zig");
-const header = @import("../src/header.zig");
-const buffer = @import("../src/buffer.zig");
+const ustack = @import("ustack");
+const stack = ustack.stack;
+const tcpip = ustack.tcpip;
+const header = ustack.header;
+const buffer = ustack.buffer;
 
 // Simple Linux Tun/Tap wrapper
 pub const TunTapEndpoint = struct {
@@ -16,6 +17,7 @@ pub const TunTapEndpoint = struct {
     wrapped_dispatcher: stack.NetworkDispatcher = undefined,
 
     pub fn init(dev_name: []const u8) !TunTapEndpoint {
+        _ = dev_name;
         const fd = try std.os.open("/dev/net/tun", std.os.O.RDWR, 0);
         
         // Setup TUN/TAP interface (simplified, usually requires ioctl)

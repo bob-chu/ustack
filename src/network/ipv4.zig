@@ -15,14 +15,16 @@ pub const IPv4Protocol = struct {
     pub fn protocol(self: *IPv4Protocol) stack.NetworkProtocol {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .number = number,
-                .newEndpoint = newEndpoint,
-                .linkAddressRequest = linkAddressRequest,
-                .parseAddresses = parseAddresses,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.NetworkProtocol.VTable{
+        .number = number,
+        .newEndpoint = newEndpoint,
+        .linkAddressRequest = linkAddressRequest,
+        .parseAddresses = parseAddresses,
+    };
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;
@@ -85,14 +87,6 @@ const ReassemblyContext = struct {
     }
     
     pub fn deinit(self: *ReassemblyContext) void {
-        for (self.fragments.items) |f| {
-            // f.data needs deinit? PacketBuffer usually refers to external memory in current impl, 
-            // except if cloned. If we store cloned packets, we need to free.
-            // Let's assume we clone data into fragments.
-            // But PacketBuffer structure is a bit weak on ownership.
-            // Let's rely on allocator for now.
-            _ = f;
-        }
         self.fragments.deinit();
     }
 };
@@ -108,13 +102,15 @@ pub const IPv4Endpoint = struct {
     pub fn networkEndpoint(self: *IPv4Endpoint) stack.NetworkEndpoint {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .writePacket = writePacket,
-                .handlePacket = handlePacket,
-                .mtu = mtu,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.NetworkEndpoint.VTable{
+        .writePacket = writePacket,
+        .handlePacket = handlePacket,
+        .mtu = mtu,
+    };
 
     fn mtu(ptr: *anyopaque) u32 {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
@@ -124,11 +120,8 @@ pub const IPv4Endpoint = struct {
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
         
-        // Check if fragmentation is needed
         const max_payload = self.nic.linkEP.mtu() - header.IPv4MinimumSize;
         if (pkt.data.size > max_payload) {
-            // Need fragmentation
-            // Simplified: return MessageTooLong for now until full implementation
             return tcpip.Error.MessageTooLong; 
         }
 
@@ -136,7 +129,6 @@ pub const IPv4Endpoint = struct {
         const ip_header = mut_pkt.header.prepend(header.IPv4MinimumSize) orelse return tcpip.Error.NoBufferSpace;
         const h = header.IPv4.init(ip_header);
         
-        // Simple encoding for now
         @memset(ip_header, 0);
         ip_header[0] = 0x45; // Version 4, IHL 5
         std.mem.writeIntBig(u16, ip_header[2..4], @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size)));
@@ -159,13 +151,12 @@ pub const IPv4Endpoint = struct {
             return;
         }
         
-        if (h.calculateChecksum() != 0) {
-            // Invalid checksum
+        const hlen = h.headerLength();
+        if (header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0)) != 0) {
             return;
         }
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {
-            // Handle fragmentation
             const key = ReassemblyKey{
                 .src = .{ .v4 = h.sourceAddress() },
                 .dst = .{ .v4 = h.destinationAddress() },
@@ -181,14 +172,10 @@ pub const IPv4Endpoint = struct {
             }
             const ctx = ctx_ptr.?;
             
-            // Trim header from packet to get payload
-            const hlen = h.headerLength();
             var payload_pkt = pkt;
             payload_pkt.data.trimFront(hlen);
-            // Must clone data because pkt is transient
             const cloned_data = payload_pkt.data.clone(self.nic.stack.allocator) catch return;
             
-            // We need a proper PacketBuffer to store
             const fragment = Fragment{
                 .data = .{ .data = cloned_data, .header = undefined },
                 .offset = h.fragmentOffset(),
@@ -198,12 +185,6 @@ pub const IPv4Endpoint = struct {
                 .dst = key.dst,
             };
             ctx.fragments.append(fragment) catch return;
-            
-            // Check if reassembly is complete
-            // Sort by offset?
-            // Simplified check: do we have all bytes?
-            // Needs sorting or tracking holes.
-            // Let's implement a simple "isComplete" check by sorting
             
             const Sort = struct {
                 fn less(context: void, a: Fragment, b: Fragment) bool {
@@ -227,69 +208,38 @@ pub const IPv4Endpoint = struct {
             }
             
             if (complete and has_last) {
-                // Reassemble!
                 var total_size: usize = 0;
                 for (ctx.fragments.items) |f| total_size += f.data.data.size;
                 
                 const reassembled_buf = self.nic.stack.allocator.alloc(u8, total_size) catch return;
                 var offset: usize = 0;
                 for (ctx.fragments.items) |f| {
-                    const v = f.data.data.toView(self.nic.stack.allocator) catch return; // Allocates view
+                    const v = f.data.data.toView(self.nic.stack.allocator) catch return;
                     defer self.nic.stack.allocator.free(v);
                     @memcpy(reassembled_buf[offset .. offset + v.len], v);
                     offset += v.len;
-                    
-                    // Cleanup fragment data
-                    // We allocated cloned_data earlier
                     var mut_data = f.data.data;
                     mut_data.deinit();
                 }
                 
-                // Cleanup context
                 ctx.fragments.deinit();
                 _ = self.reassembly_list.remove(key);
                 
-                // Deliver reassembled packet
                 var views = [_]buffer.View{reassembled_buf};
                 var reassembled_pkt = tcpip.PacketBuffer{
                     .data = buffer.VectorisedView.init(total_size, &views),
                     .header = undefined,
                 };
                 
-                // Need to restore original header info?
-                // The transport layer expects packet to point to header?
-                // Actually handlePacket takes pkt with IP header at start (before trim)
-                // But our reassembled packet only has payload.
-                // We need to prepend the IP header from the FIRST fragment.
-                
-                // We don't easily have the first fragment's header here unless we saved it.
-                // But wait, handlePacket logic below does:
-                // mut_pkt.network_header = headerView[0..h.headerLength()];
-                // ...
-                // self.dispatcher.deliverTransportPacket(r, p, mut_pkt);
-                
-                // The transport packet should NOT contain IP header in .data (it's trimmed).
-                // So reassembled_pkt.data is correct (just payload).
-                // But packet might need network_header set?
-                
                 const p = h.protocol();
                 self.dispatcher.deliverTransportPacket(r, p, reassembled_pkt);
-                
-                // Free the reassembled buffer after delivery?
-                // PacketBuffer doesn't own it.
-                // The receiver might copy it.
-                // If it's UDP/TCP, they might read from it.
-                // We should defer free it but we need to ensure it's used synchronously.
-                // Current stack is sync.
                 self.nic.stack.allocator.free(reassembled_buf);
             }
-            
             return;
         }
 
         mut_pkt.network_header = headerView[0..h.headerLength()];
 
-        const hlen = h.headerLength();
         const tlen = h.totalLength();
         mut_pkt.data.trimFront(hlen);
         mut_pkt.data.capLength(tlen - hlen);
@@ -339,11 +289,7 @@ test "IPv4 fragmentation and reassembly" {
     try s.createNIC(1, link_ep);
     const nic = s.nics.get(1).?;
     const ipv4_proto = IPv4Protocol.init();
-    // We need to register it but manually for this test context or use Stack's registry if we had one populated.
-    // Stack init doesn't populate protocols.
-    // Let's create an endpoint manually.
     
-    // Create dispatcher
     var delivered = false;
     var delivered_len: usize = 0;
     const FakeDispatcher = struct {
@@ -368,7 +314,7 @@ test "IPv4 fragmentation and reassembly" {
     ep_ipv4.* = .{
         .nic = nic,
         .address = .{ .v4 = .{ 10, 0, 0, 1 } },
-        .protocol = @constCast(&ipv4_proto), // This is a bit hacky, but test only
+        .protocol = @constCast(&ipv4_proto), 
         .dispatcher = dispatcher,
         .reassembly_list = std.AutoHashMap(ReassemblyKey, ReassemblyContext).init(allocator),
     };
@@ -385,24 +331,19 @@ test "IPv4 fragmentation and reassembly" {
         .nic = nic,
     };
 
-    // Simulate two fragments
     const payload = "hello world this is a fragmented packet";
-    // Split into "hello world " (12) and "this is a fragmented packet" (27)
-    // Total 39 bytes.
-    // Fragment 1: offset 0, more=1
-    var frag1_buf = [_]u8{0} ** (header.IPv4MinimumSize + 16); // 16 bytes payload (multiple of 8)
+    var frag1_buf = [_]u8{0} ** (header.IPv4MinimumSize + 16); 
     var frag1_h = header.IPv4.init(&frag1_buf);
     frag1_h.data[0] = 0x45;
     std.mem.writeIntBig(u16, frag1_h.data[2..4], header.IPv4MinimumSize + 16);
-    std.mem.writeIntBig(u16, frag1_h.data[4..6], 12345); // ID
-    std.mem.writeIntBig(u16, frag1_h.data[6..8], 0x2000); // MF=1, Offset=0
-    frag1_h.data[9] = 17; // UDP
-    @memcpy(frag1_h.data[12..16], &[_]u8{ 10, 0, 0, 2 }); // Src
-    @memcpy(frag1_h.data[16..20], &[_]u8{ 10, 0, 0, 1 }); // Dst
+    std.mem.writeIntBig(u16, frag1_h.data[4..6], 12345); 
+    std.mem.writeIntBig(u16, frag1_h.data[6..8], 0x2000); 
+    frag1_h.data[9] = 17; 
+    @memcpy(frag1_h.data[12..16], &[_]u8{ 10, 0, 0, 2 }); 
+    @memcpy(frag1_h.data[16..20], &[_]u8{ 10, 0, 0, 1 }); 
     @memcpy(frag1_buf[20..], payload[0..16]);
     frag1_h.setChecksum(frag1_h.calculateChecksum());
 
-    // Fragment 2: offset 16 (2 in 8-byte units), more=0
     const rem_len = payload.len - 16;
     var frag2_buf = try allocator.alloc(u8, header.IPv4MinimumSize + rem_len);
     defer allocator.free(frag2_buf);
@@ -410,15 +351,14 @@ test "IPv4 fragmentation and reassembly" {
     var frag2_h = header.IPv4.init(frag2_buf);
     frag2_h.data[0] = 0x45;
     std.mem.writeIntBig(u16, frag2_h.data[2..4], @as(u16, @intCast(header.IPv4MinimumSize + rem_len)));
-    std.mem.writeIntBig(u16, frag2_h.data[4..6], 12345); // ID matches
-    std.mem.writeIntBig(u16, frag2_h.data[6..8], 0x0002); // MF=0, Offset=2 (16 bytes)
-    frag2_h.data[9] = 17; // UDP
+    std.mem.writeIntBig(u16, frag2_h.data[4..6], 12345); 
+    std.mem.writeIntBig(u16, frag2_h.data[6..8], 0x0002); 
+    frag2_h.data[9] = 17; 
     @memcpy(frag2_h.data[12..16], &[_]u8{ 10, 0, 0, 2 });
     @memcpy(frag2_h.data[16..20], &[_]u8{ 10, 0, 0, 1 });
     @memcpy(frag2_buf[20..], payload[16..]);
     frag2_h.setChecksum(frag2_h.calculateChecksum());
 
-    // Deliver frag 1
     var views1 = [_]buffer.View{&frag1_buf};
     var pkt1 = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(frag1_buf.len, &views1),
@@ -426,9 +366,8 @@ test "IPv4 fragmentation and reassembly" {
     };
     ep_ipv4.networkEndpoint().handlePacket(&r, pkt1);
     
-    try std.testing.expect(!delivered); // Should wait for frag 2
+    try std.testing.expect(!delivered); 
 
-    // Deliver frag 2
     var views2 = [_]buffer.View{frag2_buf};
     var pkt2 = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(frag2_buf.len, &views2),

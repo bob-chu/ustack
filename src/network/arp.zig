@@ -15,14 +15,16 @@ pub const ARPProtocol = struct {
     pub fn protocol(self: *ARPProtocol) stack.NetworkProtocol {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .number = number,
-                .newEndpoint = newEndpoint,
-                .linkAddressRequest = linkAddressRequest,
-                .parseAddresses = parseAddresses,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.NetworkProtocol.VTable{
+        .number = number,
+        .newEndpoint = newEndpoint,
+        .linkAddressRequest = linkAddressRequest,
+        .parseAddresses = parseAddresses,
+    };
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;
@@ -44,10 +46,12 @@ pub const ARPProtocol = struct {
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
         _ = ptr;
-        var hdr_buf = nic.stack.allocator.alloc(u8, header.ARPSize) catch return tcpip.Error.OutOfMemory;
+        var hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_buf);
         
-        var h = header.ARP.init(hdr_buf);
+        var pre = buffer.Prependable.init(hdr_buf);
+        const arp_hdr = pre.prepend(header.ARPSize).?;
+        var h = header.ARP.init(arp_hdr);
         h.setIPv4OverEthernet();
         h.setOp(1); // Request
         @memcpy(h.data[8..14], &nic.linkEP.linkAddress());
@@ -56,7 +60,7 @@ pub const ARPProtocol = struct {
 
         var pb = tcpip.PacketBuffer{
             .data = .{.views = &[_]buffer.View{}, .size = 0},
-            .header = buffer.Prependable.initFull(hdr_buf),
+            .header = pre,
         };
         
         const broadcast_hw = [_]u8{0xff} ** 6;
@@ -88,13 +92,15 @@ pub const ARPEndpoint = struct {
     pub fn networkEndpoint(self: *ARPEndpoint) stack.NetworkEndpoint {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .writePacket = writePacket,
-                .handlePacket = handlePacket,
-                .mtu = mtu,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.NetworkEndpoint.VTable{
+        .writePacket = writePacket,
+        .handlePacket = handlePacket,
+        .mtu = mtu,
+    };
 
     fn mtu(ptr: *anyopaque) u32 {
         const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
@@ -116,25 +122,30 @@ pub const ARPEndpoint = struct {
         const sender_proto_addr = tcpip.Address{ .v4 = h.protocolAddressSender() };
         const sender_hw_addr = h.hardwareAddressSender();
         
+        std.debug.print("ARP: Received op={} sender_proto={any} sender_hw={any}\n", .{h.op(), sender_proto_addr.v4, sender_hw_addr});
+        
         self.nic.stack.addLinkAddress(sender_proto_addr, sender_hw_addr) catch {};
+
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
             if (self.nic.hasAddress(target_proto_addr)) {
-                var hdr_buf = self.nic.stack.allocator.alloc(u8, header.ARPSize) catch return;
+                var hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
                 
-                var reply_h = header.ARP.init(hdr_buf);
+                var pre = buffer.Prependable.init(hdr_buf);
+                const arp_hdr = pre.prepend(header.ARPSize).?;
+                var reply_h = header.ARP.init(arp_hdr);
                 reply_h.setIPv4OverEthernet();
                 reply_h.setOp(2); // Reply
                 @memcpy(reply_h.data[8..14], &self.nic.linkEP.linkAddress());
-                @memcpy(reply_h.data[14..18], &h.data[24..28]);
-                @memcpy(reply_h.data[18..24], &h.data[8..14]);
-                @memcpy(reply_h.data[24..28], &h.data[14..18]);
+                @memcpy(reply_h.data[14..18], h.data[24..28]);
+                @memcpy(reply_h.data[18..24], h.data[8..14]);
+                @memcpy(reply_h.data[24..28], h.data[14..18]);
 
                 var pb = tcpip.PacketBuffer{
                     .data = .{.views = &[_]buffer.View{}, .size = 0},
-                    .header = buffer.Prependable.initFull(hdr_buf),
+                    .header = pre,
                 };
                 
                 self.nic.linkEP.writePacket(null, ProtocolNumber, pb) catch {};

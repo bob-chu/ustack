@@ -54,8 +54,9 @@ pub const IPv4 = struct {
     }
 
     pub fn calculateChecksum(self: IPv4) u16 {
-        return ~internetChecksum(self.data[0..self.headerLength()], 0);
+        return finishChecksum(internetChecksum(self.data[0..self.headerLength()], 0));
     }
+
 
     pub fn flagsFragmentOffset(self: IPv4) u16 {
         return std.mem.readIntBig(u16, self.data[flagsFOOffset..][0..2]);
@@ -147,11 +148,31 @@ pub const TCP = struct {
         self.data[TCPDataOffset] = (5 << 4); // Default 20 bytes
         self.data[TCPFlagsOffset] = fl;
         std.mem.writeIntBig(u16, self.data[TCPWinSizeOffset..][0..2], win);
+        // Zero out checksum before calculation
+        std.mem.writeIntBig(u16, self.data[TCPChecksumOffset..][0..2], 0);
+    }
+
+    pub fn setChecksum(self: TCP, c: u16) void {
+        std.mem.writeIntBig(u16, self.data[TCPChecksumOffset..][0..2], c);
+    }
+
+    pub fn calculateChecksum(self: TCP, src: [4]u8, dst: [4]u8, payload: []const u8) u16 {
+        var sum: u32 = 0;
+        sum += std.mem.readIntBig(u16, src[0..2]);
+        sum += std.mem.readIntBig(u16, src[2..4]);
+        sum += std.mem.readIntBig(u16, dst[0..2]);
+        sum += std.mem.readIntBig(u16, dst[2..4]);
+        sum += 6; // Protocol TCP
+        sum += @as(u16, @intCast(self.data.len + payload.len));
+
+        sum = internetChecksum(self.data, sum);
+        sum = internetChecksum(payload, sum);
+        return finishChecksum(sum);
     }
 };
 
 /// internetChecksum calculates the internet checksum of the given data.
-pub fn internetChecksum(data: []const u8, initial: u16) u16 {
+pub fn internetChecksum(data: []const u8, initial: u32) u32 {
     var sum: u32 = initial;
     var i: usize = 0;
     while (i + 1 < data.len) : (i += 2) {
@@ -160,10 +181,15 @@ pub fn internetChecksum(data: []const u8, initial: u16) u16 {
     if (i < data.len) {
         sum += @as(u32, data[i]) << 8;
     }
-    while (sum > 0xffff) {
-        sum = (sum & 0xffff) + (sum >> 16);
+    return sum;
+}
+
+pub fn finishChecksum(sum: u32) u16 {
+    var s = sum;
+    while (s > 0xffff) {
+        s = (s & 0xffff) + (s >> 16);
     }
-    return @as(u16, @intCast(sum));
+    return ~@as(u16, @intCast(s));
 }
 
 pub const EthernetMinimumSize = 14;
@@ -205,6 +231,7 @@ pub const Ethernet = struct {
 
 pub const ARPProtocolNumber = 0x0806;
 pub const ARPSize = 28;
+pub const ReservedHeaderSize = 128;
 
 pub const ARP = struct {
     data: []u8,
@@ -259,6 +286,10 @@ pub const ARP = struct {
     pub fn setOp(self: ARP, operation: u16) void {
         std.mem.writeIntBig(u16, self.data[6..8], operation);
     }
+
+    pub fn isValid(self: ARP) bool {
+        return self.data.len >= ARPSize;
+    }
 };
 
 pub const UDPMinimumSize = 8;
@@ -284,6 +315,22 @@ pub const UDP = struct {
 
     pub fn checksum(self: UDP) u16 {
         return std.mem.readIntBig(u16, self.data[6..8]);
+    }
+
+    pub fn setSourcePort(self: UDP, p: u16) void {
+        std.mem.writeIntBig(u16, self.data[0..2], p);
+    }
+
+    pub fn setDestinationPort(self: UDP, p: u16) void {
+        std.mem.writeIntBig(u16, self.data[2..4], p);
+    }
+
+    pub fn setLength(self: UDP, l: u16) void {
+        std.mem.writeIntBig(u16, self.data[4..6], l);
+    }
+
+    pub fn setChecksum(self: UDP, c: u16) void {
+        std.mem.writeIntBig(u16, self.data[6..8], c);
     }
 };
 
@@ -315,9 +362,9 @@ pub const ICMPv4 = struct {
     }
 
     pub fn calculateChecksum(self: ICMPv4, payload: []const u8) u16 {
-        var c = internetChecksum(self.data[0..ICMPv4MinimumSize], 0);
-        c = internetChecksum(payload, c);
-        return ~c;
+        var sum = internetChecksum(self.data[0..ICMPv4MinimumSize], 0);
+        sum = internetChecksum(payload, sum);
+        return finishChecksum(sum);
     }
 };
 
@@ -417,7 +464,6 @@ pub const ICMPv6 = struct {
         std.mem.writeIntBig(u16, self.data[2..4], c);
     }
 
-    // ICMPv6 checksum includes a pseudo-header
     pub fn calculateChecksum(self: ICMPv6, src: [16]u8, dst: [16]u8, payload: []const u8) u16 {
         var sum: u32 = 0;
         
@@ -432,20 +478,13 @@ pub const ICMPv6 = struct {
         }
         
         const len = ICMPv6MinimumSize + payload.len;
-        sum += @as(u32, @intCast(len >> 16)); // Upper 16 bits of length (unlikely to be set for typical packets)
+        sum += @as(u32, @intCast(len >> 16)); 
         sum += @as(u32, @intCast(len & 0xffff));
         sum += 58; // Next Header (ICMPv6)
 
-        // ICMPv6 Header + Payload
-        sum += internetChecksum(self.data[0..ICMPv6MinimumSize], 0);
-        if (sum > 0xffff) { sum = (sum & 0xffff) + (sum >> 16); }
-        
-        sum += internetChecksum(payload, 0);
-        while (sum > 0xffff) {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-        
-        return ~@as(u16, @intCast(sum));
+        sum = internetChecksum(self.data[0..ICMPv6MinimumSize], sum);
+        sum = internetChecksum(payload, sum);
+        return finishChecksum(sum);
     }
 };
 
@@ -542,5 +581,5 @@ test "Checksum calculation" {
     // Let's calculate its checksum.
     const c = internetChecksum(&data, 0);
     const expected: u16 = 0xb1e6; // Precalculated for this header
-    try std.testing.expectEqual(expected, ~c);
+    try std.testing.expectEqual(expected, finishChecksum(c));
 }

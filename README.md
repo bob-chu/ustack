@@ -138,16 +138,24 @@ stateDiagram-v2
 *   **Pluggable Congestion Control**: Switch between NewReno, CUBIC, and BBR at runtime per endpoint.
 *   **Dual Stack**: Simultaneous IPv4 and IPv6 support.
 
-## 6. Running Tests
+## 6. Running Tests and Examples
 
-The project includes a comprehensive test suite covering unit logic and integration scenarios (TCP Handshake, Data Transfer, Packet Loss/Recovery).
-
+### Run Library Tests
 ```bash
-# Run all tests
-zig test ustack/src/main.zig
+# Inside ustack/ directory
+zig test src/main.zig
 ```
 
-## 7. Example Usage
+### Build Examples
+The examples require `libuv` and `libev` development headers installed on your system.
+```bash
+# Inside ustack/ directory
+zig build example
+```
+The binaries will be located in `zig-out/bin/`.
+
+## 7. Integration Examples
+
 
 ```zig
 const stack = @import("stack.zig");
@@ -179,5 +187,16 @@ while (true) {
 
 The `examples/` directory contains reference implementations for integrating `ustack` with real-world I/O mechanisms:
 
-*   **`examples/tun_tap_adapter.zig`**: A `LinkEndpoint` implementation for Linux TUN/TAP devices. Shows how to read/write raw Ethernet frames from a file descriptor and bridge them to the stack.
-*   **`examples/libuv_integration.zig`**: A conceptual guide on linking `ustack`'s passive event model with the `libuv` event loop. It demonstrates how to map `poll` events to packet ingestion and `timer` events to stack maintenance.
+### Adapters (Layer 2)
+*   **`tun_tap_adapter.zig`**: Linux TUN/TAP device bridge.
+*   **`af_packet_adapter.zig`**: Linux `AF_PACKET` raw socket bridge.
+*   **`af_xdp_adapter.zig`**: High-performance `AF_XDP` (Express Data Path) conceptual bridge.
+
+### Event Loop Main Examples
+*   **`main_tap_libev.zig`**: TAP interface driven by `libev`.
+*   **`main_af_packet_libuv.zig`**: `AF_PACKET` raw sockets driven by `libuv`.
+*   **`main_af_packet_libev.zig`**: `AF_PACKET` raw sockets driven by `libev`.
+*   **`main_af_xdp_libuv.zig`**: `AF_XDP` zero-copy interface driven by `libuv`.
+*   **`main_af_xdp_libev.zig`**: `AF_XDP` zero-copy interface driven by `libev`.
+
+These examples demonstrate how to map `poll`/`io` events to packet ingestion and `timer` events to stack maintenance.

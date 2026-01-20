@@ -54,27 +54,31 @@ pub const NewReno = struct {
         };
         return .{
             .ptr = self,
-            .vtable = &.{
-                .onAck = onAck,
-                .onLoss = onLoss,
-                .onRetransmit = onRetransmit,
-                .getCwnd = getCwnd,
-                .getSsthresh = getSsthresh,
-                .deinit = deinit,
-            },
+            .vtable = &VTableImpl,
         };
     }
 
+    const VTableImpl = CongestionControl.VTable{
+        .onAck = onAck,
+        .onLoss = onLoss,
+        .onRetransmit = onRetransmit,
+        .getCwnd = getCwnd,
+        .getSsthresh = getSsthresh,
+        .deinit = deinit,
+    };
+
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));
-        _ = bytes_acked; // Simplified: we treat every ACK as full MSS for growth
+        std.debug.print("CC onAck: cwnd={}, ssthresh={}, bytes_acked={}\n", .{self.cwnd, self.ssthresh, bytes_acked});
+        // Simplified: we treat every ACK as full MSS for growth
         if (self.cwnd < self.ssthresh) {
             // Slow Start
             self.cwnd += self.mss;
         } else {
             // Congestion Avoidance
-            self.cwnd += (self.mss * self.mss) / self.cwnd;
+            self.cwnd += self.mss / self.cwnd;
         }
+        std.debug.print("CC after onAck: cwnd={}\n", .{self.cwnd});
     }
 
     fn onLoss(ptr: *anyopaque) void {

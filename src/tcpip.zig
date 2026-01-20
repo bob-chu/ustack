@@ -104,11 +104,75 @@ pub const Endpoint = struct {
     pub fn accept(self: Endpoint) Error!AcceptReturn {
         return self.vtable.accept(self.ptr);
     }
+    pub fn getLocalAddress(self: Endpoint) Error!FullAddress {
+        return self.vtable.getLocalAddress(self.ptr);
+    }
+    pub fn getRemoteAddress(self: Endpoint) Error!FullAddress {
+        return self.vtable.getRemoteAddress(self.ptr);
+    }
+    pub fn shutdown(self: Endpoint, flags: u8) Error!void {
+        return self.vtable.shutdown(self.ptr, flags);
+    }
 };
 
 pub const AddressWithPrefix = struct {
     address: Address,
     prefix_len: u8,
+
+    // Convenience method to get subnet
+    pub fn toSubnet(self: AddressWithPrefix) Subnet {
+        return .{
+            .address = self.address,
+            .prefix = self.prefix_len,
+        };
+    }
+};
+
+// Subnet with mask for routing (CIDR notation)
+pub const Subnet = struct {
+    address: Address,
+    prefix: u8,
+
+    // Check if address belongs to this subnet (longest-prefix matching)
+    pub fn contains(self: Subnet, addr: Address) bool {
+        // Addresses must be same length
+        if (std.meta.activeTag(self.address) != std.meta.activeTag(addr)) {
+            return false;
+        }
+
+        // Compare prefix bits
+        const prefix_bits = self.prefix;
+        const bytes_to_check = prefix_bits / 8;
+        const remaining_bits = prefix_bits % 8;
+        var i: usize = 0;
+
+        // Check full bytes
+        while (i < bytes_to_check) : (i += 1) {
+            if (self.address.v4[i] != addr.v4[i]) {
+                return false;
+            }
+        }
+
+        // Check partial byte
+        if (remaining_bits > 0) {
+            const mask = @as(u8, @bitCast(@as(u16, 0xFF00) >> @as(u4, 8 - remaining_bits)));
+            if ((self.address.v4[i] & mask) != (addr.v4[i] & mask)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Prefix comparison operator for sorting routes (longest first)
+    pub fn gt(self: Subnet, other: u8) bool {
+        return self.prefix > other;
+    }
+
+    // Convenience method to get prefix value
+    pub fn prefix(self: Subnet) u8 {
+        return self.prefix;
+    }
 };
 
 pub const ProtocolAddress = struct {

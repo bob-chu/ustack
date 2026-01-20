@@ -28,16 +28,18 @@ pub const Cubic = struct {
         };
         return .{
             .ptr = self,
-            .vtable = &.{
-                .onAck = onAck,
-                .onLoss = onLoss,
-                .onRetransmit = onRetransmit,
-                .getCwnd = getCwnd,
-                .getSsthresh = getSsthresh,
-                .deinit = deinit,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = CongestionControl.VTable{
+        .onAck = onAck,
+        .onLoss = onLoss,
+        .onRetransmit = onRetransmit,
+        .getCwnd = getCwnd,
+        .getSsthresh = getSsthresh,
+        .deinit = deinit,
+    };
 
     fn cubicUpdate(self: *Cubic) void {
         const now = std.time.milliTimestamp();

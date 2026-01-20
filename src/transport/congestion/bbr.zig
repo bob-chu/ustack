@@ -25,16 +25,18 @@ pub const BBR = struct {
         };
         return .{
             .ptr = self,
-            .vtable = &.{
-                .onAck = onAck,
-                .onLoss = onLoss,
-                .onRetransmit = onRetransmit,
-                .getCwnd = getCwnd,
-                .getSsthresh = getSsthresh,
-                .deinit = deinit,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = CongestionControl.VTable{
+        .onAck = onAck,
+        .onLoss = onLoss,
+        .onRetransmit = onRetransmit,
+        .getCwnd = getCwnd,
+        .getSsthresh = getSsthresh,
+        .deinit = deinit,
+    };
 
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*BBR, @ptrCast(@alignCast(ptr)));

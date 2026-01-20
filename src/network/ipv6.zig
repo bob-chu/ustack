@@ -14,14 +14,16 @@ pub const IPv6Protocol = struct {
     pub fn protocol(self: *IPv6Protocol) stack.NetworkProtocol {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .number = number,
-                .newEndpoint = newEndpoint,
-                .linkAddressRequest = linkAddressRequest,
-                .parseAddresses = parseAddresses,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.NetworkProtocol.VTable{
+        .number = number,
+        .newEndpoint = newEndpoint,
+        .linkAddressRequest = linkAddressRequest,
+        .parseAddresses = parseAddresses,
+    };
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;
@@ -69,13 +71,15 @@ pub const IPv6Endpoint = struct {
     pub fn networkEndpoint(self: *IPv6Endpoint) stack.NetworkEndpoint {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .writePacket = writePacket,
-                .handlePacket = handlePacket,
-                .mtu = mtu,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.NetworkEndpoint.VTable{
+        .writePacket = writePacket,
+        .handlePacket = handlePacket,
+        .mtu = mtu,
+    };
 
     fn mtu(ptr: *anyopaque) u32 {
         const self = @as(*IPv6Endpoint, @ptrCast(@alignCast(ptr)));

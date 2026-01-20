@@ -1,9 +1,10 @@
 const std = @import("std");
 const os = std.os;
-const stack = @import("../src/stack.zig");
-const tcpip = @import("../src/tcpip.zig");
-const header = @import("../src/header.zig");
-const buffer = @import("../src/buffer.zig");
+const ustack = @import("ustack");
+const stack = ustack.stack;
+const tcpip = ustack.tcpip;
+const header = ustack.header;
+const buffer = ustack.buffer;
 
 // Linux AF_PACKET wrapper
 pub const AfPacketEndpoint = struct {
@@ -15,6 +16,7 @@ pub const AfPacketEndpoint = struct {
     wrapped_dispatcher: stack.NetworkDispatcher = undefined,
 
     pub fn init(if_index: i32) !AfPacketEndpoint {
+        _ = if_index;
         // socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
         // Simplified for example: using mock FD or standard socket creation if available
         // Zig's std.os.socket supports AF_PACKET on Linux

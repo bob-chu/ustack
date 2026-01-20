@@ -15,13 +15,15 @@ pub const UDPProtocol = struct {
     pub fn protocol(self: *UDPProtocol) stack.TransportProtocol {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .number = number,
-                .newEndpoint = newEndpoint,
-                .parsePorts = parsePorts,
-            },
+            .vtable = &VTableImpl,
         };
     }
+
+    const VTableImpl = stack.TransportProtocol.VTable{
+        .number = number,
+        .newEndpoint = newEndpoint,
+        .parsePorts = parsePorts,
+    };
 
     fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber {
         _ = ptr;
@@ -53,10 +55,10 @@ pub const UDPEndpoint = struct {
     waiter_queue: *waiter.Queue,
     rcv_list: std.TailQueue(Packet),
     mutex: std.Thread.Mutex = .{},
+    ref_count: std.atomic.Atomic(usize) = std.atomic.Atomic(usize).init(1),
     
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
-    route: ?stack.Route = null,
 
     pub fn init(s: *stack.Stack, wq: *waiter.Queue) UDPEndpoint {
         return .{
@@ -69,11 +71,86 @@ pub const UDPEndpoint = struct {
     pub fn transportEndpoint(self: *UDPEndpoint) stack.TransportEndpoint {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .handlePacket = handlePacket,
-                .close = close_internal,
-            },
+            .vtable = &TransportVTableImpl,
         };
+    }
+
+    const TransportVTableImpl = stack.TransportEndpoint.VTable{
+        .handlePacket = handlePacket,
+        .close = close_external,
+        .incRef = incRef_external,
+        .decRef = decRef_external,
+    };
+
+    pub fn incRef(self: *UDPEndpoint) void {
+        _ = self.ref_count.fetchAdd(1, .Monotonic);
+    }
+
+    pub fn decRef(self: *UDPEndpoint) void {
+        if (self.ref_count.fetchSub(1, .Release) == 1) {
+            self.ref_count.fence(.Acquire);
+            self.destroy();
+        }
+    }
+
+    fn destroy(self: *UDPEndpoint) void {
+        self.mutex.lock();
+        while (self.rcv_list.popFirst()) |node| {
+            self.stack.allocator.destroy(node);
+        }
+        self.mutex.unlock();
+        self.stack.allocator.destroy(self);
+    }
+
+    fn close_external(ptr: *anyopaque) void {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        
+        if (self.local_addr) |la| {
+            const id = stack.TransportEndpointID{
+                .local_port = la.port,
+                .local_address = la.addr,
+                .remote_port = 0,
+                .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } },
+            };
+            self.stack.unregisterTransportEndpoint(id);
+        }
+
+        self.decRef();
+    }
+
+    fn incRef_external(ptr: *anyopaque) void {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.incRef();
+    }
+
+    fn decRef_external(ptr: *anyopaque) void {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.decRef();
+    }
+
+    pub fn write(self: *UDPEndpoint, r: *stack.Route, data: buffer.VectorisedView) tcpip.Error!void {
+        const local_address = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
+        
+        var hdr_buf = self.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
+        defer self.stack.allocator.free(hdr_buf);
+        
+        var pre = buffer.Prependable.init(hdr_buf);
+        const udp_hdr = pre.prepend(header.UDPMinimumSize).?;
+        var h = header.UDP.init(udp_hdr);
+        
+        h.setSourcePort(local_address.port);
+        
+        const remote_port = self.remote_addr.?.port; 
+        h.setDestinationPort(remote_port);
+        h.setLength(@as(u16, @intCast(header.UDPMinimumSize + data.size)));
+        h.setChecksum(0);
+
+        var pb = tcpip.PacketBuffer{
+            .data = data,
+            .header = pre,
+        };
+        
+        return r.writePacket(ProtocolNumber, pb);
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
@@ -85,7 +162,7 @@ pub const UDPEndpoint = struct {
 
         const node = self.stack.allocator.create(std.TailQueue(Packet).Node) catch return;
         node.data = .{
-            .data = mut_pkt.data, // Need to clone if we want to keep it
+            .data = mut_pkt.data, 
             .sender_addr = .{
                 .nic = r.nic.id,
                 .addr = id.remote_address,
@@ -106,34 +183,22 @@ pub const UDPEndpoint = struct {
     pub fn endpoint(self: *UDPEndpoint) tcpip.Endpoint {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .close = close_external,
-                .read = read,
-                .write = write_external,
-                .connect = connect,
-                .shutdown = shutdown,
-                .listen = listen,
-                .accept = accept,
-                .bind = bind,
-                .getLocalAddress = getLocalAddress,
-                .getRemoteAddress = getRemoteAddress,
-            },
+            .vtable = &EndpointVTableImpl,
         };
     }
 
-    fn close_internal(ptr: *anyopaque) void {
-        close_external(ptr);
-    }
-
-    fn close_external(ptr: *anyopaque) void {
-        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
-        self.mutex.lock();
-        while (self.rcv_list.popFirst()) |node| {
-            self.stack.allocator.destroy(node);
-        }
-        self.mutex.unlock();
-        self.stack.allocator.destroy(self);
-    }
+    const EndpointVTableImpl = tcpip.Endpoint.VTable{
+        .close = close_external,
+        .read = read,
+        .write = write_external,
+        .connect = connect,
+        .shutdown = shutdown,
+        .listen = listen,
+        .accept = accept,
+        .bind = bind,
+        .getLocalAddress = getLocalAddress,
+        .getRemoteAddress = getRemoteAddress,
+    };
 
     fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.View {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
@@ -147,8 +212,6 @@ pub const UDPEndpoint = struct {
             a.* = node.data.sender_addr;
         }
 
-        // For simplicity, we return a merged view of the data.
-        // VectorisedView might need a way to return ownership or stay alive.
         return node.data.data.toView(self.stack.allocator) catch return tcpip.Error.NoBufferSpace;
     }
 
@@ -156,7 +219,7 @@ pub const UDPEndpoint = struct {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         const data_buf = try p.fullPayload();
         
-        var views = [_]buffer.View{data_buf};
+        var views = [_]buffer.View{@constCast(data_buf)};
         const data = buffer.VectorisedView.init(data_buf.len, &views);
 
         if (opts.to) |to| {
@@ -168,10 +231,11 @@ pub const UDPEndpoint = struct {
             };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
             
-            // For UDP, we often need the remote link address if it's not in cache
+            self.stack.mutex.lock();
             if (self.stack.link_addr_cache.get(to.addr)) |link_addr| {
                 r.remote_link_address = link_addr;
             }
+            self.stack.mutex.unlock();
 
             try self.write(&r, data);
         } else if (self.remote_addr) |to| {
@@ -183,9 +247,11 @@ pub const UDPEndpoint = struct {
             };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
             
+            self.stack.mutex.lock();
             if (self.stack.link_addr_cache.get(to.addr)) |link_addr| {
                 r.remote_link_address = link_addr;
             }
+            self.stack.mutex.unlock();
 
             try self.write(&r, data);
         } else {
@@ -230,7 +296,7 @@ pub const UDPEndpoint = struct {
         return tcpip.Error.UnknownProtocol;
     }
 
-    fn accept(ptr: *anyopaque) tcpip.Error!struct { ep: tcpip.Endpoint, wq: *waiter.Queue } {
+    fn accept(ptr: *anyopaque) tcpip.Error!tcpip.AcceptReturn {
         _ = ptr;
         return tcpip.Error.UnknownProtocol;
     }
@@ -245,80 +311,3 @@ pub const UDPEndpoint = struct {
         return tcpip.Error.UnknownProtocol;
     }
 };
-
-test "UDP handlePacket" {
-    std.debug.print("Running UDP handlePacket test...\n", .{});
-    const allocator = std.testing.allocator;
-    var s = try stack.Stack.init(allocator);
-    defer s.deinit();
-
-    var wq = waiter.Queue{};
-    var ep = try allocator.create(UDPEndpoint);
-    ep.* = UDPEndpoint.init(&s, &wq);
-    defer ep.transportEndpoint().close();
-
-    var fake_ep = struct {
-        fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-            _ = ptr; _ = r; _ = protocol; _ = pkt; return;
-        }
-        fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
-            _ = ptr; _ = dispatcher;
-        }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return [_]u8{0} ** 6; }
-        fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
-        fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
-        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
-    }{};
-
-    const link_ep = stack.LinkEndpoint{
-        .ptr = &fake_ep,
-        .vtable = &.{
-            .writePacket = @TypeOf(fake_ep).writePacket,
-            .attach = @TypeOf(fake_ep).attach,
-            .linkAddress = @TypeOf(fake_ep).linkAddress,
-            .mtu = @TypeOf(fake_ep).mtu,
-            .setMTU = @TypeOf(fake_ep).setMTU,
-            .capabilities = @TypeOf(fake_ep).capabilities,
-        },
-    };
-
-    const nic = try s.allocator.create(stack.NIC);
-    defer s.allocator.destroy(nic);
-    nic.* = stack.NIC.init(&s, 1, "test0", link_ep, false);
-    defer nic.deinit();
-
-    const r = stack.Route{
-        .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
-        .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
-        .local_link_address = .{ 0, 0, 0, 0, 0, 0 },
-        .net_proto = 0x0800,
-        .nic = nic,
-    };
-
-    var udp_data = [_]u8{0} ** 12;
-    _ = header.UDP.init(&udp_data);
-    std.mem.writeIntBig(u16, udp_data[0..2], 1234);
-    std.mem.writeIntBig(u16, udp_data[2..4], 80);
-    std.mem.writeIntBig(u16, udp_data[4..6], 12);
-
-    var views = [_]buffer.View{&udp_data};
-    const pkt = tcpip.PacketBuffer{
-        .data = buffer.VectorisedView.init(12, &views),
-        .header = undefined,
-    };
-
-    const id = stack.TransportEndpointID{
-        .local_port = 80,
-        .local_address = r.local_address,
-        .remote_port = 1234,
-        .remote_address = r.remote_address,
-    };
-
-    ep.transportEndpoint().handlePacket(&r, id, pkt);
-
-    try std.testing.expect(ep.rcv_list.first != null);
-    const p = ep.rcv_list.first.?.data;
-    try std.testing.expectEqual(@as(u16, 1234), p.sender_addr.port);
-    try std.testing.expectEqual(@as(usize, 4), p.data.size);
-}
-

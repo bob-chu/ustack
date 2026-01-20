@@ -26,6 +26,37 @@ pub const link = struct {
     pub const eth = @import("link/eth.zig");
 };
 
+pub fn init(allocator: std.mem.Allocator) !stack.Stack {
+    var s = try stack.Stack.init(allocator);
+    errdefer s.deinit();
+
+    const ipv4_proto = try allocator.create(network.ipv4.IPv4Protocol);
+    ipv4_proto.* = network.ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+
+    const ipv6_proto = try allocator.create(network.ipv6.IPv6Protocol);
+    ipv6_proto.* = network.ipv6.IPv6Protocol.init();
+    try s.registerNetworkProtocol(ipv6_proto.protocol());
+
+    const arp_proto = try allocator.create(network.arp.ARPProtocol);
+    arp_proto.* = network.arp.ARPProtocol.init();
+    try s.registerNetworkProtocol(arp_proto.protocol());
+
+    const icmp_proto = try allocator.create(network.icmp.ICMPv4Protocol);
+    icmp_proto.* = network.icmp.ICMPv4Protocol.init();
+    try s.registerNetworkProtocol(icmp_proto.protocol());
+
+    const tcp_proto = try allocator.create(transport.tcp.TCPProtocol);
+    tcp_proto.* = transport.tcp.TCPProtocol.init();
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    const udp_proto = try allocator.create(transport.udp.UDPProtocol);
+    udp_proto.* = transport.udp.UDPProtocol.init();
+    try s.registerTransportProtocol(udp_proto.protocol());
+
+    return s;
+}
+
 test {
     std.testing.refAllDecls(@This());
     _ = network.ipv4;
