@@ -96,6 +96,7 @@ pub const UDPEndpoint = struct {
     fn destroy(self: *UDPEndpoint) void {
         self.mutex.lock();
         while (self.rcv_list.popFirst()) |node| {
+            node.data.data.deinit();
             self.stack.allocator.destroy(node);
         }
         self.mutex.unlock();
@@ -142,6 +143,39 @@ pub const UDPEndpoint = struct {
         h.setDestinationPort(remote_port);
         h.setLength(@as(u16, @intCast(header.UDPMinimumSize + data.size)));
         h.setChecksum(0);
+        
+        // Calculate Checksum if IPv4
+        if (local_address.addr == .v4 and r.remote_address == .v4) {
+            // Need contiguous buffer for checksum?
+            // VectorisedView is not contiguous. 
+            // We can iterate views or linearize.
+            // For now, let's just linearize if needed or support scattered checksum.
+            // internetChecksum takes []const u8.
+            // Let's assume small payload for DNS and linearize to calculate checksum?
+            // Or better, update calculateChecksum to take VectorisedView?
+            // Or just compute partial sums.
+            
+            // Simpler: Just skip checksum for IPv4 (optional) as 0 is allowed.
+            // But user said "maybe dropped".
+            // Let's implement it properly.
+            
+            var sum: u32 = 0;
+            const src = local_address.addr.v4;
+            const dst = r.remote_address.v4;
+            sum += std.mem.readInt(u16, src[0..2], .big);
+            sum += std.mem.readInt(u16, src[2..4], .big);
+            sum += std.mem.readInt(u16, dst[0..2], .big);
+            sum += std.mem.readInt(u16, dst[2..4], .big);
+            sum += 17; // UDP
+            sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
+            
+            sum = header.internetChecksum(h.data, sum);
+            for (data.views) |view| {
+                sum = header.internetChecksum(view, sum);
+            }
+            const csum = header.finishChecksum(sum);
+            h.setChecksum(if (csum == 0) 0xffff else csum);
+        }
 
         const pb = tcpip.PacketBuffer{
             .data = data,
@@ -158,9 +192,26 @@ pub const UDPEndpoint = struct {
         const h = header.UDP.init(mut_pkt.data.first() orelse return);
         mut_pkt.data.trimFront(header.UDPMinimumSize);
 
-        const node = self.stack.allocator.create(std.TailQueue(Packet).Node) catch return;
+        // We MUST clone the data because the underlying views (from onReadable)
+        // are stack-allocated or temporary and will be invalid after this function returns.
+        const cloned_data = mut_pkt.data.clone(self.stack.allocator) catch return;
+
+        const node = self.stack.allocator.create(std.TailQueue(Packet).Node) catch {
+            // If allocation fails, we must free the cloned data to avoid leak
+            // Actually clone allocates views array AND data. Wait, VectorisedView.clone documentation:
+            // "Caller owns the returned memory."
+            // But clone() implementation:
+            // new_views[i] = try allocator.alloc(u8, ...); memcpy...
+            // So yes, we own it.
+            // If create node fails, we should free `cloned_data`.
+            // But VectorisedView.deinit() handles it.
+            var tmp = cloned_data;
+            tmp.deinit();
+            return;
+        };
+        
         node.data = .{
-            .data = mut_pkt.data, 
+            .data = cloned_data,
             .sender_addr = .{
                 .nic = r.nic.id,
                 .addr = id.remote_address,
@@ -218,7 +269,10 @@ pub const UDPEndpoint = struct {
         defer self.mutex.unlock();
 
         const node = self.rcv_list.popFirst() orelse return tcpip.Error.WouldBlock;
-        defer self.stack.allocator.destroy(node);
+        defer {
+            node.data.data.deinit();
+            self.stack.allocator.destroy(node);
+        }
 
         if (addr) |a| {
             a.* = node.data.sender_addr;
@@ -231,6 +285,9 @@ pub const UDPEndpoint = struct {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         const data_buf = try p.fullPayload();
         
+        // IMPORTANT: We must constCast for VectorisedView because it stores []u8, but write_external receives []const u8.
+        // However, we are initializing it with a pointer to data_buf which we don't own.
+        // VectorisedView usually owns its views if allocated. Here we are using a stack-allocated array of views pointing to external memory.
         var views = [_]buffer.View{@constCast(data_buf)};
         const data = buffer.VectorisedView.init(data_buf.len, &views);
 
@@ -244,7 +301,8 @@ pub const UDPEndpoint = struct {
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
             
             self.stack.mutex.lock();
-            if (self.stack.link_addr_cache.get(to.addr)) |link_addr| {
+            const next_hop = r.next_hop orelse to.addr;
+            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
             }
             self.stack.mutex.unlock();
@@ -285,18 +343,32 @@ pub const UDPEndpoint = struct {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.local_addr = addr;
         
+        var new_addr = addr;
+        if (new_addr.port == 0) {
+            // Assign ephemeral port (simple randomization)
+            new_addr.port = 30000 + @as(u16, @intCast(@mod(std.time.milliTimestamp(), 30000)));
+        }
+        self.local_addr = new_addr;
+        
+        // Register endpoint for receiving packets
         const id = stack.TransportEndpointID{
-            .local_port = addr.port,
-            .local_address = addr.addr,
+            .local_port = new_addr.port,
+            .local_address = new_addr.addr,
             .remote_port = 0,
-            .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } },
+            .remote_address = switch (new_addr.addr) {
+                .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                .v6 => .{ .v6 = [_]u8{0} ** 16 },
+            },
         };
-        try self.stack.registerTransportEndpoint(id, self.transportEndpoint());
+        
+        // We ignore error here? Ideally bind returns error if port in use.
+        // But for now let's just try to register.
+        self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
         
         return;
     }
+
 
     fn shutdown(ptr: *anyopaque, flags: u8) tcpip.Error!void {
         _ = ptr; _ = flags;

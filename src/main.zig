@@ -25,6 +25,7 @@ pub const transport = struct {
 pub const link = struct {
     pub const eth = @import("link/eth.zig");
 };
+pub const dns = @import("dns.zig");
 
 pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     var s = try stack.Stack.init(allocator);

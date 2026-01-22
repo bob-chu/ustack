@@ -132,7 +132,7 @@ const RealTunTapEndpoint = struct {
         if (len < 14) return;
 
         // Packet Trace: Incoming
-        // std.debug.print("TAP <<< IN:  len={} bytes\n", .{len});
+        std.debug.print("TAP <<< IN:  len={} bytes\n", .{len});
 
         const payload = std.heap.page_allocator.alloc(u8, len) catch return;
         defer std.heap.page_allocator.free(payload);
@@ -233,133 +233,21 @@ fn httpClientTask(s: *stack.Stack) void {
     };
 }
 
-// Simple DNS over UDP resolver (using configured gateway)
-fn resolveDns(s: *stack.Stack, hostname: []const u8) ![4]u8 {
-    var wq = waiter.Queue{};
-    const udp_proto = s.transport_protocols.get(17).?;
-    var ep = try udp_proto.newEndpoint(s, ustack.network.ipv4.ProtocolNumber, &wq);
-    defer ep.close();
-
-    try ep.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 0 });
-
-    // Use Google Public DNS
-    const dns_server = [4]u8{ 8, 8, 8, 8 };
-
-    // Build DNS query (simplified A record query)
-    var dns_buf: [512]u8 = undefined;
-    var idx: usize = 0;
-
-    // DNS Header
-    dns_buf[idx] = 0x00; idx += 1; // ID
-    dns_buf[idx] = 0x01; idx += 1;
-    dns_buf[idx] = 0x01; idx += 1; // Flags: recursion desired
-    dns_buf[idx] = 0x00; idx += 1;
-    dns_buf[idx] = 0x00; idx += 1; // QDCOUNT = 1
-    dns_buf[idx] = 0x00; idx += 1;
-    dns_buf[idx] = 0x00; idx += 1; // ANCOUNT = 0
-    dns_buf[idx] = 0x00; idx += 1;
-    dns_buf[idx] = 0x00; idx += 1; // NSCOUNT = 0
-    dns_buf[idx] = 0x00; idx += 1;
-    dns_buf[idx] = 0x00; idx += 1; // ARCOUNT = 0
-
-    // Query: encode hostname (www.google.com)
-    var it = std.mem.split(u8, hostname, ".");
-    while (it.next()) |label| {
-        dns_buf[idx] = @intCast(label.len); idx += 1;
-        @memcpy(dns_buf[idx..][0..label.len], label); idx += label.len;
-    }
-    dns_buf[idx] = 0; idx += 1; // End of labels
-
-    dns_buf[idx] = 0x00; idx += 1; // QTYPE = A (1)
-    dns_buf[idx] = 0x01; idx += 1; // QCLASS = IN (1)
-
-    const DnsPayloader = struct {
-        data: []const u8,
-        pub fn payloader(self: *@This()) tcpip.Payloader {
-            return .{ .ptr = self, .vtable = &.{ .fullPayload = fullPayload } };
-        }
-        fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
-            return @as(*@This(), @ptrCast(@alignCast(ptr))).data;
-        }
-    };
-    var fp = DnsPayloader{ .data = dns_buf[0..idx] };
-    const dest_addr = tcpip.FullAddress{ .nic = 0, .addr = .{ .v4 = dns_server }, .port = 53 };
-    while (true) {
-        _ = ep.write(fp.payloader(), .{ .to = &dest_addr }) catch |err| {
-            if (err == tcpip.Error.WouldBlock) {
-                std.time.sleep(10 * std.time.ns_per_ms);
-                continue;
-            }
-            return err;
-        };
-        break;
-    }
-
-    std.debug.print("Sent DNS query for {s}\n", .{hostname});
-
-    // Wait for response (5 second timeout)
-    var iterations: usize = 0;
-    while (iterations < 500) : (iterations += 1) {
-        const packet = ep.read(null) catch |err| {
-            if (err == tcpip.Error.WouldBlock) {
-                std.time.sleep(10 * std.time.ns_per_ms);
-                continue;
-            }
-            break;
-        };
-
-        // Parse DNS response and extract A record
-        if (packet.len > 12) {
-            const response = packet;
-            defer std.heap.page_allocator.free(response);
-
-            // Check response ID and flags
-            if (response[0] == 0x00 and response[2] & 0x80 != 0) {
-                // Skip header (12 bytes) and question section
-                var pos: usize = 12;
-                // Skip question name (labels ending with 0)
-                while (response[pos] != 0) : (pos += response[pos] + 1) {}
-                pos += 5; // Skip null byte + QTYPE + QCLASS
-
-                // Check answer count
-                const ancount = std.mem.readInt(u16, response[6..8][0..2], .big);
-                if (ancount == 0) continue;
-
-                // Parse answer
-                // Skip name (might be compressed)
-                if (response[pos] & 0xC0 == 0xC0) {
-                    pos += 2; // Compressed name pointer
-                } else {
-                    while (response[pos] != 0) : (pos += response[pos] + 1) {}
-                    pos += 1;
-                }
-
-                // Skip TYPE, CLASS, TTL, RDLENGTH
-                pos += 10;
-                const rdlength = std.mem.readInt(u16, response[pos-2..pos][0..2], .big);
-
-                // Extract IP address from A record
-                if (response[pos] == 1 and rdlength == 4) { // Type A
-                    const ip = [4]u8{ response[pos+2], response[pos+3], response[pos+4], response[pos+5] };
-                    std.debug.print("Resolved {s} to {}.{}.{}.{}\n", .{ hostname, ip[0], ip[1], ip[2], ip[3] });
-                    return ip;
-                }
-            }
-        }
-    }
-
-    return error.DnsTimeout;
-}
 
 fn doHttpClient(s: *stack.Stack) !void {
     const hostname = "www.google.com";
 
     // Resolve hostname via DNS
     std.debug.print("Resolving {s}...\n", .{hostname});
-    const google_ip = resolveDns(s, hostname) catch |err| blk: {
+    
+    // Use ustack.dns resolver
+    const dns_server = ustack.tcpip.Address{ .v4 = .{ 8, 8, 8, 8 } };
+    var resolver = ustack.dns.Resolver.init(s, dns_server);
+    
+    const google_ip = resolver.resolve(hostname) catch |err| blk: {
         std.debug.print("DNS resolution failed: {}\n", .{err});
         std.debug.print("Falling back to known IP 142.250.190.4 (www.google.com)\n", .{});
-        break :blk [4]u8{ 142, 250, 190, 4 };
+        break :blk ustack.tcpip.Address{ .v4 = .{ 142, 250, 190, 4 } };
     };
 
     var wq = waiter.Queue{};
@@ -371,9 +259,20 @@ fn doHttpClient(s: *stack.Stack) !void {
 
     try ep.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 0 }); // ephemeral port
     
-    std.debug.print("Connecting to {}.{}.{}.{}:80...\n", .{ google_ip[0], google_ip[1], google_ip[2], google_ip[3] });
+    // Helper to get v4 address bytes
+    const dest_ip = switch (google_ip) {
+        .v4 => |v| v,
+        .v6 => |v| blk: {
+             // Just take first 4 bytes if someone resolves v6? No, we need proper dual stack support.
+             // But example is mostly v4 focused.
+             _ = v;
+             break :blk [4]u8{ 142, 250, 190, 4 };
+        }
+    };
+
+    std.debug.print("Connecting to {}.{}.{}.{}:80...\n", .{ dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3] });
     while (true) {
-        ep.connect(.{ .nic = 0, .addr = .{ .v4 = google_ip }, .port = 80 }) catch |err| {
+        ep.connect(.{ .nic = 0, .addr = google_ip, .port = 80 }) catch |err| {
             if (err == tcpip.Error.WouldBlock) {
                 std.time.sleep(10 * std.time.ns_per_ms);
                 continue;

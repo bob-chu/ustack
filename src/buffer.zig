@@ -80,6 +80,11 @@ pub const VectorisedView = struct {
         const out = try allocator.alloc(u8, self.size);
         var offset: usize = 0;
         for (self.views) |v| {
+            if (offset + v.len > out.len) {
+                // Should not happen if size is correct, but safe guard
+                @memcpy(out[offset..], v[0 .. out.len - offset]);
+                break;
+            }
             @memcpy(out[offset .. offset + v.len], v);
             offset += v.len;
         }

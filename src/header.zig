@@ -295,6 +295,7 @@ pub const ARP = struct {
 pub const UDPMinimumSize = 8;
 
 pub const UDP = struct {
+    pub const ProtocolNumber = 17;
     data: []u8,
 
     pub fn init(data: []u8) UDP {
@@ -331,6 +332,20 @@ pub const UDP = struct {
 
     pub fn setChecksum(self: UDP, c: u16) void {
         std.mem.writeInt(u16, self.data[6..8], c, .big);
+    }
+
+    pub fn calculateChecksum(self: UDP, src: [4]u8, dst: [4]u8, payload: []const u8) u16 {
+        var sum: u32 = 0;
+        sum += std.mem.readInt(u16, src[0..2], .big);
+        sum += std.mem.readInt(u16, src[2..4], .big);
+        sum += std.mem.readInt(u16, dst[0..2], .big);
+        sum += std.mem.readInt(u16, dst[2..4], .big);
+        sum += 17; // Protocol UDP
+        sum += @as(u16, @intCast(self.data.len + payload.len));
+
+        sum = internetChecksum(self.data, sum);
+        sum = internetChecksum(payload, sum);
+        return finishChecksum(sum);
     }
 };
 
@@ -601,6 +616,64 @@ pub const ICMPv6OptionPrefix = struct {
         var addr: [16]u8 = undefined;
         @memcpy(&addr, self.data[16..32]);
         return addr;
+    }
+};
+
+pub const DNSHeaderSize = 12;
+
+pub const DNS = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) DNS {
+        return .{ .data = data };
+    }
+
+    pub fn id(self: DNS) u16 {
+        return std.mem.readInt(u16, self.data[0..2], .big);
+    }
+
+    pub fn flags(self: DNS) u16 {
+        return std.mem.readInt(u16, self.data[2..4], .big);
+    }
+
+    pub fn questionCount(self: DNS) u16 {
+        return std.mem.readInt(u16, self.data[4..6], .big);
+    }
+
+    pub fn answerCount(self: DNS) u16 {
+        return std.mem.readInt(u16, self.data[6..8], .big);
+    }
+
+    pub fn authorityCount(self: DNS) u16 {
+        return std.mem.readInt(u16, self.data[8..10], .big);
+    }
+
+    pub fn additionalCount(self: DNS) u16 {
+        return std.mem.readInt(u16, self.data[10..12], .big);
+    }
+
+    pub fn setId(self: DNS, i: u16) void {
+        std.mem.writeInt(u16, self.data[0..2], i, .big);
+    }
+
+    pub fn setFlags(self: DNS, f: u16) void {
+        std.mem.writeInt(u16, self.data[2..4], f, .big);
+    }
+
+    pub fn setQuestionCount(self: DNS, c: u16) void {
+        std.mem.writeInt(u16, self.data[4..6], c, .big);
+    }
+
+    pub fn setAnswerCount(self: DNS, c: u16) void {
+        std.mem.writeInt(u16, self.data[6..8], c, .big);
+    }
+
+    pub fn setAuthorityCount(self: DNS, c: u16) void {
+        std.mem.writeInt(u16, self.data[8..10], c, .big);
+    }
+
+    pub fn setAdditionalCount(self: DNS, c: u16) void {
+        std.mem.writeInt(u16, self.data[10..12], c, .big);
     }
 };
 

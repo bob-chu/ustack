@@ -680,6 +680,27 @@ pub const Stack = struct {
             if (listener_opt) |ep| {
                 ep.handlePacket(r, id, pkt);
                 ep.decRef();
+            } else {
+                // Try INADDR_ANY (0.0.0.0 / ::)
+                const any_addr = switch (r.local_address) {
+                    .v4 => tcpip.Address{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => tcpip.Address{ .v6 = [_]u8{0} ** 16 },
+                };
+                
+                const any_id = TransportEndpointID{
+                    .local_port = ports.dst,
+                    .local_address = any_addr,
+                    .remote_port = 0,
+                    .remote_address = switch (r.local_address) {
+                        .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                        .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                    },
+                };
+                
+                if (self.endpoints.get(any_id)) |ep| {
+                    ep.handlePacket(r, id, pkt);
+                    ep.decRef();
+                }
             }
         }
     }
