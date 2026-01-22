@@ -111,7 +111,10 @@ pub const UDPEndpoint = struct {
                 .local_port = la.port,
                 .local_address = la.addr,
                 .remote_port = 0,
-                .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } },
+                .remote_address = switch (la.addr) {
+                    .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                },
             };
             self.stack.unregisterTransportEndpoint(id);
         }
@@ -146,19 +149,6 @@ pub const UDPEndpoint = struct {
         
         // Calculate Checksum if IPv4
         if (local_address.addr == .v4 and r.remote_address == .v4) {
-            // Need contiguous buffer for checksum?
-            // VectorisedView is not contiguous. 
-            // We can iterate views or linearize.
-            // For now, let's just linearize if needed or support scattered checksum.
-            // internetChecksum takes []const u8.
-            // Let's assume small payload for DNS and linearize to calculate checksum?
-            // Or better, update calculateChecksum to take VectorisedView?
-            // Or just compute partial sums.
-            
-            // Simpler: Just skip checksum for IPv4 (optional) as 0 is allowed.
-            // But user said "maybe dropped".
-            // Let's implement it properly.
-            
             var sum: u32 = 0;
             const src = local_address.addr.v4;
             const dst = r.remote_address.v4;
@@ -197,14 +187,6 @@ pub const UDPEndpoint = struct {
         const cloned_data = mut_pkt.data.clone(self.stack.allocator) catch return;
 
         const node = self.stack.allocator.create(std.TailQueue(Packet).Node) catch {
-            // If allocation fails, we must free the cloned data to avoid leak
-            // Actually clone allocates views array AND data. Wait, VectorisedView.clone documentation:
-            // "Caller owns the returned memory."
-            // But clone() implementation:
-            // new_views[i] = try allocator.alloc(u8, ...); memcpy...
-            // So yes, we own it.
-            // If create node fails, we should free `cloned_data`.
-            // But VectorisedView.deinit() handles it.
             var tmp = cloned_data;
             tmp.deinit();
             return;
@@ -285,9 +267,6 @@ pub const UDPEndpoint = struct {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         const data_buf = try p.fullPayload();
         
-        // IMPORTANT: We must constCast for VectorisedView because it stores []u8, but write_external receives []const u8.
-        // However, we are initializing it with a pointer to data_buf which we don't own.
-        // VectorisedView usually owns its views if allocated. Here we are using a stack-allocated array of views pointing to external memory.
         var views = [_]buffer.View{@constCast(data_buf)};
         const data = buffer.VectorisedView.init(data_buf.len, &views);
 
@@ -362,8 +341,6 @@ pub const UDPEndpoint = struct {
             },
         };
         
-        // We ignore error here? Ideally bind returns error if port in use.
-        // But for now let's just try to register.
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
         
         return;
@@ -386,8 +363,10 @@ pub const UDPEndpoint = struct {
     }
 
     fn getLocalAddress(ptr: *anyopaque) tcpip.Error!tcpip.FullAddress {
-        _ = ptr;
-        return tcpip.Error.UnknownProtocol;
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.local_addr orelse tcpip.Error.InvalidEndpointState;
     }
 
     fn getRemoteAddress(ptr: *anyopaque) tcpip.Error!tcpip.FullAddress {

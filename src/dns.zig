@@ -42,9 +42,9 @@ pub const Resolver = struct {
         });
         
         // Debug: check assigned port
-        if (ep.getLocalAddress()) |la| {
-            std.debug.print("DNS: Bound to port {}\n", .{la.port});
-        } else |_| {}
+        // if (ep.getLocalAddress()) |la| {
+        //     std.debug.print("DNS: Bound to port {}\n", .{la.port});
+        // } else |_| {}
 
         // Build DNS query
         var dns_buf = try self.allocator.alloc(u8, 512);
@@ -93,7 +93,6 @@ pub const Resolver = struct {
             .port = 53 
         };
 
-        std.debug.print("DNS: Sending Query ID=0x{x}\n", .{query_id});
 
         // Send Query
         while (true) {
@@ -119,12 +118,10 @@ pub const Resolver = struct {
             };
             defer self.allocator.free(packet);
 
-            std.debug.print("DNS: Rx Packet len={}\n", .{packet.len});
 
             if (packet.len < header.DNSHeaderSize) continue;
             
             const resp_h = header.DNS.init(@constCast(packet[0..header.DNSHeaderSize]));
-            std.debug.print("DNS: Rx ID=0x{x} Flags=0x{x}\n", .{resp_h.id(), resp_h.flags()});
             
             if (resp_h.id() != query_id) continue;
             
@@ -144,7 +141,6 @@ pub const Resolver = struct {
 
             // Parse Answers
             var ans_count = resp_h.answerCount();
-            std.debug.print("DNS: Answers={}\n", .{ans_count});
             
             while (ans_count > 0 and pos < packet.len) : (ans_count -= 1) {
                 // Name
@@ -165,7 +161,6 @@ pub const Resolver = struct {
                 const rdlen = std.mem.readInt(u16, packet[pos+8..][0..2], .big);
                 pos += 10;
 
-                std.debug.print("DNS: Record Type={} Len={}\n", .{rtype, rdlen});
 
                 if (pos + rdlen > packet.len) break;
 

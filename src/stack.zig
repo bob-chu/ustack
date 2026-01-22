@@ -700,6 +700,13 @@ pub const Stack = struct {
                 if (self.endpoints.get(any_id)) |ep| {
                     ep.handlePacket(r, id, pkt);
                     ep.decRef();
+                } else {
+                    if (protocol == 17) {
+                         std.debug.print("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}\n", .{ports.dst, id.hash(), listener_id.hash(), any_id.hash()});
+                         // print ids
+                         std.debug.print("Exact: local={any}:{} remote={any}:{}\n", .{id.local_address, id.local_port, id.remote_address, id.remote_port});
+                         std.debug.print("Any: local={any}:{} remote={any}:{}\n", .{any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port});
+                    }
                 }
             }
         }
