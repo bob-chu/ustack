@@ -55,7 +55,7 @@ pub const UDPEndpoint = struct {
     waiter_queue: *waiter.Queue,
     rcv_list: std.TailQueue(Packet),
     mutex: std.Thread.Mutex = .{},
-    ref_count: std.atomic.Atomic(usize) = std.atomic.Atomic(usize).init(1),
+    ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
     
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
@@ -83,12 +83,12 @@ pub const UDPEndpoint = struct {
     };
 
     pub fn incRef(self: *UDPEndpoint) void {
-        _ = self.ref_count.fetchAdd(1, .Monotonic);
+        _ = self.ref_count.fetchAdd(1, .monotonic);
     }
 
     pub fn decRef(self: *UDPEndpoint) void {
-        if (self.ref_count.fetchSub(1, .Release) == 1) {
-            self.ref_count.fence(.Acquire);
+        if (self.ref_count.fetchSub(1, .release) == 1) {
+            self.ref_count.fence(.acquire);
             self.destroy();
         }
     }
@@ -128,10 +128,10 @@ pub const UDPEndpoint = struct {
         self.decRef();
     }
 
-    pub fn write(self: *UDPEndpoint, r: *stack.Route, data: buffer.VectorisedView) tcpip.Error!void {
+    pub fn write(self: *UDPEndpoint, r: *stack.Route, remote_port: u16, data: buffer.VectorisedView) tcpip.Error!void {
         const local_address = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
         
-        var hdr_buf = self.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
+        const hdr_buf = self.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer self.stack.allocator.free(hdr_buf);
         
         var pre = buffer.Prependable.init(hdr_buf);
@@ -139,13 +139,11 @@ pub const UDPEndpoint = struct {
         var h = header.UDP.init(udp_hdr);
         
         h.setSourcePort(local_address.port);
-        
-        const remote_port = self.remote_addr.?.port; 
         h.setDestinationPort(remote_port);
         h.setLength(@as(u16, @intCast(header.UDPMinimumSize + data.size)));
         h.setChecksum(0);
 
-        var pb = tcpip.PacketBuffer{
+        const pb = tcpip.PacketBuffer{
             .data = data,
             .header = pre,
         };
@@ -237,7 +235,7 @@ pub const UDPEndpoint = struct {
             }
             self.stack.mutex.unlock();
 
-            try self.write(&r, data);
+            try self.write(&r, to.port, data);
         } else if (self.remote_addr) |to| {
             const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
             
@@ -253,7 +251,7 @@ pub const UDPEndpoint = struct {
             }
             self.stack.mutex.unlock();
 
-            try self.write(&r, data);
+            try self.write(&r, to.port, data);
         } else {
             return tcpip.Error.DestinationRequired;
         }

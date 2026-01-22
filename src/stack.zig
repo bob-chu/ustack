@@ -367,11 +367,11 @@ const RouteTable = struct {
         defer self.mutex.unlock();
 
         var best_route: ?*RouteEntry = null;
-        for (self.routes.items) |route_entry| {
+        for (self.routes.items) |*route_entry| {
             // Check if destination matches this route
             if (route_entry.destination.contains(dest)) {
                 // Check NIC match if specified
-                if (best_route == null or route_entry.destination.gt(best_route.*.destination)) {
+                if (best_route == null or route_entry.destination.gt(best_route.?.destination.prefix)) {
                     best_route = route_entry;
                 }
             }
@@ -459,14 +459,13 @@ pub const Stack = struct {
 
     // Find route using longest-prefix matching in routing table
     pub fn findRoute(self: *Stack, nic_id: tcpip.NICID, local_addr: tcpip.Address, remote_addr: tcpip.Address, net_proto: tcpip.NetworkProtocolNumber) !Route {
-        self.mutex.lock();
-        const nic_opt = self.nics.get(nic_id);
-        self.mutex.unlock();
-         
-        const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
-        
-        // If NIC is specified, use it directly (old behavior for compatibility)
         if (nic_id != 0) {
+            self.mutex.lock();
+            const nic_opt = self.nics.get(nic_id);
+            self.mutex.unlock();
+             
+            const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
+            
             return Route{
                 .local_address = local_addr,
                 .remote_address = remote_addr,
@@ -479,6 +478,12 @@ pub const Stack = struct {
 
         // Find route in routing table (longest-prefix matching)
         const route_entry = self.route_table.findRoute(remote_addr, nic_id) orelse return tcpip.Error.NoRoute;
+        
+        self.mutex.lock();
+        const nic_opt = self.nics.get(route_entry.nic);
+        self.mutex.unlock();
+         
+        const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
         
         return Route{
             .local_address = local_addr,
@@ -493,7 +498,7 @@ pub const Stack = struct {
 
     // Add a route to the routing table
     pub fn addRoute(self: *Stack, route: RouteEntry) !void {
-        self.route_table.addRoute(route);
+        try self.route_table.addRoute(route);
     }
 
     // Set entire route table (replaces existing)

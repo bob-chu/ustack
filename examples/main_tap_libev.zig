@@ -56,7 +56,7 @@ const RealTunTapEndpoint = struct {
     dispatcher: ?*stack.NetworkDispatcher = null,
 
     pub fn init(dev_name: [:0]const u8) !RealTunTapEndpoint {
-        const fd = try std.os.open("/dev/net/tun", std.os.O.RDWR, 0);
+        const fd = try std.posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
         
         if (my_tuntap_init(fd, dev_name) < 0) {
             return error.TunsetiffFailed;
@@ -86,15 +86,15 @@ const RealTunTapEndpoint = struct {
         const hdr_len = pkt.header.usedLength();
         
         // Construct iovecs
-        var iovecs = std.heap.page_allocator.alloc(std.os.iovec_const, 1 + pkt.data.views.len) catch return tcpip.Error.NoBufferSpace;
+        var iovecs = std.heap.page_allocator.alloc(std.posix.iovec_const, 1 + pkt.data.views.len) catch return tcpip.Error.NoBufferSpace;
         defer std.heap.page_allocator.free(iovecs);
         
-        iovecs[0] = .{ .iov_base = pkt.header.view().ptr, .iov_len = hdr_len };
+        iovecs[0] = .{ .base = pkt.header.view().ptr, .len = hdr_len };
         for (pkt.data.views, 0..) |v, i| {
-            iovecs[i+1] = .{ .iov_base = v.ptr, .iov_len = v.len };
+            iovecs[i+1] = .{ .base = v.ptr, .len = v.len };
         }
         
-        _ = std.os.writev(self.fd, iovecs) catch |err| {
+        _ = std.posix.writev(self.fd, iovecs) catch |err| {
             std.debug.print("TAP: writev error: {}\n", .{err});
             return tcpip.Error.UnknownDevice;
         };
@@ -125,27 +125,29 @@ const RealTunTapEndpoint = struct {
 
     pub fn onReadable(self: *RealTunTapEndpoint) !void {
         var buf: [2000]u8 = undefined;
-        const len = std.os.read(self.fd, &buf) catch return;
+        const len = std.posix.read(self.fd, &buf) catch |err| {
+            std.debug.print("TAP: read error: {}\n", .{err});
+            return;
+        };
         if (len < 14) return;
 
         // Packet Trace: Incoming
-        std.debug.print("TAP <<< IN:  len={} bytes=", .{len});
-        for (buf[0..len]) |b| std.debug.print("{x:0>2} ", .{b});
-        std.debug.print("\n", .{});
+        // std.debug.print("TAP <<< IN:  len={} bytes\n", .{len});
 
-        var payload = std.heap.page_allocator.alloc(u8, len) catch return;
+        const payload = std.heap.page_allocator.alloc(u8, len) catch return;
+        defer std.heap.page_allocator.free(payload);
         @memcpy(payload, buf[0..len]);
         
-        var views = [_]buffer.View{payload};
-        var pkt = tcpip.PacketBuffer{
+        var views = [1]buffer.View{payload};
+        
+        const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(payload.len, &views),
-            .header = undefined,
+            .header = buffer.Prependable.init(&[_]u8{}),
         };
 
         if (self.dispatcher) |d| {
             d.deliverNetworkPacket([_]u8{0}**6, [_]u8{0}**6, 0, pkt);
         }
-        std.heap.page_allocator.free(payload);
     }
 };
 
@@ -191,18 +193,18 @@ pub fn main() !void {
         .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 },
     });
 
-    // Configure routing table with default gateway (192.168.1.1)
-    // This enables access to internet via NAT/router
+    // Configure routing table with default gateway (10.0.0.1)
+    // This enables access to internet via NAT/router on the host
     try s.addRoute(.{
-        .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 },
-        .gateway = .{ .v4 = .{ 192, 168, 1, 1 } },
+        .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 },
+        .gateway = .{ .v4 = .{ 10, 0, 0, 1 } },
         .nic = 1,
         .mtu = 1500,
     });
     
     std.debug.print("Example: TAP + Libev starting...\n", .{});
 
-    var loop = my_ev_default_loop() orelse {
+    const loop = my_ev_default_loop() orelse {
         std.debug.print("Failed to initialize libev loop\n", .{});
         return;
     };
@@ -236,8 +238,8 @@ fn resolveDns(s: *stack.Stack, hostname: []const u8) ![4]u8 {
 
     try ep.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 0 });
 
-    // Use default gateway as DNS server
-    const dns_server = [4]u8{ 192, 168, 1, 1 };
+    // Use Google Public DNS
+    const dns_server = [4]u8{ 8, 8, 8, 8 };
 
     // Build DNS query (simplified A record query)
     var dns_buf: [512]u8 = undefined;
@@ -277,7 +279,17 @@ fn resolveDns(s: *stack.Stack, hostname: []const u8) ![4]u8 {
         }
     };
     var fp = DnsPayloader{ .data = dns_buf[0..idx] };
-    _ = try ep.write(.{ .nic = 1, .addr = .{ .v4 = dns_server }, .port = 53 }, fp.payloader(), .{});
+    const dest_addr = tcpip.FullAddress{ .nic = 0, .addr = .{ .v4 = dns_server }, .port = 53 };
+    while (true) {
+        _ = ep.write(fp.payloader(), .{ .to = &dest_addr }) catch |err| {
+            if (err == tcpip.Error.WouldBlock) {
+                std.time.sleep(10 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        break;
+    }
 
     std.debug.print("Sent DNS query for {s}\n", .{hostname});
 
@@ -293,8 +305,8 @@ fn resolveDns(s: *stack.Stack, hostname: []const u8) ![4]u8 {
         };
 
         // Parse DNS response and extract A record
-        if (packet.data.size > 12) {
-            const response = packet.data.toView(std.heap.page_allocator) catch continue;
+        if (packet.len > 12) {
+            const response = packet;
             defer std.heap.page_allocator.free(response);
 
             // Check response ID and flags
@@ -306,7 +318,7 @@ fn resolveDns(s: *stack.Stack, hostname: []const u8) ![4]u8 {
                 pos += 5; // Skip null byte + QTYPE + QCLASS
 
                 // Check answer count
-                const ancount = std.mem.readInt(u16, response[6..8], .big);
+                const ancount = std.mem.readInt(u16, response[6..8][0..2], .big);
                 if (ancount == 0) continue;
 
                 // Parse answer
@@ -320,7 +332,7 @@ fn resolveDns(s: *stack.Stack, hostname: []const u8) ![4]u8 {
 
                 // Skip TYPE, CLASS, TTL, RDLENGTH
                 pos += 10;
-                const rdlength = std.mem.readInt(u16, response[pos-2..pos], .big);
+                const rdlength = std.mem.readInt(u16, response[pos-2..pos][0..2], .big);
 
                 // Extract IP address from A record
                 if (response[pos] == 1 and rdlength == 4) { // Type A
@@ -339,10 +351,11 @@ fn doHttpClient(s: *stack.Stack) !void {
     const hostname = "www.google.com";
 
     // Resolve hostname via DNS
-    const google_ip = resolveDns(s, hostname) catch |err| {
+    std.debug.print("Resolving {s}...\n", .{hostname});
+    const google_ip = resolveDns(s, hostname) catch |err| blk: {
         std.debug.print("DNS resolution failed: {}\n", .{err});
-        std.debug.print("Falling back to known IP 142.250.80.46\n", .{});
-        return error.DnsFailed;
+        std.debug.print("Falling back to known IP 142.250.190.4 (www.google.com)\n", .{});
+        break :blk [4]u8{ 142, 250, 190, 4 };
     };
 
     var wq = waiter.Queue{};
@@ -351,13 +364,34 @@ fn doHttpClient(s: *stack.Stack) !void {
     defer ep.close();
 
     try ep.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 0 }); // ephemeral port
-    try ep.connect(.{ .nic = 1, .addr = .{ .v4 = google_ip }, .port = 80 });
+    
+    std.debug.print("Connecting to {}.{}.{}.{}:80...\n", .{ google_ip[0], google_ip[1], google_ip[2], google_ip[3] });
+    while (true) {
+        ep.connect(.{ .nic = 0, .addr = .{ .v4 = google_ip }, .port = 80 }) catch |err| {
+            if (err == tcpip.Error.WouldBlock) {
+                std.time.sleep(10 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        break;
+    }
 
-    std.debug.print("Connected to {}.{}.{}.{}:80\n", .{ google_ip[0], google_ip[1], google_ip[2], google_ip[3] });
+    // Wait for connection to be established
+    const tcp_ep = @as(*ustack.transport.tcp.TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
+    var connect_timeout: usize = 0;
+    while (tcp_ep.state != .established) {
+        if (tcp_ep.state == .error_state or tcp_ep.state == .closed) return error.ConnectFailed;
+        std.time.sleep(10 * std.time.ns_per_ms);
+        connect_timeout += 1;
+        if (connect_timeout > 1000) return error.ConnectTimeout; // 10 seconds
+    }
+
+    std.debug.print("Connected to {s} (80)\n", .{hostname});
 
     // Construct HTTP request with proper Host header
     var request_buf: [256]u8 = undefined;
-    const request = try std.fmt.bufPrint(&request_buf, "GET / HTTP/1.0\r\nHost: {s}\r\nUser-Agent: ustack/0.1\r\nAccept: */*\r\n\r\n", .{hostname});
+    const request = try std.fmt.bufPrint(&request_buf, "GET / HTTP/1.1\r\nHost: {s}\r\nUser-Agent: ustack/0.1\r\nConnection: close\r\n\r\n", .{hostname});
 
     const MyPayloader = struct {
         data: []const u8,
@@ -369,7 +403,16 @@ fn doHttpClient(s: *stack.Stack) !void {
         }
     };
     var fp = MyPayloader{ .data = request };
-    _ = try ep.write(fp.payloader(), .{});
+    while (true) {
+        _ = ep.write(fp.payloader(), .{}) catch |err| {
+            if (err == tcpip.Error.WouldBlock) {
+                std.time.sleep(10 * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        break;
+    }
 
     std.debug.print("Sent HTTP request to {s}\n", .{hostname});
 
@@ -383,12 +426,27 @@ fn doHttpClient(s: *stack.Stack) !void {
             }
             break;
         };
+        if (view.len == 0) {
+            std.debug.print("EOF reached (peer closed connection)\n", .{});
+            break;
+        }
         total_received += view.len;
-        std.debug.print("Received {} bytes:\n{s}\n", .{ view.len, view });
+        std.debug.print("Received {} bytes\n", .{ view.len });
 
         // Stop after receiving reasonable amount of data
-        if (total_received > 5000) break;
+        if (total_received > 20000) break;
     }
 
-    std.debug.print("\nTotal received: {} bytes\n", .{total_received});
+    std.debug.print("\nTotal received: {} bytes. Closing gracefully...\n", .{total_received});
+    
+    try ep.shutdown(0);
+    
+    // Wait for stack to reach CLOSED state
+    while (tcp_ep.state != .closed) {
+        std.time.sleep(10 * std.time.ns_per_ms);
+    }
+    
+    std.debug.print("Connection closed gracefully. Exiting in 1 second...\n", .{});
+    std.time.sleep(1000 * std.time.ns_per_ms);
+    std.process.exit(0);
 }
