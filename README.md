@@ -168,56 +168,90 @@ stateDiagram-v2
 *   **Pluggable Congestion Control**: Switch between NewReno, CUBIC, and BBR at runtime per endpoint.
 *   **Dual Stack**: Simultaneous IPv4 and IPv6 support on the same NICs.
 
-## 6. Running Tests and Examples
+*   **DNS Resolver**: Built-in, robust DNS client (`ustack.dns`) supporting A record lookup, timeouts, and ephemeral port binding.
 
-### Run Library Tests
+## 6. Building and Usage
+
+### 6.1 Prerequisites
+*   **Zig 0.13.0** or newer.
+*   **libev** and **libuv** (development headers) for examples.
+
+### 6.2 Build Library
+The project builds both static (`libustack.a`) and dynamic (`libustack.so` / `.dylib`) libraries.
+
 ```bash
-# Inside ustack/ directory
+zig build
+# Artifacts will be in zig-out/lib/
+```
+
+### 6.3 Run Tests
+Execute the comprehensive test suite (including unit tests for TCP, IPv6, DNS, etc.):
+```bash
 zig test src/main.zig
 ```
 
-### Build Examples
-The examples require `libuv` and `libev` development headers installed on your system.
+### 6.4 Build and Run Examples
+The examples demonstrate how to integrate the `ustack` library with system interfaces (TAP, AF_PACKET) and event loops (libev, libuv). They link against the built `libustack` static library.
+
 ```bash
-# Inside ustack/ directory
+# Build all examples
 zig build example
+
+# Run the TAP example (requires root/CAP_NET_ADMIN for TAP device creation)
+sudo ./zig-out/bin/example_tap_libev
 ```
-The binaries will be located in `zig-out/bin/`.
 
-## 7. Integration Examples
+## 7. API Usage Guide
 
-
+### 7.1 Initialization and DNS Resolution
 ```zig
-const stack = @import("stack.zig");
-const tcpip = @import("tcpip.zig");
+const ustack = @import("ustack");
 
 // 1. Initialize Stack
-var s = try stack.Stack.init(allocator);
+var s = try ustack.init(allocator);
 
-// 2. Create NIC
-const link_ep = ...; // Your hardware or pipe endpoint
-try s.createNIC(1, link_ep);
+// 2. Initialize Resolver
+const dns_server = ustack.tcpip.Address{ .v4 = .{ 8, 8, 8, 8 } };
+var resolver = ustack.dns.Resolver.init(&s, dns_server);
 
-// 3. Create TCP Endpoint
-var ep = try s.transport_protocols.get(6).?.newEndpoint(&s, ustack.network.ipv4.ProtocolNumber, &wq);
-defer ep.close();
-
-// 4. Configure Options (Optional)
-try ep.setOption(.{ .ts_enabled = true });
-
-// 5. Bind and Listen
-const addr = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 80 };
-try ep.bind(addr);
-try ep.listen(128);
-
-// 6. Accept connections
-while (true) {
-    const new_conn = try ep.accept();
-    // Handle new_conn.ep (e.g. read HTTP request)
-}
+// 3. Resolve Hostname
+const ip = try resolver.resolve("example.com");
 ```
 
-## 7. Integration Examples
+### 7.2 TCP Client
+```zig
+// 1. Create Endpoint
+var wq = ustack.waiter.Queue{};
+const tcp_proto = s.transport_protocols.get(6).?; // TCP = 6
+var ep = try tcp_proto.newEndpoint(&s, ustack.network.ipv4.ProtocolNumber, &wq);
+defer ep.close();
+
+// 2. Configure Options
+try ep.setOption(.{ .ts_enabled = true }); // Enable RFC 1323 Timestamps
+
+// 3. Connect
+const dest = ustack.tcpip.FullAddress{ .nic = 0, .addr = ip, .port = 80 };
+try ep.connect(dest);
+
+// 4. Send Data
+const request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+var payload = MyPayloader{ .data = request };
+_ = try ep.write(payload.payloader(), .{});
+```
+
+### 7.3 TCP Server
+```zig
+// 1. Bind and Listen
+const bind_addr = ustack.tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 8080 };
+try ep.bind(bind_addr);
+try ep.listen(128); // Backlog size
+
+// 2. Accept Loop
+while (true) {
+    const new_conn = try ep.accept();
+    // Handle new_conn.ep in a new task/thread
+}
+```
 
 The `examples/` directory contains reference implementations for integrating `ustack` with real-world I/O mechanisms:
 
