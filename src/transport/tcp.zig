@@ -103,6 +103,10 @@ pub const TCPEndpoint = struct {
     last_ack: u32 = 0,
     rcv_packets_since_ack: u32 = 0,
 
+    // TCP Options
+    ts_enabled: bool = false,
+    ts_recent: u32 = 0,
+
     cc: congestion.CongestionControl,
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
@@ -110,6 +114,17 @@ pub const TCPEndpoint = struct {
     rcv_list: std.TailQueue(Packet) = .{},
     snd_queue: std.TailQueue(Segment) = .{},
     retransmit_timer: time.Timer = undefined,
+
+    backlog: i32 = 0,
+    syncache: std.ArrayList(SyncacheEntry) = undefined,
+
+    pub const SyncacheEntry = struct {
+        remote_addr: tcpip.FullAddress,
+        rcv_nxt: u32,
+        snd_nxt: u32,
+        ts_recent: u32,
+        ts_enabled: bool,
+    };
 
     pub const Segment = struct {
         data: buffer.VectorisedView,
@@ -128,6 +143,7 @@ pub const TCPEndpoint = struct {
             .cc = cc,
             .rcv_wnd = 65535,
             .retransmit_timer = time.Timer.init(handleRetransmitTimer, undefined), // Context set later
+            .syncache = std.ArrayList(SyncacheEntry).init(s.allocator),
         };
     }
 
@@ -169,7 +185,27 @@ pub const TCPEndpoint = struct {
         .bind = bind,
         .getLocalAddress = getLocalAddress,
         .getRemoteAddress = getRemoteAddress,
+        .setOption = setOption,
+        .getOption = getOption,
     };
+
+    fn setOption(ptr: *anyopaque, opt: tcpip.EndpointOption) tcpip.Error!void {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (opt) {
+            .ts_enabled => |v| self.ts_enabled = v,
+        }
+    }
+
+    fn getOption(ptr: *anyopaque, opt: tcpip.EndpointOptionType) tcpip.EndpointOption {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (opt) {
+            .ts_enabled => .{ .ts_enabled = self.ts_enabled },
+        };
+    }
 
     fn handleRetransmitTimer(ptr: *anyopaque) void {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
@@ -269,6 +305,7 @@ pub const TCPEndpoint = struct {
 
     fn destroy(self: *TCPEndpoint) void {
         self.mutex.lock();
+        self.syncache.deinit();
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
             self.stack.allocator.destroy(node);
@@ -335,13 +372,25 @@ pub const TCPEndpoint = struct {
         };
         const r = try self.stack.findRoute(remote_address.nic, local_address.addr, remote_address.addr, net_proto);
 
+        const options_len: u8 = if (self.ts_enabled) 12 else 0;
         const hdr_buf = try self.stack.allocator.alloc(u8, header.ReservedHeaderSize);
         defer self.stack.allocator.free(hdr_buf);
         
         var pre = buffer.Prependable.init(hdr_buf);
-        const tcp_hdr = pre.prepend(header.TCPMinimumSize).?;
+        const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
         var h = header.TCP.init(tcp_hdr);
         h.encode(local_address.port, remote_address.port, self.snd_nxt, self.rcv_nxt, header.TCPFlagAck | header.TCPFlagPsh, @as(u16, @intCast(@min(self.rcv_wnd, 65535))));
+        
+        if (self.ts_enabled) {
+            h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
+            h.data[20] = 1; // NOP
+            h.data[21] = 1; // NOP
+            h.data[22] = 8; // Kind: Timestamp
+            h.data[23] = 10; // Length
+            std.mem.writeInt(u32, h.data[24..28], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
+            std.mem.writeInt(u32, h.data[28..32], self.ts_recent, .big);
+        }
+
         h.setChecksum(h.calculateChecksum(local_address.addr.v4, remote_address.addr.v4, payload));
 
         self.rcv_packets_since_ack = 0;
@@ -399,18 +448,29 @@ pub const TCPEndpoint = struct {
         };
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
 
+        const options_len: u8 = if (self.ts_enabled) 12 + 4 else 4; // MSS(4) + Optional TS(12)
         const hdr_buf = self.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer self.stack.allocator.free(hdr_buf);
         
         var pre = buffer.Prependable.init(hdr_buf);
-        const tcp_hdr = pre.prepend(header.TCPMinimumSize + 4).?;
+        const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
         var h = header.TCP.init(tcp_hdr);
         h.encode(local_address.port, addr.port, 1000, 0, header.TCPFlagSyn, @as(u16, @intCast(@min(self.rcv_wnd, 65535))));
-        h.data[header.TCPDataOffset] = (6 << 4); // 24 bytes header
+        h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
         // MSS Option: Kind=2, Len=4, Value=1460
         h.data[20] = 2;
         h.data[21] = 4;
         std.mem.writeInt(u16, h.data[22..24], 1460, .big);
+        
+        if (self.ts_enabled) {
+            h.data[24] = 1; // NOP
+            h.data[25] = 1; // NOP
+            h.data[26] = 8; // Kind: Timestamp
+            h.data[27] = 10; // Length
+            std.mem.writeInt(u32, h.data[28..32], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
+            std.mem.writeInt(u32, h.data[32..36], 0, .big);
+        }
+
         h.setChecksum(h.calculateChecksum(local_address.addr.v4, addr.addr.v4, &[_]u8{}));
 
         const pb = tcpip.PacketBuffer{
@@ -458,7 +518,7 @@ pub const TCPEndpoint = struct {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
         self.mutex.lock();
         defer self.mutex.unlock();
-        _ = backlog;
+        self.backlog = if (backlog > 0) backlog else 128;
         self.state = .listen;
         
         if (self.local_addr) |addr| {
@@ -504,40 +564,119 @@ pub const TCPEndpoint = struct {
         const h = header.TCP.init(v);
         const fl = h.flags();
 
+        // Parse Options
+        const hlen = h.dataOffset();
+        if (hlen > header.TCPMinimumSize) {
+            var opt_idx: usize = 20;
+            while (opt_idx < hlen) {
+                const kind = v[opt_idx];
+                if (kind == 0) break; // EOL
+                if (kind == 1) { // NOP
+                    opt_idx += 1;
+                    continue;
+                }
+                const len = v[opt_idx + 1];
+                if (kind == 8 and len == 10) { // Timestamp
+                    const val = std.mem.readInt(u32, v[opt_idx + 2 .. opt_idx + 6][0..4], .big);
+                    // Update ts_recent
+                    self.ts_recent = val;
+                    if (fl & header.TCPFlagSyn != 0) {
+                        self.ts_enabled = true;
+                    }
+                }
+                opt_idx += len;
+            }
+        }
+
         std.debug.print("TCP: state={s}, flags=0x{x}, seq={}, ack={}, remote_addr={any}\n", .{@tagName(self.state), fl, h.sequenceNumber(), h.ackNumber(), id.remote_address});
 
         switch (self.state) {
             .listen => {
                 if (fl & header.TCPFlagSyn != 0) {
-                    const new_wq = self.stack.allocator.create(waiter.Queue) catch return;
-                    new_wq.* = .{};
-                    const new_ep = self.stack.allocator.create(TCPEndpoint) catch return;
-                    new_ep.* = TCPEndpoint.init(self.stack, new_wq) catch return;
-                    new_ep.retransmit_timer.context = new_ep;
-                    new_ep.owns_waiter_queue = true;
-                    new_ep.state = .syn_recv;
-                    new_ep.rcv_nxt = h.sequenceNumber() + 1;
-                    new_ep.local_addr = self.local_addr;
-                    new_ep.remote_addr = .{
-                        .nic = r.nic.id,
-                        .addr = id.remote_address,
-                        .port = h.sourcePort(),
-                    };
+                    if (self.syncache.items.len + self.accepted_queue.len >= self.backlog) {
+                        return; // Drop SYN if queue is full
+                    }
                     
-                    const new_id = stack.TransportEndpointID{
-                        .local_port = new_ep.local_addr.?.port,
-                        .local_address = new_ep.local_addr.?.addr,
-                        .remote_port = new_ep.remote_addr.?.port,
-                        .remote_address = new_ep.remote_addr.?.addr,
+                    const entry = SyncacheEntry{
+                        .remote_addr = .{
+                            .nic = r.nic.id,
+                            .addr = id.remote_address,
+                            .port = h.sourcePort(),
+                        },
+                        .rcv_nxt = h.sequenceNumber() + 1,
+                        .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))),
+                        .ts_recent = self.ts_recent,
+                        .ts_enabled = self.ts_enabled,
                     };
-                    self.stack.registerTransportEndpoint(new_id, new_ep.transportEndpoint()) catch return;
+                    self.syncache.append(entry) catch return;
+                    
+                    // Send SYN-ACK
+                    const options_len: u8 = if (entry.ts_enabled) 12 + 4 else 4;
+                    const hdr_buf = self.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
+                    defer self.stack.allocator.free(hdr_buf);
+                    
+                    var pre = buffer.Prependable.init(hdr_buf);
+                    const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
+                    var reply_h = header.TCP.init(tcp_hdr);
+                    reply_h.encode(id.local_port, id.remote_port, entry.snd_nxt, entry.rcv_nxt, header.TCPFlagSyn | header.TCPFlagAck, @as(u16, @intCast(@min(self.rcv_wnd, 65535))));
+                    reply_h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
+                    // MSS
+                    reply_h.data[20] = 2; reply_h.data[21] = 4;
+                    std.mem.writeInt(u16, reply_h.data[22..24], 1460, .big);
+                    if (entry.ts_enabled) {
+                        reply_h.data[24] = 1; reply_h.data[25] = 1;
+                        reply_h.data[26] = 8; reply_h.data[27] = 10;
+                        std.mem.writeInt(u32, reply_h.data[28..32], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
+                        std.mem.writeInt(u32, reply_h.data[32..36], entry.ts_recent, .big);
+                    }
+                    reply_h.setChecksum(reply_h.calculateChecksum(id.local_address.v4, id.remote_address.v4, &[_]u8{}));
+                    
+                    const pb = tcpip.PacketBuffer{
+                        .data = .{.views = &[_]buffer.View{}, .size = 0},
+                        .header = pre,
+                    };
+                    var mut_r = r.*;
+                    mut_r.writePacket(ProtocolNumber, pb) catch {};
+                } else if (fl & header.TCPFlagAck != 0) {
+                    // Completion of 3-way handshake
+                    var found_idx: ?usize = null;
+                    for (self.syncache.items, 0..) |entry, i| {
+                        if (entry.remote_addr.addr.eq(id.remote_address) and entry.remote_addr.port == h.sourcePort() and h.ackNumber() == entry.snd_nxt + 1) {
+                            found_idx = i;
+                            break;
+                        }
+                    }
+                    
+                    if (found_idx) |idx| {
+                        const entry = self.syncache.swapRemove(idx);
+                        
+                        const new_wq = self.stack.allocator.create(waiter.Queue) catch return;
+                        new_wq.* = .{};
+                        const new_ep = self.stack.allocator.create(TCPEndpoint) catch return;
+                        new_ep.* = TCPEndpoint.init(self.stack, new_wq) catch return;
+                        new_ep.retransmit_timer.context = new_ep;
+                        new_ep.owns_waiter_queue = true;
+                        new_ep.state = .established;
+                        new_ep.rcv_nxt = entry.rcv_nxt;
+                        new_ep.snd_nxt = entry.snd_nxt + 1;
+                        new_ep.local_addr = .{ .nic = r.nic.id, .addr = id.local_address, .port = id.local_port };
+                        new_ep.remote_addr = entry.remote_addr;
+                        new_ep.ts_enabled = entry.ts_enabled;
+                        new_ep.ts_recent = entry.ts_recent;
 
-                    new_ep.sendControl(header.TCPFlagSyn | header.TCPFlagAck) catch {};
-                    
-                    const node = self.stack.allocator.create(std.TailQueue(tcpip.AcceptReturn).Node) catch return;
-                    node.data = .{ .ep = new_ep.endpoint(), .wq = new_wq };
-                    self.accepted_queue.append(node);
-                    self.waiter_queue.notify(waiter.EventIn);
+                        const new_id = stack.TransportEndpointID{
+                            .local_port = new_ep.local_addr.?.port,
+                            .local_address = new_ep.local_addr.?.addr,
+                            .remote_port = new_ep.remote_addr.?.port,
+                            .remote_address = new_ep.remote_addr.?.addr,
+                        };
+                        self.stack.registerTransportEndpoint(new_id, new_ep.transportEndpoint()) catch return;
+
+                        const node = self.stack.allocator.create(std.TailQueue(tcpip.AcceptReturn).Node) catch return;
+                        node.data = .{ .ep = new_ep.endpoint(), .wq = new_wq };
+                        self.accepted_queue.append(node);
+                        self.waiter_queue.notify(waiter.EventIn);
+                    }
                 }
             },
             .syn_sent => {
@@ -808,17 +947,20 @@ test "TCP retransmission" {
     const r_to_server = stack.Route{ .local_address = server_addr.addr, .remote_address = client_addr.addr, .local_link_address = [_]u8{0} ** 6, .net_proto = 0x0800, .nic = nic };
     const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = server_addr.addr, .remote_port = 1234, .remote_address = client_addr.addr };
     ep_server.transportEndpoint().handlePacket(&r_to_server, id_to_server, syn_pkt);
-    const accept_res = try ep_server.endpoint().accept();
-    const ep_accepted = @as(*TCPEndpoint, @ptrCast(@alignCast(accept_res.ep.ptr)));
-    defer accept_res.ep.close();
+    
     var syn_ack_views = [_]buffer.View{fake_ep.last_pkt.?[20..]};
     const syn_ack_pkt = tcpip.PacketBuffer{ .data = .{ .views = &syn_ack_views, .size = fake_ep.last_pkt.?.len - 20 }, .header = buffer.Prependable.init(&[_]u8{}) };
     const r_to_client = stack.Route{ .local_address = client_addr.addr, .remote_address = server_addr.addr, .local_link_address = [_]u8{0} ** 6, .net_proto = 0x0800, .nic = nic };
     const id_to_client = stack.TransportEndpointID{ .local_port = 1234, .local_address = client_addr.addr, .remote_port = 80, .remote_address = server_addr.addr };
     ep_client.transportEndpoint().handlePacket(&r_to_client, id_to_client, syn_ack_pkt);
+
     var ack_views = [_]buffer.View{fake_ep.last_pkt.?[20..]};
     const ack_pkt = tcpip.PacketBuffer{ .data = .{ .views = &ack_views, .size = fake_ep.last_pkt.?.len - 20 }, .header = buffer.Prependable.init(&[_]u8{}) };
-    ep_accepted.transportEndpoint().handlePacket(&r_to_server, id_to_server, ack_pkt);
+    ep_server.transportEndpoint().handlePacket(&r_to_server, id_to_server, ack_pkt);
+
+    const accept_res = try ep_server.endpoint().accept();
+    const ep_accepted = @as(*TCPEndpoint, @ptrCast(@alignCast(accept_res.ep.ptr)));
+    defer accept_res.ep.close();
 
     const FakePayloader = struct {
         data: []const u8,
@@ -837,4 +979,119 @@ test "TCP retransmission" {
     const rcv_view = try ep_accepted.endpoint().read(null);
     defer allocator.free(rcv_view);
     try std.testing.expectEqualStrings("important data", rcv_view);
+}
+
+test "TCP Timestamps parsing and echoing" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var wq = waiter.Queue{};
+    var ep = try allocator.create(TCPEndpoint);
+    ep.* = try TCPEndpoint.init(&s, &wq);
+    ep.retransmit_timer.context = ep;
+    defer ep.decRef();
+    
+    ep.ts_enabled = true;
+    ep.state = .established;
+    ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
+    ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
+
+    // Fake incoming packet with Timestamp option
+    var pkt_data = [_]u8{0} ** 60;
+    var h = header.TCP.init(&pkt_data);
+    h.encode(1234, 80, 1000, 1000, header.TCPFlagAck, 65535);
+    h.data[header.TCPDataOffset] = (8 << 4); // 32 bytes header
+    // Timestamp: Kind=8, Len=10, TSval=0x11223344, TSecr=0
+    pkt_data[20] = 8; pkt_data[21] = 10;
+    std.mem.writeInt(u32, pkt_data[22..26], 0x11223344, .big);
+    
+    var views = [_]buffer.View{&pkt_data};
+    const pkt = tcpip.PacketBuffer{ .data = .{ .views = &views, .size = 32 }, .header = buffer.Prependable.init(&[_]u8{}) };
+    const r = stack.Route{ .local_address = .{ .v4 = .{10,0,0,1} }, .remote_address = .{ .v4 = .{10,0,0,2} }, .local_link_address = [_]u8{0}**6, .net_proto = 0x0800, .nic = undefined };
+    const id = stack.TransportEndpointID{ .local_port = 80, .local_address = .{ .v4 = .{10,0,0,1} }, .remote_port = 1234, .remote_address = .{ .v4 = .{10,0,0,2} } };
+    
+    TCPEndpoint.handlePacket(ep, &r, id, pkt);
+    
+    try std.testing.expectEqual(@as(u32, 0x11223344), ep.ts_recent);
+}
+
+test "TCP Graceful Close handshake" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+
+    var fake_link = struct {
+        last_flags: u8 = 0,
+        fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            _ = r; _ = protocol;
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            const hdr = pkt.header.view();
+            // Skip IP header (20 bytes)
+            if (hdr.len >= 40) {
+                const h = header.TCP.init(hdr[20..]);
+                self.last_flags = h.flags();
+            } else if (hdr.len >= 20) {
+                const h = header.TCP.init(hdr);
+                self.last_flags = h.flags();
+            }
+            return;
+        }
+        fn attach(ptr: *anyopaque, _: *stack.NetworkDispatcher) void { _ = ptr; }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return [_]u8{0}**6; }
+        fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities { return 0; }
+    }{};
+
+    const link_ep = stack.LinkEndpoint{ .ptr = &fake_link, .vtable = &.{
+        .writePacket = @TypeOf(fake_link).writePacket,
+        .attach = @TypeOf(fake_link).attach,
+        .linkAddress = @TypeOf(fake_link).linkAddress,
+        .mtu = @TypeOf(fake_link).mtu,
+        .setMTU = @TypeOf(fake_link).setMTU,
+        .capabilities = @TypeOf(fake_link).capabilities,
+    }};
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+    try nic.addAddress(.{
+        .protocol = 0x0800,
+        .address_with_prefix = .{ .address = .{ .v4 = .{ 10, 0, 0, 1 } }, .prefix_len = 24 },
+    });
+    try s.addLinkAddress(.{ .v4 = .{ 10, 0, 0, 2 } }, [_]u8{1, 2, 3, 4, 5, 6});
+
+    var wq = waiter.Queue{};
+    var ep = try allocator.create(TCPEndpoint);
+    ep.* = try TCPEndpoint.init(&s, &wq);
+    ep.retransmit_timer.context = ep;
+    defer ep.decRef();
+    
+    ep.state = .established;
+    ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
+    ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
+
+    // Start Active Close
+    try ep.endpoint().shutdown(0);
+    try std.testing.expect(ep.state == .fin_wait1);
+    try std.testing.expect(fake_link.last_flags & header.TCPFlagFin != 0);
+
+    // Receive ACK for our FIN
+    var pkt_data = [_]u8{0} ** 20;
+    var h = header.TCP.init(&pkt_data);
+    h.encode(1234, 80, 2000, ep.snd_nxt, header.TCPFlagAck, 65535);
+    var views = [_]buffer.View{&pkt_data};
+    const pkt = tcpip.PacketBuffer{ .data = .{ .views = &views, .size = 20 }, .header = buffer.Prependable.init(&[_]u8{}) };
+    const r = stack.Route{ .local_address = .{ .v4 = .{10,0,0,1} }, .remote_address = .{ .v4 = .{10,0,0,2} }, .local_link_address = [_]u8{0}**6, .net_proto = 0x0800, .nic = s.nics.get(1).? };
+    const id = stack.TransportEndpointID{ .local_port = 80, .local_address = .{ .v4 = .{10,0,0,1} }, .remote_port = 1234, .remote_address = .{ .v4 = .{10,0,0,2} } };
+    
+    TCPEndpoint.handlePacket(ep, &r, id, pkt);
+    try std.testing.expect(ep.state == .fin_wait2);
+
+    // Receive FIN from peer
+    h.encode(1234, 80, 2000, ep.snd_nxt, header.TCPFlagFin | header.TCPFlagAck, 65535);
+    TCPEndpoint.handlePacket(ep, &r, id, pkt);
+    try std.testing.expect(ep.state == .closed); // Transitioned through TIME_WAIT automatically
 }

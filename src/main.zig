@@ -46,6 +46,10 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     icmp_proto.* = network.icmp.ICMPv4Protocol.init();
     try s.registerNetworkProtocol(icmp_proto.protocol());
 
+    const icmpv4_transport = try allocator.create(network.icmp.ICMPv4TransportProtocol);
+    icmpv4_transport.* = network.icmp.ICMPv4TransportProtocol.init();
+    try s.registerTransportProtocol(icmpv4_transport.protocol());
+
     const tcp_proto = try allocator.create(transport.tcp.TCPProtocol);
     tcp_proto.* = transport.tcp.TCPProtocol.init();
     try s.registerTransportProtocol(tcp_proto.protocol());
@@ -53,6 +57,10 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     const udp_proto = try allocator.create(transport.udp.UDPProtocol);
     udp_proto.* = transport.udp.UDPProtocol.init();
     try s.registerTransportProtocol(udp_proto.protocol());
+
+    const icmpv6_proto = try allocator.create(network.icmpv6.ICMPv6TransportProtocol);
+    icmpv6_proto.* = network.icmpv6.ICMPv6TransportProtocol.init();
+    try s.registerTransportProtocol(icmpv6_proto.protocol());
 
     return s;
 }

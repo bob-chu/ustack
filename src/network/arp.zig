@@ -46,7 +46,7 @@ pub const ARPProtocol = struct {
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
         _ = ptr;
-        var hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
+        const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_buf);
         
         var pre = buffer.Prependable.init(hdr_buf);
@@ -58,7 +58,7 @@ pub const ARPProtocol = struct {
         @memcpy(h.data[14..18], &local_addr.v4);
         @memcpy(h.data[24..28], &addr.v4);
 
-        var pb = tcpip.PacketBuffer{
+        const pb = tcpip.PacketBuffer{
             .data = .{.views = &[_]buffer.View{}, .size = 0},
             .header = pre,
         };
@@ -100,11 +100,17 @@ pub const ARPEndpoint = struct {
         .writePacket = writePacket,
         .handlePacket = handlePacket,
         .mtu = mtu,
+        .close = close,
     };
 
     fn mtu(ptr: *anyopaque) u32 {
         const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
         return self.nic.linkEP.mtu() - header.ARPSize;
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.nic.stack.allocator.destroy(self);
     }
 
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
@@ -130,7 +136,7 @@ pub const ARPEndpoint = struct {
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
             if (self.nic.hasAddress(target_proto_addr)) {
-                var hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
+                const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
                 
                 var pre = buffer.Prependable.init(hdr_buf);
@@ -143,7 +149,7 @@ pub const ARPEndpoint = struct {
                 @memcpy(reply_h.data[18..24], h.data[8..14]);
                 @memcpy(reply_h.data[24..28], h.data[14..18]);
 
-                var pb = tcpip.PacketBuffer{
+                const pb = tcpip.PacketBuffer{
                     .data = .{.views = &[_]buffer.View{}, .size = 0},
                     .header = pre,
                 };

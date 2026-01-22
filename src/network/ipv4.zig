@@ -110,11 +110,22 @@ pub const IPv4Endpoint = struct {
         .writePacket = writePacket,
         .handlePacket = handlePacket,
         .mtu = mtu,
+        .close = close,
     };
 
     fn mtu(ptr: *anyopaque) u32 {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
         return self.nic.linkEP.mtu() - header.IPv4MinimumSize;
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
+        var it = self.reassembly_list.valueIterator();
+        while (it.next()) |ctx| {
+            ctx.deinit();
+        }
+        self.reassembly_list.deinit();
+        self.nic.stack.allocator.destroy(self);
     }
 
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
@@ -131,7 +142,7 @@ pub const IPv4Endpoint = struct {
         
         @memset(ip_header, 0);
         ip_header[0] = 0x45; // Version 4, IHL 5
-        std.mem.writeIntBig(u16, ip_header[2..4], @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size)));
+        std.mem.writeInt(u16, ip_header[2..4], @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size)), .big);
         ip_header[8] = 64; // TTL
         ip_header[9] = @as(u8, @intCast(protocol));
         @memcpy(ip_header[12..16], &r.local_address.v4);
@@ -226,7 +237,7 @@ pub const IPv4Endpoint = struct {
                 _ = self.reassembly_list.remove(key);
                 
                 var views = [_]buffer.View{reassembled_buf};
-                var reassembled_pkt = tcpip.PacketBuffer{
+                const reassembled_pkt = tcpip.PacketBuffer{
                     .data = buffer.VectorisedView.init(total_size, &views),
                     .header = undefined,
                 };
@@ -335,9 +346,9 @@ test "IPv4 fragmentation and reassembly" {
     var frag1_buf = [_]u8{0} ** (header.IPv4MinimumSize + 16); 
     var frag1_h = header.IPv4.init(&frag1_buf);
     frag1_h.data[0] = 0x45;
-    std.mem.writeIntBig(u16, frag1_h.data[2..4], header.IPv4MinimumSize + 16);
-    std.mem.writeIntBig(u16, frag1_h.data[4..6], 12345); 
-    std.mem.writeIntBig(u16, frag1_h.data[6..8], 0x2000); 
+    std.mem.writeInt(u16, frag1_h.data[2..4], header.IPv4MinimumSize + 16, .big);
+    std.mem.writeInt(u16, frag1_h.data[4..6], 12345, .big); 
+    std.mem.writeInt(u16, frag1_h.data[6..8], 0x2000, .big); 
     frag1_h.data[9] = 17; 
     @memcpy(frag1_h.data[12..16], &[_]u8{ 10, 0, 0, 2 }); 
     @memcpy(frag1_h.data[16..20], &[_]u8{ 10, 0, 0, 1 }); 
@@ -350,9 +361,9 @@ test "IPv4 fragmentation and reassembly" {
     @memset(frag2_buf, 0);
     var frag2_h = header.IPv4.init(frag2_buf);
     frag2_h.data[0] = 0x45;
-    std.mem.writeIntBig(u16, frag2_h.data[2..4], @as(u16, @intCast(header.IPv4MinimumSize + rem_len)));
-    std.mem.writeIntBig(u16, frag2_h.data[4..6], 12345); 
-    std.mem.writeIntBig(u16, frag2_h.data[6..8], 0x0002); 
+    std.mem.writeInt(u16, frag2_h.data[2..4], @as(u16, @intCast(header.IPv4MinimumSize + rem_len)), .big);
+    std.mem.writeInt(u16, frag2_h.data[4..6], 12345, .big); 
+    std.mem.writeInt(u16, frag2_h.data[6..8], 0x0002, .big); 
     frag2_h.data[9] = 17; 
     @memcpy(frag2_h.data[12..16], &[_]u8{ 10, 0, 0, 2 });
     @memcpy(frag2_h.data[16..20], &[_]u8{ 10, 0, 0, 1 });
@@ -360,7 +371,7 @@ test "IPv4 fragmentation and reassembly" {
     frag2_h.setChecksum(frag2_h.calculateChecksum());
 
     var views1 = [_]buffer.View{&frag1_buf};
-    var pkt1 = tcpip.PacketBuffer{
+    const pkt1 = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(frag1_buf.len, &views1),
         .header = undefined,
     };
@@ -369,7 +380,7 @@ test "IPv4 fragmentation and reassembly" {
     try std.testing.expect(!delivered); 
 
     var views2 = [_]buffer.View{frag2_buf};
-    var pkt2 = tcpip.PacketBuffer{
+    const pkt2 = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(frag2_buf.len, &views2),
         .header = undefined,
     };

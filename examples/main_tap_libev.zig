@@ -192,6 +192,10 @@ pub fn main() !void {
         .protocol = ustack.network.icmp.ProtocolNumber,
         .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 },
     });
+    try nic.addAddress(.{
+        .protocol = ustack.network.ipv6.ProtocolNumber,
+        .address_with_prefix = .{ .address = .{ .v6 = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 } }, .prefix_len = 64 },
+    });
 
     // Configure routing table with default gateway (10.0.0.1)
     // This enables access to internet via NAT/router on the host
@@ -362,6 +366,8 @@ fn doHttpClient(s: *stack.Stack) !void {
     const tcp_proto = s.transport_protocols.get(6).?;
     var ep = try tcp_proto.newEndpoint(s, ustack.network.ipv4.ProtocolNumber, &wq);
     defer ep.close();
+
+    try ep.setOption(.{ .ts_enabled = true });
 
     try ep.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 0 }); // ephemeral port
     

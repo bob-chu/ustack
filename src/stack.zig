@@ -69,6 +69,7 @@ pub const NetworkEndpoint = struct {
         writePacket: *const fn (ptr: *anyopaque, r: *const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void,
         handlePacket: *const fn (ptr: *anyopaque, r: *const Route, pkt: tcpip.PacketBuffer) void,
         mtu: *const fn (ptr: *anyopaque) u32,
+        close: ?*const fn (ptr: *anyopaque) void = null,
     };
 
     pub fn writePacket(self: NetworkEndpoint, r: *const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
@@ -81,6 +82,10 @@ pub const NetworkEndpoint = struct {
 
     pub fn mtu(self: NetworkEndpoint) u32 {
         return self.vtable.mtu(self.ptr);
+    }
+
+    pub fn close(self: NetworkEndpoint) void {
+        if (self.vtable.close) |f| f(self.ptr);
     }
 };
 
@@ -119,6 +124,28 @@ pub const TransportEndpointID = struct {
     local_address: tcpip.Address,
     remote_port: u16,
     remote_address: tcpip.Address,
+
+    pub fn hash(self: TransportEndpointID) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&self.local_port));
+        switch (self.local_address) {
+            .v4 => |v| h.update(&v),
+            .v6 => |v| h.update(&v),
+        }
+        h.update(std.mem.asBytes(&self.remote_port));
+        switch (self.remote_address) {
+            .v4 => |v| h.update(&v),
+            .v6 => |v| h.update(&v),
+        }
+        return h.final();
+    }
+
+    pub fn eq(self: TransportEndpointID, other: TransportEndpointID) bool {
+        return self.local_port == other.local_port and
+            self.local_address.eq(other.local_address) and
+            self.remote_port == other.remote_port and
+            self.remote_address.eq(other.remote_address);
+    }
 };
 
 pub const TransportEndpoint = struct {
@@ -159,6 +186,7 @@ pub const TransportProtocol = struct {
         number: *const fn (ptr: *anyopaque) tcpip.TransportProtocolNumber,
         newEndpoint: *const fn (ptr: *anyopaque, stack: *Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint,
         parsePorts: *const fn (ptr: *anyopaque, pkt: tcpip.PacketBuffer) PortPair,
+        handlePacket: ?*const fn (ptr: *anyopaque, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void = null,
     };
 
     pub fn number(self: TransportProtocol) tcpip.TransportProtocolNumber {
@@ -210,6 +238,10 @@ pub const NIC = struct {
     }
 
     pub fn deinit(self: *NIC) void {
+        var it = self.network_endpoints.valueIterator();
+        while (it.next()) |ep| {
+            ep.close();
+        }
         self.addresses.deinit();
         self.network_endpoints.deinit();
     }
@@ -218,6 +250,9 @@ pub const NIC = struct {
         try self.addresses.append(addr);
         if (self.stack.network_protocols.get(addr.protocol)) |proto| {
             const ep = try proto.newEndpoint(self, addr.address_with_prefix, self.stack.transportDispatcher());
+            if (self.network_endpoints.get(addr.protocol)) |old_ep| {
+                old_ep.close();
+            }
             try self.network_endpoints.put(addr.protocol, ep);
         }
     }
@@ -389,11 +424,74 @@ const RouteTable = struct {
     }
 };
 
+pub const TransportTable = struct {
+    const num_shards = 256;
+    
+    shards: [num_shards]Shard,
+
+    const Shard = struct {
+        mutex: std.Thread.Mutex = .{},
+        endpoints: std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
+    };
+
+    const TransportContext = struct {
+        pub fn hash(_: TransportContext, key: TransportEndpointID) u64 {
+            return key.hash();
+        }
+        pub fn eql(_: TransportContext, a: TransportEndpointID, b: TransportEndpointID) bool {
+            return a.eq(b);
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator) TransportTable {
+        var self: TransportTable = undefined;
+        for (&self.shards) |*shard| {
+            shard.* = .{
+                .endpoints = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator),
+            };
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *TransportTable) void {
+        for (&self.shards) |*shard| {
+            shard.endpoints.deinit();
+        }
+    }
+
+    fn getShard(self: *TransportTable, id: TransportEndpointID) *Shard {
+        return &self.shards[id.hash() % num_shards];
+    }
+
+    pub fn put(self: *TransportTable, id: TransportEndpointID, ep: TransportEndpoint) !void {
+        const shard = self.getShard(id);
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
+        try shard.endpoints.put(id, ep);
+    }
+
+    pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
+        const shard = self.getShard(id);
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
+        return shard.endpoints.remove(id);
+    }
+
+    pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
+        const shard = self.getShard(id);
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
+        const ep = shard.endpoints.get(id);
+        if (ep) |e| e.incRef();
+        return ep;
+    }
+};
+
 pub const Stack = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
-    endpoints: std.AutoHashMap(TransportEndpointID, TransportEndpoint),
+    endpoints: TransportTable,
     link_addr_cache: std.AutoHashMap(tcpip.Address, tcpip.LinkAddress),
     transport_protocols: std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol),
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
@@ -404,7 +502,7 @@ pub const Stack = struct {
         return .{
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
-            .endpoints = std.AutoHashMap(TransportEndpointID, TransportEndpoint).init(allocator),
+            .endpoints = TransportTable.init(allocator),
             .link_addr_cache = std.AutoHashMap(tcpip.Address, tcpip.LinkAddress).init(allocator),
             .transport_protocols = std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol).init(allocator),
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
@@ -446,14 +544,10 @@ pub const Stack = struct {
     }
 
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         try self.endpoints.put(id, ep);
     }
 
     pub fn unregisterTransportEndpoint(self: *Stack, id: TransportEndpointID) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         _ = self.endpoints.remove(id);
     }
 
@@ -558,26 +652,30 @@ pub const Stack = struct {
             .remote_address = r.remote_address,
         };
         
-        self.mutex.lock();
         const ep_opt = self.endpoints.get(id);
-        if (ep_opt) |ep| ep.incRef();
-        self.mutex.unlock();
 
         if (ep_opt) |ep| {
             ep.handlePacket(r, id, pkt);
             ep.decRef();
         } else {
+            // Try global handler first (for ICMP, etc)
+            if (proto.vtable.handlePacket) |handle| {
+                handle(proto.ptr, r, id, pkt);
+                return;
+            }
+
             // Try wildcard match for listeners
             const listener_id = TransportEndpointID{
                 .local_port = ports.dst,
                 .local_address = r.local_address,
                 .remote_port = 0,
-                .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } },
+                .remote_address = switch (r.local_address) {
+                    .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                },
             };
-            self.mutex.lock();
+            
             const listener_opt = self.endpoints.get(listener_id);
-            if (listener_opt) |ep| ep.incRef();
-            self.mutex.unlock();
             
             if (listener_opt) |ep| {
                 ep.handlePacket(r, id, pkt);

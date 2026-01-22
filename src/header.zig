@@ -26,7 +26,7 @@ pub const IPv4 = struct {
     }
 
     pub fn totalLength(self: IPv4) u16 {
-        return std.mem.readIntBig(u16, self.data[IPv4TotalLenOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[IPv4TotalLenOffset..][0..2], .big);
     }
 
     pub fn protocol(self: IPv4) u8 {
@@ -34,7 +34,7 @@ pub const IPv4 = struct {
     }
 
     pub fn checksum(self: IPv4) u16 {
-        return std.mem.readIntBig(u16, self.data[checksumOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[checksumOffset..][0..2], .big);
     }
 
     pub fn sourceAddress(self: IPv4) [4]u8 {
@@ -50,7 +50,7 @@ pub const IPv4 = struct {
     }
 
     pub fn setChecksum(self: IPv4, c: u16) void {
-        std.mem.writeIntBig(u16, self.data[checksumOffset..][0..2], c);
+        std.mem.writeInt(u16, self.data[checksumOffset..][0..2], c, .big);
     }
 
     pub fn calculateChecksum(self: IPv4) u16 {
@@ -59,7 +59,7 @@ pub const IPv4 = struct {
 
 
     pub fn flagsFragmentOffset(self: IPv4) u16 {
-        return std.mem.readIntBig(u16, self.data[flagsFOOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[flagsFOOffset..][0..2], .big);
     }
 
     pub fn moreFragments(self: IPv4) bool {
@@ -71,7 +71,7 @@ pub const IPv4 = struct {
     }
 
     pub fn id(self: IPv4) u16 {
-        return std.mem.readIntBig(u16, self.data[idOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[idOffset..][0..2], .big);
     }
 
     pub fn isValid(self: IPv4, pkt_size: usize) bool {
@@ -109,19 +109,19 @@ pub const TCP = struct {
     }
 
     pub fn sourcePort(self: TCP) u16 {
-        return std.mem.readIntBig(u16, self.data[TCPSrcPortOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[TCPSrcPortOffset..][0..2], .big);
     }
 
     pub fn destinationPort(self: TCP) u16 {
-        return std.mem.readIntBig(u16, self.data[TCPDstPortOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[TCPDstPortOffset..][0..2], .big);
     }
 
     pub fn sequenceNumber(self: TCP) u32 {
-        return std.mem.readIntBig(u32, self.data[TCPSeqNumOffset..][0..4]);
+        return std.mem.readInt(u32, self.data[TCPSeqNumOffset..][0..4], .big);
     }
 
     pub fn ackNumber(self: TCP) u32 {
-        return std.mem.readIntBig(u32, self.data[TCPAckNumOffset..][0..4]);
+        return std.mem.readInt(u32, self.data[TCPAckNumOffset..][0..4], .big);
     }
 
     pub fn dataOffset(self: TCP) u8 {
@@ -133,35 +133,35 @@ pub const TCP = struct {
     }
 
     pub fn windowSize(self: TCP) u16 {
-        return std.mem.readIntBig(u16, self.data[TCPWinSizeOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[TCPWinSizeOffset..][0..2], .big);
     }
 
     pub fn checksum(self: TCP) u16 {
-        return std.mem.readIntBig(u16, self.data[TCPChecksumOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[TCPChecksumOffset..][0..2], .big);
     }
 
     pub fn encode(self: TCP, src: u16, dst: u16, seq: u32, ack: u32, fl: u8, win: u16) void {
-        std.mem.writeIntBig(u16, self.data[TCPSrcPortOffset..][0..2], src);
-        std.mem.writeIntBig(u16, self.data[TCPDstPortOffset..][0..2], dst);
-        std.mem.writeIntBig(u32, self.data[TCPSeqNumOffset..][0..4], seq);
-        std.mem.writeIntBig(u32, self.data[TCPAckNumOffset..][0..4], ack);
+        std.mem.writeInt(u16, self.data[TCPSrcPortOffset..][0..2], src, .big);
+        std.mem.writeInt(u16, self.data[TCPDstPortOffset..][0..2], dst, .big);
+        std.mem.writeInt(u32, self.data[TCPSeqNumOffset..][0..4], seq, .big);
+        std.mem.writeInt(u32, self.data[TCPAckNumOffset..][0..4], ack, .big);
         self.data[TCPDataOffset] = (5 << 4); // Default 20 bytes
         self.data[TCPFlagsOffset] = fl;
-        std.mem.writeIntBig(u16, self.data[TCPWinSizeOffset..][0..2], win);
+        std.mem.writeInt(u16, self.data[TCPWinSizeOffset..][0..2], win, .big);
         // Zero out checksum before calculation
-        std.mem.writeIntBig(u16, self.data[TCPChecksumOffset..][0..2], 0);
+        std.mem.writeInt(u16, self.data[TCPChecksumOffset..][0..2], 0, .big);
     }
 
     pub fn setChecksum(self: TCP, c: u16) void {
-        std.mem.writeIntBig(u16, self.data[TCPChecksumOffset..][0..2], c);
+        std.mem.writeInt(u16, self.data[TCPChecksumOffset..][0..2], c, .big);
     }
 
     pub fn calculateChecksum(self: TCP, src: [4]u8, dst: [4]u8, payload: []const u8) u16 {
         var sum: u32 = 0;
-        sum += std.mem.readIntBig(u16, src[0..2]);
-        sum += std.mem.readIntBig(u16, src[2..4]);
-        sum += std.mem.readIntBig(u16, dst[0..2]);
-        sum += std.mem.readIntBig(u16, dst[2..4]);
+        sum += std.mem.readInt(u16, src[0..2], .big);
+        sum += std.mem.readInt(u16, src[2..4], .big);
+        sum += std.mem.readInt(u16, dst[0..2], .big);
+        sum += std.mem.readInt(u16, dst[2..4], .big);
         sum += 6; // Protocol TCP
         sum += @as(u16, @intCast(self.data.len + payload.len));
 
@@ -176,7 +176,7 @@ pub fn internetChecksum(data: []const u8, initial: u32) u32 {
     var sum: u32 = initial;
     var i: usize = 0;
     while (i + 1 < data.len) : (i += 2) {
-        sum += std.mem.readIntBig(u16, data[i..][0..2]);
+        sum += std.mem.readInt(u16, data[i..][0..2], .big);
     }
     if (i < data.len) {
         sum += @as(u32, data[i]) << 8;
@@ -219,13 +219,13 @@ pub const Ethernet = struct {
     }
 
     pub fn etherType(self: Ethernet) u16 {
-        return std.mem.readIntBig(u16, self.data[ethType..][0..2]);
+        return std.mem.readInt(u16, self.data[ethType..][0..2], .big);
     }
 
     pub fn encode(self: Ethernet, src: [6]u8, dst: [6]u8, eth_type: u16) void {
         @memcpy(self.data[srcMAC..][0..6], &src);
         @memcpy(self.data[dstMAC..][0..6], &dst);
-        std.mem.writeIntBig(u16, self.data[ethType..][0..2], eth_type);
+        std.mem.writeInt(u16, self.data[ethType..][0..2], eth_type, .big);
     }
 };
 
@@ -241,15 +241,15 @@ pub const ARP = struct {
     }
 
     pub fn hardwareAddressSpace(self: ARP) u16 {
-        return std.mem.readIntBig(u16, self.data[0..2]);
+        return std.mem.readInt(u16, self.data[0..2], .big);
     }
 
     pub fn protocolAddressSpace(self: ARP) u16 {
-        return std.mem.readIntBig(u16, self.data[2..4]);
+        return std.mem.readInt(u16, self.data[2..4], .big);
     }
 
     pub fn op(self: ARP) u16 {
-        return std.mem.readIntBig(u16, self.data[6..8]);
+        return std.mem.readInt(u16, self.data[6..8], .big);
     }
 
     pub fn hardwareAddressSender(self: ARP) [6]u8 {
@@ -277,14 +277,14 @@ pub const ARP = struct {
     }
 
     pub fn setIPv4OverEthernet(self: ARP) void {
-        std.mem.writeIntBig(u16, self.data[0..2], 1); // htypeEthernet
-        std.mem.writeIntBig(u16, self.data[2..4], 0x0800); // IPv4ProtocolNumber
+        std.mem.writeInt(u16, self.data[0..2], 1, .big); // htypeEthernet
+        std.mem.writeInt(u16, self.data[2..4], 0x0800, .big); // IPv4ProtocolNumber
         self.data[4] = 6; // macSize
         self.data[5] = 4; // IPv4AddressSize
     }
 
     pub fn setOp(self: ARP, operation: u16) void {
-        std.mem.writeIntBig(u16, self.data[6..8], operation);
+        std.mem.writeInt(u16, self.data[6..8], operation, .big);
     }
 
     pub fn isValid(self: ARP) bool {
@@ -302,35 +302,35 @@ pub const UDP = struct {
     }
 
     pub fn sourcePort(self: UDP) u16 {
-        return std.mem.readIntBig(u16, self.data[0..2]);
+        return std.mem.readInt(u16, self.data[0..2], .big);
     }
 
     pub fn destinationPort(self: UDP) u16 {
-        return std.mem.readIntBig(u16, self.data[2..4]);
+        return std.mem.readInt(u16, self.data[2..4], .big);
     }
 
     pub fn length(self: UDP) u16 {
-        return std.mem.readIntBig(u16, self.data[4..6]);
+        return std.mem.readInt(u16, self.data[4..6], .big);
     }
 
     pub fn checksum(self: UDP) u16 {
-        return std.mem.readIntBig(u16, self.data[6..8]);
+        return std.mem.readInt(u16, self.data[6..8], .big);
     }
 
     pub fn setSourcePort(self: UDP, p: u16) void {
-        std.mem.writeIntBig(u16, self.data[0..2], p);
+        std.mem.writeInt(u16, self.data[0..2], p, .big);
     }
 
     pub fn setDestinationPort(self: UDP, p: u16) void {
-        std.mem.writeIntBig(u16, self.data[2..4], p);
+        std.mem.writeInt(u16, self.data[2..4], p, .big);
     }
 
     pub fn setLength(self: UDP, l: u16) void {
-        std.mem.writeIntBig(u16, self.data[4..6], l);
+        std.mem.writeInt(u16, self.data[4..6], l, .big);
     }
 
     pub fn setChecksum(self: UDP, c: u16) void {
-        std.mem.writeIntBig(u16, self.data[6..8], c);
+        std.mem.writeInt(u16, self.data[6..8], c, .big);
     }
 };
 
@@ -354,11 +354,11 @@ pub const ICMPv4 = struct {
     }
 
     pub fn checksum(self: ICMPv4) u16 {
-        return std.mem.readIntBig(u16, self.data[2..4]);
+        return std.mem.readInt(u16, self.data[2..4], .big);
     }
 
     pub fn setChecksum(self: ICMPv4, c: u16) void {
-        std.mem.writeIntBig(u16, self.data[2..4], c);
+        std.mem.writeInt(u16, self.data[2..4], c, .big);
     }
 
     pub fn calculateChecksum(self: ICMPv4, payload: []const u8) u16 {
@@ -386,17 +386,17 @@ pub const IPv6 = struct {
     }
 
     pub fn trafficClass(self: IPv6) u8 {
-        const v = std.mem.readIntBig(u32, self.data[0..4]);
+        const v = std.mem.readInt(u32, self.data[0..4], .big);
         return @as(u8, @intCast((v >> 20) & 0xff));
     }
 
     pub fn flowLabel(self: IPv6) u32 {
-        const v = std.mem.readIntBig(u32, self.data[0..4]);
+        const v = std.mem.readInt(u32, self.data[0..4], .big);
         return v & 0xfffff;
     }
 
     pub fn payloadLength(self: IPv6) u16 {
-        return std.mem.readIntBig(u16, self.data[IPv6PayloadLenOffset..][0..2]);
+        return std.mem.readInt(u16, self.data[IPv6PayloadLenOffset..][0..2], .big);
     }
 
     pub fn nextHeader(self: IPv6) u8 {
@@ -420,8 +420,8 @@ pub const IPv6 = struct {
     }
 
     pub fn encode(self: IPv6, src: [16]u8, dst: [16]u8, next_header: u8, payload_len: u16) void {
-        std.mem.writeIntBig(u32, self.data[0..4], 0x60000000); // Ver 6, TC 0, FL 0
-        std.mem.writeIntBig(u16, self.data[IPv6PayloadLenOffset..][0..2], payload_len);
+        std.mem.writeInt(u32, self.data[0..4], 0x60000000, .big); // Ver 6, TC 0, FL 0
+        std.mem.writeInt(u16, self.data[IPv6PayloadLenOffset..][0..2], payload_len, .big);
         self.data[IPv6NextHeaderOffset] = next_header;
         self.data[IPv6HopLimitOffset] = 64; // Default hop limit
         @memcpy(self.data[IPv6SrcAddrOffset..][0..16], &src);
@@ -440,6 +440,20 @@ pub const IPv6 = struct {
 pub const ICMPv6MinimumSize = 4;
 pub const ICMPv6EchoRequestType = 128;
 pub const ICMPv6EchoReplyType = 129;
+pub const ICMPv6RouterSolicitationType = 133;
+pub const ICMPv6RouterAdvertisementType = 134;
+pub const ICMPv6NeighborSolicitationType = 135;
+pub const ICMPv6NeighborAdvertisementType = 136;
+
+pub const ICMPv6NAFlagsRouter = 0x80;
+pub const ICMPv6NAFlagsSolicited = 0x40;
+pub const ICMPv6NAFlagsOverride = 0x20;
+
+pub const ICMPv6OptionSourceLinkLayerAddress = 1;
+pub const ICMPv6OptionTargetLinkLayerAddress = 2;
+pub const ICMPv6OptionPrefixInformation = 3;
+pub const ICMPv6OptionRedirectHeader = 4;
+pub const ICMPv6OptionMTU = 5;
 
 pub const ICMPv6 = struct {
     data: []u8,
@@ -457,11 +471,11 @@ pub const ICMPv6 = struct {
     }
 
     pub fn checksum(self: ICMPv6) u16 {
-        return std.mem.readIntBig(u16, self.data[2..4]);
+        return std.mem.readInt(u16, self.data[2..4], .big);
     }
 
     pub fn setChecksum(self: ICMPv6, c: u16) void {
-        std.mem.writeIntBig(u16, self.data[2..4], c);
+        std.mem.writeInt(u16, self.data[2..4], c, .big);
     }
 
     pub fn calculateChecksum(self: ICMPv6, src: [16]u8, dst: [16]u8, payload: []const u8) u16 {
@@ -470,11 +484,11 @@ pub const ICMPv6 = struct {
         // Pseudo-header
         var i: usize = 0;
         while (i < 16) : (i += 2) {
-            sum += std.mem.readIntBig(u16, src[i..][0..2]);
+            sum += std.mem.readInt(u16, src[i..][0..2], .big);
         }
         i = 0;
         while (i < 16) : (i += 2) {
-            sum += std.mem.readIntBig(u16, dst[i..][0..2]);
+            sum += std.mem.readInt(u16, dst[i..][0..2], .big);
         }
         
         const len = ICMPv6MinimumSize + payload.len;
@@ -485,6 +499,108 @@ pub const ICMPv6 = struct {
         sum = internetChecksum(self.data[0..ICMPv6MinimumSize], sum);
         sum = internetChecksum(payload, sum);
         return finishChecksum(sum);
+    }
+};
+
+pub const ICMPv6NS = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) ICMPv6NS {
+        return .{ .data = data };
+    }
+
+    pub fn targetAddress(self: ICMPv6NS) [16]u8 {
+        var addr: [16]u8 = undefined;
+        @memcpy(&addr, self.data[4..20]);
+        return addr;
+    }
+
+    pub fn setTargetAddress(self: ICMPv6NS, addr: [16]u8) void {
+        @memcpy(self.data[4..20], &addr);
+    }
+};
+
+pub const ICMPv6NA = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) ICMPv6NA {
+        return .{ .data = data };
+    }
+
+    pub fn flags(self: ICMPv6NA) u8 {
+        return self.data[0];
+    }
+
+    pub fn targetAddress(self: ICMPv6NA) [16]u8 {
+        var addr: [16]u8 = undefined;
+        @memcpy(&addr, self.data[4..20]);
+        return addr;
+    }
+
+    pub fn setFlags(self: ICMPv6NA, f: u8) void {
+        self.data[0] = f;
+    }
+
+    pub fn setTargetAddress(self: ICMPv6NA, addr: [16]u8) void {
+        @memcpy(self.data[4..20], &addr);
+    }
+};
+
+pub const ICMPv6RA = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) ICMPv6RA {
+        return .{ .data = data };
+    }
+
+    pub fn hopLimit(self: ICMPv6RA) u8 {
+        return self.data[0];
+    }
+
+    pub fn flags(self: ICMPv6RA) u8 {
+        return self.data[1];
+    }
+
+    pub fn routerLifetime(self: ICMPv6RA) u16 {
+        return std.mem.readInt(u16, self.data[2..4], .big);
+    }
+
+    pub fn reachableTime(self: ICMPv6RA) u32 {
+        return std.mem.readInt(u32, self.data[4..8], .big);
+    }
+
+    pub fn retransTimer(self: ICMPv6RA) u32 {
+        return std.mem.readInt(u32, self.data[8..12], .big);
+    }
+};
+
+pub const ICMPv6OptionPrefix = struct {
+    data: []u8,
+
+    pub fn init(data: []u8) ICMPv6OptionPrefix {
+        return .{ .data = data };
+    }
+
+    pub fn prefixLength(self: ICMPv6OptionPrefix) u8 {
+        return self.data[2];
+    }
+
+    pub fn flags(self: ICMPv6OptionPrefix) u8 {
+        return self.data[3];
+    }
+
+    pub fn validLifetime(self: ICMPv6OptionPrefix) u32 {
+        return std.mem.readInt(u32, self.data[4..8], .big);
+    }
+
+    pub fn preferredLifetime(self: ICMPv6OptionPrefix) u32 {
+        return std.mem.readInt(u32, self.data[8..12], .big);
+    }
+
+    pub fn prefix(self: ICMPv6OptionPrefix) [16]u8 {
+        var addr: [16]u8 = undefined;
+        @memcpy(&addr, self.data[16..32]);
+        return addr;
     }
 };
 
@@ -509,7 +625,7 @@ test "IPv6 header" {
 test "IPv4 header" {
     var data = [_]u8{0} ** 20;
     data[0] = 0x45; // Version 4, IHL 5 (20 bytes)
-    std.mem.writeIntBig(u16, data[2..4], 100); // Total length
+    std.mem.writeInt(u16, data[2..4], 100, .big); // Total length
     data[9] = 6; // TCP
     @memcpy(data[12..16], &[_]u8{ 192, 168, 1, 1 });
     @memcpy(data[16..20], &[_]u8{ 192, 168, 1, 2 });
@@ -524,9 +640,9 @@ test "IPv4 header" {
 
 test "TCP header" {
     var data = [_]u8{0} ** 20;
-    std.mem.writeIntBig(u16, data[0..2], 1234); // Src port
-    std.mem.writeIntBig(u16, data[2..4], 80);   // Dst port
-    std.mem.writeIntBig(u32, data[4..8], 0x11223344); // Seq
+    std.mem.writeInt(u16, data[0..2], 1234, .big); // Src port
+    std.mem.writeInt(u16, data[2..4], 80, .big);   // Dst port
+    std.mem.writeInt(u32, data[4..8], 0x11223344, .big); // Seq
     data[12] = 0x50; // Data offset 5 (20 bytes)
     data[13] = 0x02; // SYN flag
 
@@ -563,10 +679,10 @@ test "ARP header" {
 
 test "UDP header" {
     var data = [_]u8{0} ** 8;
-    std.mem.writeIntBig(u16, data[0..2], 1234);
-    std.mem.writeIntBig(u16, data[2..4], 5678);
-    std.mem.writeIntBig(u16, data[4..6], 20);
-    std.mem.writeIntBig(u16, data[6..8], 0xabcd);
+    std.mem.writeInt(u16, data[0..2], 1234, .big);
+    std.mem.writeInt(u16, data[2..4], 5678, .big);
+    std.mem.writeInt(u16, data[4..6], 20, .big);
+    std.mem.writeInt(u16, data[6..8], 0xabcd, .big);
 
     const udp = UDP.init(&data);
     try std.testing.expectEqual(@as(u16, 1234), udp.sourcePort());

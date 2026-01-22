@@ -15,6 +15,22 @@ pub const Address = union(enum) {
             .v6 => |v| std.mem.eql(u8, &v, &other.v6),
         };
     }
+
+    pub fn toSolicitedNodeMulticast(self: Address) Address {
+        const v6 = switch (self) {
+            .v4 => unreachable,
+            .v6 => |v| v,
+        };
+        var res = [_]u8{0} ** 16;
+        res[0] = 0xff;
+        res[1] = 0x02;
+        res[11] = 0x01;
+        res[12] = 0xff;
+        res[13] = v6[13];
+        res[14] = v6[14];
+        res[15] = v6[15];
+        return .{ .v6 = res };
+    }
 };
 
 pub const LinkAddress = [6]u8;
@@ -81,6 +97,8 @@ pub const Endpoint = struct {
         getLocalAddress: *const fn (ptr: *anyopaque) Error!FullAddress,
         getRemoteAddress: *const fn (ptr: *anyopaque) Error!FullAddress,
         setReceiveWindow: ?*const fn (ptr: *anyopaque, size: u32) void = null,
+        setOption: *const fn (ptr: *anyopaque, opt: EndpointOption) Error!void,
+        getOption: *const fn (ptr: *anyopaque, opt: EndpointOptionType) EndpointOption,
     };
 
     pub fn close(self: Endpoint) void {
@@ -113,6 +131,20 @@ pub const Endpoint = struct {
     pub fn shutdown(self: Endpoint, flags: u8) Error!void {
         return self.vtable.shutdown(self.ptr, flags);
     }
+    pub fn setOption(self: Endpoint, opt: EndpointOption) Error!void {
+        return self.vtable.setOption(self.ptr, opt);
+    }
+    pub fn getOption(self: Endpoint, opt_type: EndpointOptionType) EndpointOption {
+        return self.vtable.getOption(self.ptr, opt_type);
+    }
+};
+
+pub const EndpointOptionType = enum {
+    ts_enabled,
+};
+
+pub const EndpointOption = union(EndpointOptionType) {
+    ts_enabled: bool,
 };
 
 pub const AddressWithPrefix = struct {
@@ -146,17 +178,26 @@ pub const Subnet = struct {
         const remaining_bits = prefix_bits % 8;
         var i: usize = 0;
 
+        const self_buf = switch (self.address) {
+            .v4 => |v| v[0..],
+            .v6 => |v| v[0..],
+        };
+        const addr_buf = switch (addr) {
+            .v4 => |v| v[0..],
+            .v6 => |v| v[0..],
+        };
+
         // Check full bytes
         while (i < bytes_to_check) : (i += 1) {
-            if (self.address.v4[i] != addr.v4[i]) {
+            if (self_buf[i] != addr_buf[i]) {
                 return false;
             }
         }
 
         // Check partial byte
         if (remaining_bits > 0) {
-            const mask = @as(u8, @bitCast(@as(u16, 0xFF00) >> @as(u4, 8 - remaining_bits)));
-            if ((self.address.v4[i] & mask) != (addr.v4[i] & mask)) {
+            const mask = @as(u8, 0xFF) << @intCast(8 - remaining_bits);
+            if ((self_buf[i] & mask) != (addr_buf[i] & mask)) {
                 return false;
             }
         }
