@@ -50,114 +50,15 @@ pub extern fn my_ev_run(loop: ?*ev_loop) void;
 pub extern fn my_tuntap_init(fd: i32, name: [*:0]const u8) i32;
 
 // Implementation of TunTapEndpoint that actually works
-const RealTunTapEndpoint = struct {
-    fd: i32,
-    address: [6]u8 = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 },
-    dispatcher: ?*stack.NetworkDispatcher = null,
 
-    pub fn init(dev_name: [:0]const u8) !RealTunTapEndpoint {
-        const fd = try std.posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
-        
-        if (my_tuntap_init(fd, dev_name) < 0) {
-            return error.TunsetiffFailed;
-        }
-        
-        return RealTunTapEndpoint{ .fd = fd };
-    }
-
-    pub fn linkEndpoint(self: *RealTunTapEndpoint) stack.LinkEndpoint {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .writePacket = writePacket,
-                .attach = attach,
-                .linkAddress = linkAddress,
-                .mtu = mtu,
-                .setMTU = setMTU,
-                .capabilities = capabilities,
-            },
-        };
-    }
-
-    fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-        const self = @as(*RealTunTapEndpoint, @ptrCast(@alignCast(ptr)));
-        _ = r; _ = protocol;
-
-        const hdr_len = pkt.header.usedLength();
-        
-        // Construct iovecs
-        var iovecs = std.heap.page_allocator.alloc(std.posix.iovec_const, 1 + pkt.data.views.len) catch return tcpip.Error.NoBufferSpace;
-        defer std.heap.page_allocator.free(iovecs);
-        
-        iovecs[0] = .{ .base = pkt.header.view().ptr, .len = hdr_len };
-        for (pkt.data.views, 0..) |v, i| {
-            iovecs[i+1] = .{ .base = v.ptr, .len = v.len };
-        }
-        
-        _ = std.posix.writev(self.fd, iovecs) catch |err| {
-            std.debug.print("TAP: writev error: {}\n", .{err});
-            return tcpip.Error.UnknownDevice;
-        };
-        
-        // Packet Trace: Outgoing
-        std.debug.print("TAP >>> OUT: len={} bytes=", .{hdr_len + pkt.data.size});
-        const hdr = pkt.header.view();
-        for (hdr) |b| std.debug.print("{x:0>2} ", .{b});
-        for (pkt.data.views) |v| {
-            for (v) |b| std.debug.print("{x:0>2} ", .{b});
-        }
-        std.debug.print("\n", .{});
-    }
-
-    fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
-        const self = @as(*RealTunTapEndpoint, @ptrCast(@alignCast(ptr)));
-        self.dispatcher = dispatcher;
-    }
-
-    fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
-        const self = @as(*RealTunTapEndpoint, @ptrCast(@alignCast(ptr)));
-        return self.address;
-    }
-
-    fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
-    fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
-    fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
-
-    pub fn onReadable(self: *RealTunTapEndpoint) !void {
-        var buf: [2000]u8 = undefined;
-        const len = std.posix.read(self.fd, &buf) catch |err| {
-            std.debug.print("TAP: read error: {}\n", .{err});
-            return;
-        };
-        if (len < 14) return;
-
-        // Packet Trace: Incoming
-        std.debug.print("TAP <<< IN:  len={} bytes\n", .{len});
-
-        const payload = std.heap.page_allocator.alloc(u8, len) catch return;
-        defer std.heap.page_allocator.free(payload);
-        @memcpy(payload, buf[0..len]);
-        
-        var views = [1]buffer.View{payload};
-        
-        const pkt = tcpip.PacketBuffer{
-            .data = buffer.VectorisedView.init(payload.len, &views),
-            .header = buffer.Prependable.init(&[_]u8{}),
-        };
-
-        if (self.dispatcher) |d| {
-            d.deliverNetworkPacket([_]u8{0}**6, [_]u8{0}**6, 0, pkt);
-        }
-    }
-};
-
+// Global variables for libev callbacks
 var global_stack: *stack.Stack = undefined;
-var global_tap: *RealTunTapEndpoint = undefined;
+var global_tap: *ustack.drivers.tap.Tap = undefined;
 
 fn libev_io_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) void {
     _ = loop; _ = watcher; _ = revents;
-    global_tap.onReadable() catch |err| {
-        std.debug.print("onReadable error: {}\n", .{err});
+    global_tap.readPacket() catch |err| {
+        std.debug.print("readPacket error: {}\n", .{err});
     };
 }
 
@@ -172,7 +73,7 @@ pub fn main() !void {
     var s = try ustack.init(allocator);
     global_stack = &s;
     
-    var tap = try RealTunTapEndpoint.init("tap0");
+    var tap = try ustack.drivers.tap.Tap.init("tap0");
     global_tap = &tap;
     
     var eth_ep = ustack.link.eth.EthernetEndpoint.init(tap.linkEndpoint(), tap.address);

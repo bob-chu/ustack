@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const buffer = @import("buffer.zig");
 pub const header = @import("header.zig");
@@ -26,6 +27,12 @@ pub const link = struct {
     pub const eth = @import("link/eth.zig");
 };
 pub const dns = @import("dns.zig");
+
+pub const drivers = if (builtin.os.tag == .linux) struct {
+    pub const tap = @import("drivers/linux/tap.zig");
+    pub const af_packet = @import("drivers/linux/af_packet.zig");
+    pub const af_xdp = @import("drivers/linux/af_xdp.zig");
+} else struct {};
 
 pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     var s = try stack.Stack.init(allocator);
