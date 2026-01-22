@@ -10,8 +10,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
     b.installArtifact(lib);
+
+    const dylib = b.addSharedLibrary(.{
+        .name = "ustack",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(dylib);
 
     const ustack_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -35,7 +42,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     example.root_module.addImport("ustack", ustack_mod);
+    example.linkLibrary(lib); // Link against static lib to enforce library usage
     example.linkLibC();
+
     example.linkSystemLibrary("uv");
 
     const install_example = b.addInstallArtifact(example, .{});
@@ -58,8 +67,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         exe.root_module.addImport("ustack", ustack_mod);
+        exe.linkLibrary(lib);
         exe.linkLibC();
+
         exe.linkSystemLibrary(ex.lib);
+        if (std.mem.eql(u8, ex.name, "example_tap_libev")) {
+            exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
+        }
         const install = b.addInstallArtifact(exe, .{});
         example_step.dependOn(&install.step);
     }
