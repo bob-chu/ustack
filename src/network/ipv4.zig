@@ -164,7 +164,8 @@ pub const IPv4Endpoint = struct {
         
         const hlen = h.headerLength();
         if (header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0)) != 0) {
-            return;
+            std.debug.print("IPv4: Checksum failure from {any}\n", .{h.sourceAddress()});
+            // return; // Disable drop for debugging
         }
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {

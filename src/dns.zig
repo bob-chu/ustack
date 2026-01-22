@@ -31,13 +31,26 @@ pub const Resolver = struct {
         var ep = try udp_proto.newEndpoint(self.stack, net_proto, &wq);
         defer ep.close();
 
+        // Try to find specific source address to bind to (avoids INADDR_ANY routing issues)
+        var bind_addr = switch (self.dns_server) {
+            .v4 => tcpip.Address{ .v4 = .{ 0, 0, 0, 0 } },
+            .v6 => tcpip.Address{ .v6 = [_]u8{0} ** 16 },
+        };
+        
+        // Find address on NIC 1 (default)
+        if (self.stack.nics.get(1)) |nic| {
+            for (nic.addresses.items) |pa| {
+                if (std.meta.activeTag(pa.address_with_prefix.address) == std.meta.activeTag(self.dns_server)) {
+                    bind_addr = pa.address_with_prefix.address;
+                    break;
+                }
+            }
+        }
+
         // Bind to ephemeral port
         try ep.bind(.{ 
-            .nic = 1, // Default NIC? Should be routable.
-            .addr = switch (self.dns_server) {
-                .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
-                .v6 => .{ .v6 = [_]u8{0} ** 16 },
-            }, 
+            .nic = 1, 
+            .addr = bind_addr, 
             .port = 0 
         });
         
