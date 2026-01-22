@@ -196,7 +196,21 @@ pub const UDPEndpoint = struct {
         .bind = bind,
         .getLocalAddress = getLocalAddress,
         .getRemoteAddress = getRemoteAddress,
+        .setOption = setOption,
+        .getOption = getOption,
     };
+
+    fn setOption(ptr: *anyopaque, opt: tcpip.EndpointOption) tcpip.Error!void {
+        _ = ptr; _ = opt;
+        return;
+    }
+
+    fn getOption(ptr: *anyopaque, opt_type: tcpip.EndpointOptionType) tcpip.EndpointOption {
+        _ = ptr;
+        return switch (opt_type) {
+            .ts_enabled => .{ .ts_enabled = false },
+        };
+    }
 
     fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.View {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
