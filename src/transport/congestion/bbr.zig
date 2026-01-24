@@ -6,7 +6,7 @@ pub const BBR = struct {
     ssthresh: u32,
     mss: u32,
     allocator: std.mem.Allocator,
-    
+
     // Simplified BBR state
     min_rtt: u32,
     bottleneck_bw: u64,

@@ -57,10 +57,11 @@ pub fn build(b: *std.Build) void {
         exe.linkLibC();
 
         exe.linkSystemLibrary(ex.lib);
-        if (std.mem.eql(u8, ex.name, "example_tap_libev") or 
-            std.mem.eql(u8, ex.name, "example_tap_libev_mux") or 
+        if (std.mem.eql(u8, ex.name, "example_tap_libev") or
+            std.mem.eql(u8, ex.name, "example_tap_libev_mux") or
             std.mem.eql(u8, ex.name, "example_af_packet_libev") or
-            std.mem.eql(u8, ex.name, "example_af_xdp_libev")) {
+            std.mem.eql(u8, ex.name, "example_af_xdp_libev"))
+        {
             exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
         }
         const install = b.addInstallArtifact(exe, .{});

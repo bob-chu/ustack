@@ -31,7 +31,8 @@ pub const UDPProtocol = struct {
     }
 
     fn newEndpoint(ptr: *anyopaque, s: *stack.Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
-        _ = ptr; _ = net_proto;
+        _ = ptr;
+        _ = net_proto;
         const ep = s.allocator.create(UDPEndpoint) catch return tcpip.Error.OutOfMemory;
         ep.* = UDPEndpoint.init(s, wait_queue);
         return ep.endpoint();
@@ -56,7 +57,7 @@ pub const UDPEndpoint = struct {
     rcv_list: std.TailQueue(Packet),
     mutex: std.Thread.Mutex = .{},
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
-    
+
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
 
@@ -106,7 +107,7 @@ pub const UDPEndpoint = struct {
 
     fn close_external(ptr: *anyopaque) void {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
-        
+
         if (self.local_addr) |la| {
             const id = stack.TransportEndpointID{
                 .local_port = la.port,
@@ -135,19 +136,19 @@ pub const UDPEndpoint = struct {
 
     pub fn write(self: *UDPEndpoint, r: *stack.Route, remote_port: u16, data: buffer.VectorisedView) tcpip.Error!void {
         const local_address = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-        
+
         const hdr_buf = self.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer self.stack.allocator.free(hdr_buf);
-        
+
         var pre = buffer.Prependable.init(hdr_buf);
         const udp_hdr = pre.prepend(header.UDPMinimumSize).?;
         var h = header.UDP.init(udp_hdr);
-        
+
         h.setSourcePort(local_address.port);
         h.setDestinationPort(remote_port);
         h.setLength(@as(u16, @intCast(header.UDPMinimumSize + data.size)));
         h.setChecksum(0);
-        
+
         // Calculate Checksum if IPv4
         if (local_address.addr == .v4 and r.remote_address == .v4) {
             var sum: u32 = 0;
@@ -159,7 +160,7 @@ pub const UDPEndpoint = struct {
             sum += std.mem.readInt(u16, dst[2..4], .big);
             sum += 17; // UDP
             sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
-            
+
             sum = header.internetChecksum(h.data, sum);
             for (data.views) |view| {
                 sum = header.internetChecksum(view, sum);
@@ -172,7 +173,7 @@ pub const UDPEndpoint = struct {
             .data = data,
             .header = pre,
         };
-        
+
         return r.writePacket(ProtocolNumber, pb);
     }
 
@@ -192,7 +193,7 @@ pub const UDPEndpoint = struct {
             tmp.deinit();
             return;
         };
-        
+
         node.data = .{
             .data = cloned_data,
             .sender_addr = .{
@@ -235,7 +236,8 @@ pub const UDPEndpoint = struct {
     };
 
     fn setOption(ptr: *anyopaque, opt: tcpip.EndpointOption) tcpip.Error!void {
-        _ = ptr; _ = opt;
+        _ = ptr;
+        _ = opt;
         return;
     }
 
@@ -270,19 +272,19 @@ pub const UDPEndpoint = struct {
     fn write_external(ptr: *anyopaque, p: tcpip.Payloader, opts: tcpip.WriteOptions) tcpip.Error!usize {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         const data_buf = try p.fullPayload();
-        
+
         var views = [_]buffer.View{@constCast(data_buf)};
         const data = buffer.VectorisedView.init(data_buf.len, &views);
 
         if (opts.to) |to| {
             const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-            
+
             const net_proto: u16 = switch (to.addr) {
                 .v4 => 0x0800,
                 .v6 => 0x86dd,
             };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
-            
+
             self.stack.mutex.lock();
             const next_hop = r.next_hop orelse to.addr;
             if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
@@ -293,13 +295,13 @@ pub const UDPEndpoint = struct {
             try self.write(&r, to.port, data);
         } else if (self.remote_addr) |to| {
             const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-            
+
             const net_proto: u16 = switch (to.addr) {
                 .v4 => 0x0800,
                 .v6 => 0x86dd,
             };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
-            
+
             self.stack.mutex.lock();
             if (self.stack.link_addr_cache.get(to.addr)) |link_addr| {
                 r.remote_link_address = link_addr;
@@ -310,7 +312,7 @@ pub const UDPEndpoint = struct {
         } else {
             return tcpip.Error.DestinationRequired;
         }
-        
+
         return data_buf.len;
     }
 
@@ -326,14 +328,14 @@ pub const UDPEndpoint = struct {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         self.mutex.lock();
         defer self.mutex.unlock();
-        
+
         var new_addr = addr;
         if (new_addr.port == 0) {
             // Assign ephemeral port (simple randomization)
             new_addr.port = 30000 + @as(u16, @intCast(@mod(std.time.milliTimestamp(), 30000)));
         }
         self.local_addr = new_addr;
-        
+
         // Register endpoint for receiving packets
         const id = stack.TransportEndpointID{
             .local_port = new_addr.port,
@@ -344,20 +346,21 @@ pub const UDPEndpoint = struct {
                 .v6 => .{ .v6 = [_]u8{0} ** 16 },
             },
         };
-        
+
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
-        
+
         return;
     }
 
-
     fn shutdown(ptr: *anyopaque, flags: u8) tcpip.Error!void {
-        _ = ptr; _ = flags;
+        _ = ptr;
+        _ = flags;
         return;
     }
 
     fn listen(ptr: *anyopaque, backlog: i32) tcpip.Error!void {
-        _ = ptr; _ = backlog;
+        _ = ptr;
+        _ = backlog;
         return tcpip.Error.UnknownProtocol;
     }
 

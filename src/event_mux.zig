@@ -1,7 +1,7 @@
 const std = @import("std");
 const waiter = @import("waiter.zig");
 
-/// EventMultiplexer acts as a bridge between ustack's user-space events 
+/// EventMultiplexer acts as a bridge between ustack's user-space events
 pub const EventMultiplexer = struct {
     ready_queue: ReadyQueue,
     signal_fd: std.posix.fd_t,
@@ -9,11 +9,11 @@ pub const EventMultiplexer = struct {
 
     pub fn init(allocator: std.mem.Allocator) !*EventMultiplexer {
         const self = try allocator.create(EventMultiplexer);
-        
+
         // Create an eventfd (or pipe as fallback) to signal the kernel loop
         // EFD_NONBLOCK is usually 0x800 on Linux.
         const efd = try std.posix.eventfd(0, 0x800);
-        
+
         self.* = .{
             .ready_queue = ReadyQueue.init(allocator),
             .signal_fd = efd,
@@ -36,18 +36,9 @@ pub const EventMultiplexer = struct {
     /// The "Soupcall" - This is registered on a socket's wait_queue.
     /// It gets triggered by the stack when data arrives or space opens up.
     pub fn upcall(entry: *waiter.Entry) void {
+        const self = @as(*EventMultiplexer, @ptrCast(@alignCast(entry.upcall_ctx.?)));
         std.debug.print("EventMux: upcall triggered\n", .{});
-        // The context is a pointer to the EventMultiplexer
-        const self = @as(*EventMultiplexer, @ptrCast(@alignCast(entry.context.?)));
-        
-        // entry.next is often used as a pointer to the actual socket/endpoint context 
-        // in user implementations, but here we expect the user to set up the entry 
-        // so we know which socket fired.
-        
-        // 1. Add to ready queue (logic depends on how we identify sockets)
         self.ready_queue.push(entry) catch return;
-
-        // 2. Signal the kernel loop via eventfd
         const val: u64 = 1;
         _ = std.posix.write(self.signal_fd, std.mem.asBytes(&val)) catch {};
     }
@@ -67,7 +58,7 @@ pub const EventMultiplexer = struct {
 const ReadyQueue = struct {
     mutex: std.Thread.Mutex = .{},
     list: std.ArrayList(*waiter.Entry),
-    
+
     pub fn init(allocator: std.mem.Allocator) ReadyQueue {
         return .{
             .list = std.ArrayList(*waiter.Entry).init(allocator),
@@ -81,21 +72,21 @@ const ReadyQueue = struct {
     pub fn push(self: *ReadyQueue, entry: *waiter.Entry) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        
+
         // Deduplicate: Don't add if already in queue
         for (self.list.items) |item| {
             if (item == entry) return;
         }
-        
+
         try self.list.append(entry);
     }
 
     pub fn popAll(self: *ReadyQueue) ![]*waiter.Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
-        
+
         if (self.list.items.len == 0) return &[_]*waiter.Entry{};
-        
+
         const results = try self.list.toOwnedSlice();
         return results;
     }
@@ -107,7 +98,7 @@ test "EventMultiplexer basic" {
     defer mux.deinit();
 
     var entry = waiter.Entry.init(mux, EventMultiplexer.upcall);
-    
+
     // Trigger upcall
     EventMultiplexer.upcall(&entry);
 

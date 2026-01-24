@@ -10,10 +10,10 @@ pub const Socket = struct {
     // For a listening socket, we create it.
     // For an accepted socket, we inherit it from the stack.
     wait_queue: *waiter.Queue,
-    
+
     blocking: bool = true,
     allocator: std.mem.Allocator,
-    
+
     // Synchronization for blocking mode
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
@@ -81,7 +81,7 @@ pub fn usocket(s: *stack.Stack, domain: i32, sock_type: i32, protocol: i32) !*So
     errdefer {
         s.allocator.destroy(wq);
     }
-    
+
     return Socket.init(s.allocator, ep, wq);
 }
 
@@ -94,11 +94,11 @@ pub fn ubind(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_t) 
 pub fn uconnect(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
     _ = len;
     const full_addr = fromSockAddr(addr) catch return error.AddressFamilyNotSupported;
-    
+
     // Non-blocking connect not fully supported by this simple wrapper logic yet,
     // but underlying stack supports it.
     try sock.endpoint.connect(full_addr);
-    
+
     // For TCP, connect might return immediately or start handshake.
     // If blocking, we should wait for ESTABLISHED or Error.
     if (sock.blocking) {
@@ -108,7 +108,7 @@ pub fn uconnect(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_
         // Currently endpoint interface doesn't expose state generically.
         // Assuming TCP endpoint:
         // Wait for EventOut (writable) which usually signifies connected.
-        
+
         sock.mutex.lock();
         defer sock.mutex.unlock();
         while (true) {
@@ -117,15 +117,15 @@ pub fn uconnect(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_
             // Actually, connect() in tcp.zig returns immediately after sending SYN.
             // We should wait.
             // Let's assume we wait for writeable.
-             
-             // Hack: just wait once? No.
-             // We need 'getOption' to check error?
-             // Or just proceed. Standard connect() blocks.
-             // Let's implement a wait loop here.
-             
-             // This is tricky without `getsockopt(SO_ERROR)`.
-             // For now, let's just return. User will find out on read/write.
-             break;
+
+            // Hack: just wait once? No.
+            // We need 'getOption' to check error?
+            // Or just proceed. Standard connect() blocks.
+            // Let's implement a wait loop here.
+
+            // This is tricky without `getsockopt(SO_ERROR)`.
+            // For now, let's just return. User will find out on read/write.
+            break;
         }
     }
 }
@@ -147,11 +147,11 @@ pub fn uaccept(sock: *Socket, addr: ?*std.posix.sockaddr, len: ?*std.posix.sockl
         };
 
         if (addr) |out_addr| {
-             if (res.ep.getRemoteAddress()) |remote| {
-                 toSockAddr(remote, out_addr, len);
-             } else |_| {}
+            if (res.ep.getRemoteAddress()) |remote| {
+                toSockAddr(remote, out_addr, len);
+            } else |_| {}
         }
-        
+
         return Socket.init(sock.allocator, res.ep, res.wq);
     }
 }
@@ -168,7 +168,7 @@ pub fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
             }
             return err;
         };
-        
+
         const len = @min(buf.len, view.len);
         @memcpy(buf[0..len], view[0..len]);
         // Note: 'view' is owned by us (caller of read). We must free it?
@@ -196,7 +196,7 @@ pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
 
     while (true) {
         const n = sock.endpoint.write(fp.payloader(), .{}) catch |err| {
-             if (err == tcpip.Error.WouldBlock and sock.blocking) {
+            if (err == tcpip.Error.WouldBlock and sock.blocking) {
                 sock.mutex.lock();
                 sock.cond.wait(&sock.mutex);
                 sock.mutex.unlock();
@@ -249,7 +249,7 @@ fn toSockAddr(addr: tcpip.FullAddress, out: *std.posix.sockaddr, len: ?*std.posi
             @memcpy(@as([*]u8, @ptrCast(out))[0..size], @as([*]const u8, @ptrCast(&in))[0..size]);
         },
         .v6 => |v| {
-             var in6 = std.posix.sockaddr.in6{
+            var in6 = std.posix.sockaddr.in6{
                 .family = std.posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, addr.port),
                 .flowinfo = 0,
@@ -257,7 +257,7 @@ fn toSockAddr(addr: tcpip.FullAddress, out: *std.posix.sockaddr, len: ?*std.posi
                 .scope_id = 0,
             };
             const size = @sizeOf(std.posix.sockaddr.in6);
-             if (len) |l| {
+            if (len) |l| {
                 if (l.* < size) return;
                 l.* = size;
             }
@@ -282,15 +282,16 @@ test "POSIX API TCP client/server" {
         allocator: std.mem.Allocator,
         server_pkt: ?[]u8 = null,
         client_pkt: ?[]u8 = null,
-        
+
         // Very basic in-memory "loopback" that delivers packets to the stack
         // This simulates the wire
         stack_ref: *stack.Stack,
-        
+
         fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            _ = r; _ = protocol;
-            
+            _ = r;
+            _ = protocol;
+
             // Linearize packet
             const hdr_view = pkt.header.view();
             const total_len = hdr_view.len + pkt.data.size;
@@ -298,25 +299,31 @@ test "POSIX API TCP client/server" {
             @memcpy(buf[0..hdr_view.len], hdr_view);
             var off = hdr_view.len;
             for (pkt.data.views) |v| {
-                @memcpy(buf[off..off+v.len], v);
+                @memcpy(buf[off .. off + v.len], v);
                 off += v.len;
             }
-            
+
             // "Transmit" by delivering back to stack (loopback)
             // But we need to reverse src/dst in IP/TCP headers if we want full emulation.
             // For this test, we are cheating. We just want to verifying API calls don't crash and wait/notify works.
             // But `uconnect` waits for handshake. We need a responder.
-            
+
             // Let's just test bind/listen/socket creation without full traffic flow for now
             // to verify API surface. Full flow requires a lot of setup.
             self.allocator.free(buf);
             return;
         }
         fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
-        fn linkAddress(_: *anyopaque) tcpip.LinkAddress { return .{ .addr = [_]u8{0}**6 }; }
-        fn mtu(_: *anyopaque) u32 { return 1500; }
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
         fn setMTU(_: *anyopaque, _: u32) void {}
-        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities { return 0; }
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return 0;
+        }
     }{ .allocator = allocator, .stack_ref = &s };
 
     const link_ep = stack.LinkEndpoint{
@@ -343,13 +350,13 @@ test "POSIX API TCP client/server" {
         .family = std.posix.AF.INET,
         .port = std.mem.nativeToBig(u16, 8080),
         .addr = 0, // 0.0.0.0
-        .zero = [_]u8{0}**8,
+        .zero = [_]u8{0} ** 8,
     };
     try ubind(sock, @as(std.posix.sockaddr, @bitCast(addr)), @sizeOf(std.posix.sockaddr.in));
-    
+
     // 3. Listen
     try ulisten(sock, 10);
-    
+
     // 4. Accept (Non-blocking check for test)
     // We set non-blocking just to verify it doesn't hang forever in test
     sock.blocking = false;
@@ -402,13 +409,13 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
         const mask = pfd.sock.wait_queue.events();
         const interested = pollToWaiter(pfd.events);
         const fired = mask & interested;
-        
+
         if (fired != 0) {
             pfd.revents = waiterToPoll(fired);
             ready_count += 1;
         }
     }
-    
+
     if (ready_count > 0 or timeout_ms == 0) {
         return ready_count;
     }
@@ -418,23 +425,23 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
     // No, Condition Variable is associated with a Mutex.
     // Each Socket has its own Mutex/Cond.
     // This is hard with the current architecture where each Socket owns its queue/cond.
-    
+
     // Solution: Create a TEMPORARY Waiter Entry that points to a local condition variable.
     // Register this entry to ALL sockets' queues.
     // Wait on the local condition variable.
     // Unregister from all.
-    
+
     var mutex = std.Thread.Mutex{};
     var cond = std.Thread.Condition{};
     var fired = false;
-    
+
     const PollContext = struct {
         mutex: *std.Thread.Mutex,
         cond: *std.Thread.Condition,
         fired: *bool,
     };
     var ctx = PollContext{ .mutex = &mutex, .cond = &cond, .fired = &fired };
-    
+
     const callback = struct {
         fn cb(e: *waiter.Entry) void {
             const c = @as(*PollContext, @ptrCast(@alignCast(e.context.?)));
@@ -444,24 +451,24 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
             c.mutex.unlock();
         }
     }.cb;
-    
+
     // We need an array of entries, one per FD
     // Stack allocation might be too big for large N.
     // Use allocator from first socket? Or pass an allocator?
     // Let's assume fds.len is reasonable (like select 1024), or require allocator.
     // For now, let's use a temporary allocator or error if too big?
     // Let's use `std.heap.page_allocator` just for the wait entries array if stack is small.
-    
+
     // Optimization: Just one entry per socket.
     // Zig doesn't allow VLA.
     const entries = try std.heap.page_allocator.alloc(waiter.Entry, fds.len);
     defer std.heap.page_allocator.free(entries);
-    
+
     for (fds, 0..) |*pfd, i| {
         entries[i] = waiter.Entry.init(&ctx, callback);
         pfd.sock.wait_queue.eventRegister(&entries[i], pollToWaiter(pfd.events));
     }
-    
+
     // Wait
     mutex.lock();
     if (!fired) {
@@ -474,12 +481,12 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
         }
     }
     mutex.unlock();
-    
+
     // Unregister
     for (fds, 0..) |*pfd, i| {
         pfd.sock.wait_queue.eventUnregister(&entries[i]);
     }
-    
+
     // Re-check events
     ready_count = 0;
     for (fds) |*pfd| {
@@ -494,7 +501,7 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
             ready_count += 1;
         }
     }
-    
+
     return ready_count;
 }
 
@@ -510,12 +517,20 @@ test "POSIX upoll basic" {
 
     // Setup Link
     var fake_link = struct {
-        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void { return; }
+        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
         fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
-        fn linkAddress(_: *anyopaque) tcpip.LinkAddress { return .{ .addr = [_]u8{0}**6 }; }
-        fn mtu(_: *anyopaque) u32 { return 1500; }
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
         fn setMTU(_: *anyopaque, _: u32) void {}
-        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities { return 0; }
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return 0;
+        }
     }{};
     const link_ep = stack.LinkEndpoint{
         .ptr = &fake_link,
@@ -542,9 +557,9 @@ test "POSIX upoll basic" {
     // 2. Poll with data
     // Inject packet to make it readable
     const udp_ep = @as(*@import("transport/udp.zig").UDPEndpoint, @ptrCast(@alignCast(sock.endpoint.ptr)));
-    const r = stack.Route{ .local_address = .{ .v4 = .{127,0,0,1} }, .remote_address = .{ .v4 = .{127,0,0,2} }, .local_link_address = .{ .addr = [_]u8{0}**6 }, .net_proto = 0x0800, .nic = s.nics.get(1).? };
-    const id = stack.TransportEndpointID{ .local_port = 0, .local_address = .{ .v4 = .{0,0,0,0} }, .remote_port = 1234, .remote_address = .{ .v4 = .{127,0,0,2} } };
-    
+    const r = stack.Route{ .local_address = .{ .v4 = .{ 127, 0, 0, 1 } }, .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } }, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = s.nics.get(1).? };
+    const id = stack.TransportEndpointID{ .local_port = 0, .local_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .remote_port = 1234, .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } } };
+
     // We need to bind first to receive? UDP handlePacket doesn't check bind if injected directly to EP logic?
     // Wait, we need to inject to the endpoint instance.
     // Let's assume handlePacket logic:
@@ -554,18 +569,18 @@ test "POSIX upoll basic" {
     // Need UDP header for handlePacket to strip?
     // UDPEndpoint.handlePacket expects raw packet including UDP header?
     // Yes: header.UDP.init(mut_pkt.data.first()...)
-    
+
     // Re-alloc with header space
     allocator.free(payload_buf);
     const buf = try allocator.alloc(u8, 8 + 4); // 8 header + 4 payload
     @memset(buf, 0);
     var views2 = [_]buffer.View{buf};
     const pkt = tcpip.PacketBuffer{ .data = buffer.VectorisedView.init(buf.len, &views2), .header = buffer.Prependable.init(&[_]u8{}) };
-    
+
     // Inject directly into endpoint handler (bypassing stack dispatch for simplicity)
     udp_ep.transportEndpoint().handlePacket(&r, id, pkt);
     allocator.free(buf);
-    
+
     // Poll again (immediate)
     const n2 = try upoll(&fds, 100);
     try std.testing.expectEqual(@as(usize, 1), n2);

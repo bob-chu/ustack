@@ -277,20 +277,20 @@ pub const NIC = struct {
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // std.debug.print("NIC: Received packet proto=0x{x} remote={any} local={any}\n", .{protocol, remote, local});
-        
+
         self.stack.mutex.lock();
         const proto_opt = self.stack.network_protocols.get(protocol);
         self.stack.mutex.unlock();
-        
+
         if (proto_opt == null) return;
         const proto = proto_opt.?;
-        
+
         const ep_opt = self.network_endpoints.get(protocol);
         if (ep_opt == null) return;
         const ep = ep_opt.?;
-        
+
         const addrs = proto.parseAddresses(pkt);
-        
+
         const r = Route{
             .local_address = addrs.dst,
             .remote_address = addrs.src,
@@ -299,7 +299,7 @@ pub const NIC = struct {
             .net_proto = protocol,
             .nic = self,
         };
-        
+
         ep.handlePacket(&r, pkt);
     }
 };
@@ -322,7 +322,7 @@ pub const Route = struct {
             self.nic.stack.mutex.lock();
             const link_addr_opt = self.nic.stack.link_addr_cache.get(next_hop);
             self.nic.stack.mutex.unlock();
- 
+
             if (link_addr_opt) |link_addr| {
                 self.remote_link_address = link_addr;
             } else {
@@ -335,7 +335,7 @@ pub const Route = struct {
                 return tcpip.Error.WouldBlock;
             }
         }
-         
+
         const net_ep = self.nic.network_endpoints.get(self.net_proto) orelse return tcpip.Error.NoRoute;
         return net_ep.writePacket(self, protocol, pkt);
     }
@@ -430,7 +430,7 @@ const RouteTable = struct {
 
 pub const TransportTable = struct {
     const num_shards = 256;
-    
+
     shards: [num_shards]Shard,
 
     const Shard = struct {
@@ -565,9 +565,9 @@ pub const Stack = struct {
             self.mutex.lock();
             const nic_opt = self.nics.get(nic_id);
             self.mutex.unlock();
-             
+
             const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
-            
+
             return Route{
                 .local_address = local_addr,
                 .remote_address = remote_addr,
@@ -580,13 +580,13 @@ pub const Stack = struct {
 
         // Find route in routing table (longest-prefix matching)
         const route_entry = self.route_table.findRoute(remote_addr, nic_id) orelse return tcpip.Error.NoRoute;
-        
+
         self.mutex.lock();
         const nic_opt = self.nics.get(route_entry.nic);
         self.mutex.unlock();
-         
+
         const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
-        
+
         var final_local_addr = local_addr;
         if (final_local_addr.isAny()) {
             // Find address on the NIC that matches the protocol
@@ -637,11 +637,11 @@ pub const Stack = struct {
     pub fn createNIC(self: *Stack, id: tcpip.NICID, ep: LinkEndpoint) !void {
         const nic = try self.allocator.create(NIC);
         nic.* = NIC.init(self, id, "", ep, false);
-        
+
         self.mutex.lock();
         try self.nics.put(id, nic);
         self.mutex.unlock();
-        
+
         nic.attach();
     }
 
@@ -656,21 +656,21 @@ pub const Stack = struct {
 
     pub fn deliverTransportPacket(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
-        
+
         self.mutex.lock();
         const proto_opt = self.transport_protocols.get(protocol);
         self.mutex.unlock();
-        
+
         const proto = proto_opt orelse return;
         const ports = proto.parsePorts(pkt);
-        
+
         const id = TransportEndpointID{
             .local_port = ports.dst,
             .local_address = r.local_address,
             .remote_port = ports.src,
             .remote_address = r.remote_address,
         };
-        
+
         const ep_opt = self.endpoints.get(id);
 
         if (ep_opt) |ep| {
@@ -693,9 +693,9 @@ pub const Stack = struct {
                     .v6 => .{ .v6 = [_]u8{0} ** 16 },
                 },
             };
-            
+
             const listener_opt = self.endpoints.get(listener_id);
-            
+
             if (listener_opt) |ep| {
                 ep.handlePacket(r, id, pkt);
                 ep.decRef();
@@ -705,7 +705,7 @@ pub const Stack = struct {
                     .v4 => tcpip.Address{ .v4 = .{ 0, 0, 0, 0 } },
                     .v6 => tcpip.Address{ .v6 = [_]u8{0} ** 16 },
                 };
-                
+
                 const any_id = TransportEndpointID{
                     .local_port = ports.dst,
                     .local_address = any_addr,
@@ -715,19 +715,80 @@ pub const Stack = struct {
                         .v6 => .{ .v6 = [_]u8{0} ** 16 },
                     },
                 };
-                
+
                 if (self.endpoints.get(any_id)) |ep| {
                     ep.handlePacket(r, id, pkt);
                     ep.decRef();
                 } else {
                     if (protocol == 17) {
-                         std.debug.print("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}\n", .{ports.dst, id.hash(), listener_id.hash(), any_id.hash()});
-                         // print ids
-                         std.debug.print("Exact: local={any}:{} remote={any}:{}\n", .{id.local_address, id.local_port, id.remote_address, id.remote_port});
-                         std.debug.print("Any: local={any}:{} remote={any}:{}\n", .{any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port});
+                        std.debug.print("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}\n", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
+                        // print ids
+                        std.debug.print("Exact: local={any}:{} remote={any}:{}\n", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
+                        std.debug.print("Any: local={any}:{} remote={any}:{}\n", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });
                     }
                 }
             }
         }
     }
 };
+
+test "Stack.findRoute 0.0.0.0 bind" {
+    const allocator = std.testing.allocator;
+    var s = try Stack.init(allocator);
+    defer s.deinit();
+
+    // Mock LinkEndpoint
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) LinkEndpointCapabilities {
+            return 0;
+        }
+    }{};
+
+    const link_ep = LinkEndpoint{
+        .ptr = &fake_link,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_link).writePacket,
+            .attach = @TypeOf(fake_link).attach,
+            .linkAddress = @TypeOf(fake_link).linkAddress,
+            .mtu = @TypeOf(fake_link).mtu,
+            .setMTU = @TypeOf(fake_link).setMTU,
+            .capabilities = @TypeOf(fake_link).capabilities,
+        },
+    };
+
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+
+    const local_ip = tcpip.Address{ .v4 = .{ 10, 0, 0, 1 } };
+    try nic.addAddress(.{
+        .protocol = 0x0800,
+        .address_with_prefix = .{ .address = local_ip, .prefix_len = 24 },
+    });
+
+    // Add a route
+    try s.addRoute(.{
+        .destination = .{ .address = .{ .v4 = .{ 10, 0, 0, 0 } }, .prefix = 24 },
+        .gateway = .{ .v4 = .{ 0, 0, 0, 0 } },
+        .nic = 1,
+        .mtu = 1500,
+    });
+
+    // Test findRoute with any (0.0.0.0) source address
+    const remote_ip = tcpip.Address{ .v4 = .{ 10, 0, 0, 2 } };
+    const route = try s.findRoute(0, .{ .v4 = .{ 0, 0, 0, 0 } }, remote_ip, 0x0800);
+
+    try std.testing.expect(route.local_address.eq(local_ip));
+    try std.testing.expect(route.remote_address.eq(remote_ip));
+    try std.testing.expectEqual(@as(tcpip.NICID, 1), route.nic.id);
+}

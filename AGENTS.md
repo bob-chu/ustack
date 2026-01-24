@@ -21,6 +21,24 @@ docker exec my-ubuntu zig build
 docker exec my-ubuntu zig build test
 ```
 
+### 🏃 Running AF_PACKET Example (Server/Client)
+To run the `AF_PACKET` example using a `veth` pair:
+
+1. **Setup veth pair** (requires root/privileged):
+   ```bash
+   docker exec --privileged my-ubuntu /ustack/setup_veth.sh
+   ```
+
+2. **Start Server** (on `veth0`):
+   ```bash
+   docker exec --privileged -w /ustack my-ubuntu ./zig-out/bin/example_af_packet_libev veth0 server 10.0.0.2/24
+   ```
+
+3. **Start Client** (on `veth1`):
+   ```bash
+   docker exec --privileged -w /ustack my-ubuntu ./zig-out/bin/example_af_packet_libev veth1 client 10.0.0.1/24 10.0.0.2
+   ```
+
 ### 🏗 Building
 - **Build library (static/shared):** `zig build` (artifacts in `zig-out/lib/`)
 - **Build examples:** `zig build example` (artifacts in `zig-out/bin/`)

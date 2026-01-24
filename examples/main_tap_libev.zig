@@ -56,26 +56,30 @@ var global_stack: *stack.Stack = undefined;
 var global_tap: *ustack.drivers.tap.Tap = undefined;
 
 fn libev_io_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     global_tap.readPacket() catch |err| {
         std.debug.print("readPacket error: {}\n", .{err});
     };
 }
 
 fn libev_timer_cb(loop: ?*ev_loop, watcher: *ev_timer, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     _ = global_stack.timer_queue.tick();
 }
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
-    
+
     var s = try ustack.init(allocator);
     global_stack = &s;
-    
+
     var tap = try ustack.drivers.tap.Tap.init("tap0");
     global_tap = &tap;
-    
+
     var eth_ep = ustack.link.eth.EthernetEndpoint.init(tap.linkEndpoint(), tap.address);
     try s.createNIC(1, eth_ep.linkEndpoint());
 
@@ -106,18 +110,18 @@ pub fn main() !void {
         .nic = 1,
         .mtu = 1500,
     });
-    
+
     std.debug.print("Example: TAP + Libev starting...\n", .{});
 
     const loop = my_ev_default_loop() orelse {
         std.debug.print("Failed to initialize libev loop\n", .{});
         return;
     };
-    
+
     var io_watcher: ev_io = undefined;
     my_ev_io_init(&io_watcher, libev_io_cb, tap.fd, EV_READ);
     my_ev_io_start(loop, &io_watcher);
-    
+
     var timer_watcher: ev_timer = undefined;
     my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.01, 0.01); // 10ms ticks
     my_ev_timer_start(loop, &timer_watcher);
@@ -134,17 +138,16 @@ fn httpClientTask(s: *stack.Stack) void {
     };
 }
 
-
 fn doHttpClient(s: *stack.Stack) !void {
     const hostname = "www.google.com";
 
     // Resolve hostname via DNS
     std.debug.print("Resolving {s}...\n", .{hostname});
-    
+
     // Use ustack.dns resolver
     const dns_server = ustack.tcpip.Address{ .v4 = .{ 8, 8, 8, 8 } };
     var resolver = ustack.dns.Resolver.init(s, dns_server);
-    
+
     const google_ip = resolver.resolve(hostname) catch |err| blk: {
         std.debug.print("DNS resolution failed: {}\n", .{err});
         std.debug.print("Falling back to known IP 142.250.190.4 (www.google.com)\n", .{});
@@ -159,16 +162,16 @@ fn doHttpClient(s: *stack.Stack) !void {
     try ep.setOption(.{ .ts_enabled = true });
 
     try ep.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 0 }); // ephemeral port
-    
+
     // Helper to get v4 address bytes
     const dest_ip = switch (google_ip) {
         .v4 => |v| v,
         .v6 => |v| blk: {
-             // Just take first 4 bytes if someone resolves v6? No, we need proper dual stack support.
-             // But example is mostly v4 focused.
-             _ = v;
-             break :blk [4]u8{ 142, 250, 190, 4 };
-        }
+            // Just take first 4 bytes if someone resolves v6? No, we need proper dual stack support.
+            // But example is mostly v4 focused.
+            _ = v;
+            break :blk [4]u8{ 142, 250, 190, 4 };
+        },
     };
 
     std.debug.print("Connecting to {}.{}.{}.{}:80...\n", .{ dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3] });
@@ -246,14 +249,14 @@ fn doHttpClient(s: *stack.Stack) !void {
     }
 
     std.debug.print("\nTotal received: {} bytes. Closing gracefully...\n", .{total_received});
-    
+
     try ep.shutdown(0);
-    
+
     // Wait for stack to reach CLOSED state
     while (tcp_ep.state != .closed) {
         std.time.sleep(10 * std.time.ns_per_ms);
     }
-    
+
     std.debug.print("Connection closed gracefully. Exiting in 1 second...\n", .{});
     std.time.sleep(1000 * std.time.ns_per_ms);
     std.process.exit(0);

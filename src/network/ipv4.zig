@@ -45,7 +45,10 @@ pub const IPv4Protocol = struct {
     }
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
-        _ = ptr; _ = addr; _ = local_addr; _ = nic;
+        _ = ptr;
+        _ = addr;
+        _ = local_addr;
+        _ = nic;
         return tcpip.Error.NotPermitted;
     }
 
@@ -81,11 +84,11 @@ const ReassemblyKey = struct {
 
 const ReassemblyContext = struct {
     fragments: std.ArrayList(Fragment),
-    
+
     pub fn init(allocator: std.mem.Allocator) ReassemblyContext {
         return .{ .fragments = std.ArrayList(Fragment).init(allocator) };
     }
-    
+
     pub fn deinit(self: *ReassemblyContext) void {
         self.fragments.deinit();
     }
@@ -96,7 +99,7 @@ pub const IPv4Endpoint = struct {
     address: tcpip.Address,
     protocol: *IPv4Protocol,
     dispatcher: stack.TransportDispatcher,
-    
+
     reassembly_list: std.AutoHashMap(ReassemblyKey, ReassemblyContext),
 
     pub fn networkEndpoint(self: *IPv4Endpoint) stack.NetworkEndpoint {
@@ -130,16 +133,16 @@ pub const IPv4Endpoint = struct {
 
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
-        
+
         const max_payload = self.nic.linkEP.mtu() - header.IPv4MinimumSize;
         if (pkt.data.size > max_payload) {
-            return tcpip.Error.MessageTooLong; 
+            return tcpip.Error.MessageTooLong;
         }
 
         var mut_pkt = pkt;
         const ip_header = mut_pkt.header.prepend(header.IPv4MinimumSize) orelse return tcpip.Error.NoBufferSpace;
         const h = header.IPv4.init(ip_header);
-        
+
         @memset(ip_header, 0);
         ip_header[0] = 0x45; // Version 4, IHL 5
         std.mem.writeInt(u16, ip_header[2..4], @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size)), .big);
@@ -147,7 +150,7 @@ pub const IPv4Endpoint = struct {
         ip_header[9] = @as(u8, @intCast(protocol));
         @memcpy(ip_header[12..16], &r.local_address.v4);
         @memcpy(ip_header[16..20], &r.remote_address.v4);
-        
+
         h.setChecksum(h.calculateChecksum());
 
         return self.nic.linkEP.writePacket(r, ProtocolNumber, mut_pkt);
@@ -161,7 +164,7 @@ pub const IPv4Endpoint = struct {
         if (!h.isValid(mut_pkt.data.size)) {
             return;
         }
-        
+
         const hlen = h.headerLength();
         if (header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0)) != 0) {
             std.debug.print("IPv4: Checksum failure from {any}\n", .{h.sourceAddress()});
@@ -169,14 +172,14 @@ pub const IPv4Endpoint = struct {
         }
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {
-            std.debug.print("IPv4: Fragment received. offset={}, more={}\n", .{h.fragmentOffset(), h.moreFragments()});
+            std.debug.print("IPv4: Fragment received. offset={}, more={}\n", .{ h.fragmentOffset(), h.moreFragments() });
             const key = ReassemblyKey{
                 .src = .{ .v4 = h.sourceAddress() },
                 .dst = .{ .v4 = h.destinationAddress() },
                 .id = h.id(),
                 .protocol = h.protocol(),
             };
-            
+
             var ctx_ptr = self.reassembly_list.getPtr(key);
             if (ctx_ptr == null) {
                 const ctx = ReassemblyContext.init(self.nic.stack.allocator);
@@ -184,7 +187,7 @@ pub const IPv4Endpoint = struct {
                 ctx_ptr = self.reassembly_list.getPtr(key);
             }
             const ctx = ctx_ptr.?;
-            
+
             var payload_pkt = pkt;
             payload_pkt.data.trimFront(hlen);
             // Cap length to what IP header says
@@ -196,7 +199,7 @@ pub const IPv4Endpoint = struct {
             }
 
             const cloned_data = payload_pkt.data.clone(self.nic.stack.allocator) catch return;
-            
+
             const fragment = Fragment{
                 .data = .{ .data = cloned_data, .header = undefined },
                 .offset = h.fragmentOffset(),
@@ -206,7 +209,7 @@ pub const IPv4Endpoint = struct {
                 .dst = key.dst,
             };
             ctx.fragments.append(fragment) catch return;
-            
+
             const Sort = struct {
                 fn less(context: void, a: Fragment, b: Fragment) bool {
                     _ = context;
@@ -214,11 +217,11 @@ pub const IPv4Endpoint = struct {
                 }
             };
             std.sort.block(Fragment, ctx.fragments.items, {}, Sort.less);
-            
+
             var expected_offset: u16 = 0;
             var complete = true;
             var has_last = false;
-            
+
             for (ctx.fragments.items) |f| {
                 if (f.offset != expected_offset) {
                     complete = false;
@@ -227,11 +230,11 @@ pub const IPv4Endpoint = struct {
                 expected_offset += @as(u16, @intCast(f.data.data.size));
                 if (!f.more) has_last = true;
             }
-            
+
             if (complete and has_last) {
                 var total_size: usize = 0;
                 for (ctx.fragments.items) |f| total_size += f.data.data.size;
-                
+
                 const reassembled_buf = self.nic.stack.allocator.alloc(u8, total_size) catch return;
                 var offset: usize = 0;
                 for (ctx.fragments.items) |f| {
@@ -242,16 +245,16 @@ pub const IPv4Endpoint = struct {
                     var mut_data = f.data.data;
                     mut_data.deinit();
                 }
-                
+
                 ctx.fragments.deinit();
                 _ = self.reassembly_list.remove(key);
-                
+
                 var views = [_]buffer.View{reassembled_buf};
                 const reassembled_pkt = tcpip.PacketBuffer{
                     .data = buffer.VectorisedView.init(total_size, &views),
                     .header = undefined,
                 };
-                
+
                 const p = h.protocol();
                 self.dispatcher.deliverTransportPacket(r, p, reassembled_pkt);
                 self.nic.stack.allocator.free(reassembled_buf);
@@ -278,21 +281,32 @@ test "IPv4 fragmentation and reassembly" {
     var fake_ep = struct {
         mtu_val: u32 = 1500,
         fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-            _ = ptr; _ = r; _ = protocol; _ = pkt; return;
+            _ = ptr;
+            _ = r;
+            _ = protocol;
+            _ = pkt;
+            return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
-            _ = ptr; _ = dispatcher;
+            _ = ptr;
+            _ = dispatcher;
         }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{0} ** 6 }; }
-        fn mtu(ptr: *anyopaque) u32 { 
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            _ = ptr;
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(ptr: *anyopaque) u32 {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            return self.mtu_val; 
+            return self.mtu_val;
         }
-        fn setMTU(ptr: *anyopaque, m: u32) void { 
+        fn setMTU(ptr: *anyopaque, m: u32) void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            self.mtu_val = m; 
+            self.mtu_val = m;
         }
-        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
+        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities {
+            _ = ptr;
+            return stack.CapabilityNone;
+        }
     }{ .mtu_val = 1500 };
 
     const link_ep = stack.LinkEndpoint{
@@ -310,7 +324,7 @@ test "IPv4 fragmentation and reassembly" {
     try s.createNIC(1, link_ep);
     const nic = s.nics.get(1).?;
     const ipv4_proto = IPv4Protocol.init();
-    
+
     var delivered = false;
     var delivered_len: usize = 0;
     const FakeDispatcher = struct {
@@ -318,7 +332,8 @@ test "IPv4 fragmentation and reassembly" {
         delivered_len: *usize,
         fn deliverTransportPacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            _ = r; _ = protocol;
+            _ = r;
+            _ = protocol;
             self.delivered.* = true;
             self.delivered_len.* = pkt.data.size;
         }
@@ -335,7 +350,7 @@ test "IPv4 fragmentation and reassembly" {
     ep_ipv4.* = .{
         .nic = nic,
         .address = .{ .v4 = .{ 10, 0, 0, 1 } },
-        .protocol = @constCast(&ipv4_proto), 
+        .protocol = @constCast(&ipv4_proto),
         .dispatcher = dispatcher,
         .reassembly_list = std.AutoHashMap(ReassemblyKey, ReassemblyContext).init(allocator),
     };
@@ -353,15 +368,15 @@ test "IPv4 fragmentation and reassembly" {
     };
 
     const payload = "hello world this is a fragmented packet";
-    var frag1_buf = [_]u8{0} ** (header.IPv4MinimumSize + 16); 
+    var frag1_buf = [_]u8{0} ** (header.IPv4MinimumSize + 16);
     var frag1_h = header.IPv4.init(&frag1_buf);
     frag1_h.data[0] = 0x45;
     std.mem.writeInt(u16, frag1_h.data[2..4], header.IPv4MinimumSize + 16, .big);
-    std.mem.writeInt(u16, frag1_h.data[4..6], 12345, .big); 
-    std.mem.writeInt(u16, frag1_h.data[6..8], 0x2000, .big); 
-    frag1_h.data[9] = 17; 
-    @memcpy(frag1_h.data[12..16], &[_]u8{ 10, 0, 0, 2 }); 
-    @memcpy(frag1_h.data[16..20], &[_]u8{ 10, 0, 0, 1 }); 
+    std.mem.writeInt(u16, frag1_h.data[4..6], 12345, .big);
+    std.mem.writeInt(u16, frag1_h.data[6..8], 0x2000, .big);
+    frag1_h.data[9] = 17;
+    @memcpy(frag1_h.data[12..16], &[_]u8{ 10, 0, 0, 2 });
+    @memcpy(frag1_h.data[16..20], &[_]u8{ 10, 0, 0, 1 });
     @memcpy(frag1_buf[20..], payload[0..16]);
     frag1_h.setChecksum(frag1_h.calculateChecksum());
 
@@ -372,9 +387,9 @@ test "IPv4 fragmentation and reassembly" {
     var frag2_h = header.IPv4.init(frag2_buf);
     frag2_h.data[0] = 0x45;
     std.mem.writeInt(u16, frag2_h.data[2..4], @as(u16, @intCast(header.IPv4MinimumSize + rem_len)), .big);
-    std.mem.writeInt(u16, frag2_h.data[4..6], 12345, .big); 
-    std.mem.writeInt(u16, frag2_h.data[6..8], 0x0002, .big); 
-    frag2_h.data[9] = 17; 
+    std.mem.writeInt(u16, frag2_h.data[4..6], 12345, .big);
+    std.mem.writeInt(u16, frag2_h.data[6..8], 0x0002, .big);
+    frag2_h.data[9] = 17;
     @memcpy(frag2_h.data[12..16], &[_]u8{ 10, 0, 0, 2 });
     @memcpy(frag2_h.data[16..20], &[_]u8{ 10, 0, 0, 1 });
     @memcpy(frag2_buf[20..], payload[16..]);
@@ -386,8 +401,8 @@ test "IPv4 fragmentation and reassembly" {
         .header = undefined,
     };
     ep_ipv4.networkEndpoint().handlePacket(&r, pkt1);
-    
-    try std.testing.expect(!delivered); 
+
+    try std.testing.expect(!delivered);
 
     var views2 = [_]buffer.View{frag2_buf};
     const pkt2 = tcpip.PacketBuffer{

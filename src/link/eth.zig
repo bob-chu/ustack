@@ -36,15 +36,15 @@ pub const EthernetEndpoint = struct {
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
         var mut_pkt = pkt;
-        
+
         const eth_header = mut_pkt.header.prepend(header.EthernetMinimumSize) orelse return tcpip.Error.NoBufferSpace;
         var eth = header.Ethernet.init(eth_header);
-        
+
         const dst = if (r) |route| (if (route.remote_link_address) |la| la.addr else [_]u8{0xff} ** 6) else [_]u8{0xff} ** 6;
         const src = if (r) |route| route.local_link_address.addr else self.addr.addr;
-        
+
         eth.encode(src, dst, protocol);
-        
+
         return self.lower.writePacket(r, protocol, mut_pkt);
     }
 
@@ -62,16 +62,18 @@ pub const EthernetEndpoint = struct {
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
-        _ = remote; _ = local; _ = protocol;
+        _ = remote;
+        _ = local;
+        _ = protocol;
         var mut_pkt = pkt;
         const v = mut_pkt.data.first() orelse return;
         if (v.len < header.EthernetMinimumSize) return;
-        
+
         const eth = header.Ethernet.init(v);
         const p = eth.etherType();
         mut_pkt.link_header = v[0..header.EthernetMinimumSize];
         mut_pkt.data.trimFront(header.EthernetMinimumSize);
-        
+
         if (self.dispatcher) |d| {
             const src = tcpip.LinkAddress{ .addr = eth.sourceAddress() };
             const dst = tcpip.LinkAddress{ .addr = eth.destinationAddress() };

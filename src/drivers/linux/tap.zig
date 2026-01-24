@@ -11,7 +11,7 @@ pub const Tap = struct {
     fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 } }, // Default fake MAC
-    
+
     // To be set by stack.NIC.attach()
     dispatcher: ?*stack.NetworkDispatcher = null,
 
@@ -19,17 +19,17 @@ pub const Tap = struct {
     /// Note: This requires CAP_NET_ADMIN privileges.
     pub fn init(dev_name: []const u8) !Tap {
         const fd = try std.posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0);
-        
+
         // Use C wrapper to avoid struct layout issues
         const name_c = try std.heap.page_allocator.dupeZ(u8, dev_name);
         defer std.heap.page_allocator.free(name_c);
-        
+
         const rc = my_tuntap_init(fd, name_c);
         if (rc < 0) {
             std.debug.print("my_tuntap_init failed: rc={}\n", .{rc});
             return error.TunsetiffFailed;
         }
-        
+
         // Set interface up and assign IP via our new C helpers
         // Use 10.0.0.1 for the host side of the tap
         _ = my_set_if_up(name_c);
@@ -39,10 +39,10 @@ pub const Tap = struct {
             .fd = fd,
         };
     }
-    
+
     extern fn my_set_if_up(name: [*:0]const u8) i32;
     extern fn my_set_if_addr(name: [*:0]const u8, addr: [*:0]const u8) i32;
-    
+
     /// Initialize from an existing file descriptor.
     /// Useful if the FD is passed from a privileged parent process.
     pub fn initFromFd(fd: std.posix.fd_t) Tap {
@@ -68,26 +68,27 @@ pub const Tap = struct {
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*Tap, @ptrCast(@alignCast(ptr)));
-        _ = r; _ = protocol;
-        
+        _ = r;
+        _ = protocol;
+
         // We need to linearize the packet for write().
         const total_len = pkt.header.usedLength() + pkt.data.size;
-        
+
         var buf = std.heap.page_allocator.alloc(u8, total_len) catch return tcpip.Error.NoBufferSpace;
         defer std.heap.page_allocator.free(buf);
-        
+
         const hdr_len = pkt.header.usedLength();
         @memcpy(buf[0..hdr_len], pkt.header.view());
-        
+
         // Copy data
         const view = pkt.data.toView(std.heap.page_allocator) catch return tcpip.Error.NoBufferSpace;
         defer std.heap.page_allocator.free(view);
         @memcpy(buf[hdr_len..], view);
-        
+
         const rc = std.os.linux.write(self.fd, buf.ptr, buf.len);
         if (std.posix.errno(rc) != .SUCCESS) {
-             std.debug.print("writePacket failed: fd={}, rc={}, err={}\n", .{ self.fd, rc, std.posix.errno(rc) });
-             return tcpip.Error.UnknownDevice;
+            std.debug.print("writePacket failed: fd={}, rc={}, err={}\n", .{ self.fd, rc, std.posix.errno(rc) });
+            return tcpip.Error.UnknownDevice;
         }
     }
 
@@ -115,7 +116,7 @@ pub const Tap = struct {
         _ = ptr;
         return stack.CapabilityNone;
     }
-    
+
     pub fn readPacket(self: *Tap) !void {
         var buf: [9000]u8 = undefined; // Support up to Jumbo
         const rc = std.os.linux.read(self.fd, &buf, buf.len);
@@ -126,16 +127,16 @@ pub const Tap = struct {
         }
         const len = rc;
         if (len == 0) return; // EOF
-        
+
         const frame_buf = try std.heap.page_allocator.alloc(u8, len);
         @memcpy(frame_buf, buf[0..len]);
-        
+
         var views = [1]buffer.View{frame_buf};
         const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(frame_buf.len, &views),
             .header = buffer.Prependable.init(&[_]u8{}),
         };
-        
+
         if (self.dispatcher) |d| {
             // For Ethernet devices, we often pass a dummy or zero MAC if it's going to be parsed by EthernetEndpoint anyway.
             // But EthernetEndpoint.deliverNetworkPacket ignores these arguments anyway.
@@ -143,7 +144,7 @@ pub const Tap = struct {
             const src_mac = tcpip.LinkAddress{ .addr = buf[6..12].* };
             d.deliverNetworkPacket(&src_mac, &dst_mac, 0, pkt);
         }
-        
+
         std.heap.page_allocator.free(frame_buf);
     }
 };

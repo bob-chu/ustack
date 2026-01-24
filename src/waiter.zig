@@ -21,6 +21,7 @@ pub fn toLinux(e: EventMask) u32 {
 
 pub const Entry = struct {
     context: ?*anyopaque = null,
+    upcall_ctx: ?*anyopaque = null,
     callback: ?*const fn (e: *Entry) void = null,
     mask: EventMask = 0,
     next: ?*Entry = null,
@@ -29,6 +30,14 @@ pub const Entry = struct {
     pub fn init(context: ?*anyopaque, callback: ?*const fn (e: *Entry) void) Entry {
         return .{
             .context = context,
+            .callback = callback,
+        };
+    }
+
+    pub fn initWithUpcall(context: ?*anyopaque, upcall_ctx: ?*anyopaque, callback: ?*const fn (e: *Entry) void) Entry {
+        return .{
+            .context = context,
+            .upcall_ctx = upcall_ctx,
             .callback = callback,
         };
     }

@@ -57,7 +57,6 @@ pub const IPv4 = struct {
         return finishChecksum(internetChecksum(self.data[0..self.headerLength()], 0));
     }
 
-
     pub fn flagsFragmentOffset(self: IPv4) u16 {
         return std.mem.readInt(u16, self.data[flagsFOOffset..][0..2], .big);
     }
@@ -232,6 +231,12 @@ pub const Ethernet = struct {
 pub const ARPProtocolNumber = 0x0806;
 pub const ARPSize = 28;
 pub const ReservedHeaderSize = 128;
+
+// Linux IOCTL constants for network interfaces
+pub const SIOCGIFINDEX = 0x8933;
+pub const SIOCGIFHWADDR = 0x8927;
+
+pub const ETH_P_ALL = 0x0003;
 
 pub const ARP = struct {
     data: []u8,
@@ -495,7 +500,7 @@ pub const ICMPv6 = struct {
 
     pub fn calculateChecksum(self: ICMPv6, src: [16]u8, dst: [16]u8, payload: []const u8) u16 {
         var sum: u32 = 0;
-        
+
         // Pseudo-header
         var i: usize = 0;
         while (i < 16) : (i += 2) {
@@ -505,9 +510,9 @@ pub const ICMPv6 = struct {
         while (i < 16) : (i += 2) {
             sum += std.mem.readInt(u16, dst[i..][0..2], .big);
         }
-        
+
         const len = ICMPv6MinimumSize + payload.len;
-        sum += @as(u32, @intCast(len >> 16)); 
+        sum += @as(u32, @intCast(len >> 16));
         sum += @as(u32, @intCast(len & 0xffff));
         sum += 58; // Next Header (ICMPv6)
 
@@ -682,7 +687,7 @@ test "IPv6 header" {
     const ipv6 = IPv6.init(&data);
     const src = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const dst = [_]u8{ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
-    
+
     ipv6.encode(src, dst, 6, 100); // TCP (6), payload 100
 
     try std.testing.expectEqual(@as(u8, 0), ipv6.trafficClass());
@@ -714,7 +719,7 @@ test "IPv4 header" {
 test "TCP header" {
     var data = [_]u8{0} ** 20;
     std.mem.writeInt(u16, data[0..2], 1234, .big); // Src port
-    std.mem.writeInt(u16, data[2..4], 80, .big);   // Dst port
+    std.mem.writeInt(u16, data[2..4], 80, .big); // Dst port
     std.mem.writeInt(u32, data[4..8], 0x11223344, .big); // Seq
     data[12] = 0x50; // Data offset 5 (20 bytes)
     data[13] = 0x02; // SYN flag

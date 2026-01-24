@@ -41,9 +41,9 @@ pub const Loopback = struct {
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*Loopback, @ptrCast(@alignCast(ptr)));
         _ = r;
-        
+
         std.debug.print("Loopback: Queuing packet proto=0x{x} len={}\n", .{ protocol, pkt.data.size });
-        
+
         // Deep clone packet to store in queue
         const node = self.allocator.create(std.TailQueue(Packet).Node) catch return tcpip.Error.NoBufferSpace;
         node.data = .{

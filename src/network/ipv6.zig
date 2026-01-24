@@ -48,31 +48,31 @@ pub const IPv6Protocol = struct {
         if (addr != .v6) return;
         const target = addr.v6;
         const src = local_addr.v6;
-        
+
         // Solicited-node multicast address
         const dst = addr.toSolicitedNodeMulticast().v6;
-        
+
         // Build Neighbor Solicitation
         const payload_len = header.ICMPv6MinimumSize + 20 + 8;
         const buf = nic.stack.allocator.alloc(u8, payload_len) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(buf);
-        
+
         var icmp_h = header.ICMPv6.init(buf[0..header.ICMPv6MinimumSize]);
         icmp_h.data[0] = header.ICMPv6NeighborSolicitationType;
         icmp_h.data[1] = 0;
         icmp_h.setChecksum(0);
-        
+
         var ns = header.ICMPv6NS.init(buf[header.ICMPv6MinimumSize..]);
         ns.setTargetAddress(target);
-        
+
         // Option: Source Link-Layer Address
         buf[header.ICMPv6MinimumSize + 20] = header.ICMPv6OptionSourceLinkLayerAddress;
         buf[header.ICMPv6MinimumSize + 21] = 1;
         @memcpy(buf[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28], &nic.linkEP.linkAddress().addr);
-        
+
         const c = icmp_h.calculateChecksum(src, dst, buf[header.ICMPv6MinimumSize..]);
         icmp_h.setChecksum(c);
-        
+
         const hdr_mem = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_mem);
 
@@ -81,7 +81,7 @@ pub const IPv6Protocol = struct {
             .data = buffer.VectorisedView.init(buf.len, &views),
             .header = buffer.Prependable.init(hdr_mem),
         };
-        
+
         var r = stack.Route{
             .local_address = .{ .v6 = src },
             .remote_address = .{ .v6 = dst },
@@ -91,7 +91,7 @@ pub const IPv6Protocol = struct {
             .net_proto = ProtocolNumber,
             .nic = nic,
         };
-        
+
         if (nic.network_endpoints.get(ProtocolNumber)) |ep| {
             try ep.writePacket(&r, 58, pkt); // ICMPv6 is 58
         }
@@ -112,22 +112,22 @@ pub const IPv6Protocol = struct {
         const target = addr.address.v6;
         const src = [_]u8{0} ** 16;
         const dst = addr.address.toSolicitedNodeMulticast().v6;
-        
+
         const payload_len = header.ICMPv6MinimumSize + 20; // No SLLA option for DAD
         const buf = nic.stack.allocator.alloc(u8, payload_len) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(buf);
-        
+
         var icmp_h = header.ICMPv6.init(buf[0..header.ICMPv6MinimumSize]);
         icmp_h.data[0] = header.ICMPv6NeighborSolicitationType;
         icmp_h.data[1] = 0;
         icmp_h.setChecksum(0);
-        
+
         var ns = header.ICMPv6NS.init(buf[header.ICMPv6MinimumSize..]);
         ns.setTargetAddress(target);
-        
+
         const c = icmp_h.calculateChecksum(src, dst, buf[header.ICMPv6MinimumSize..]);
         icmp_h.setChecksum(c);
-        
+
         const hdr_mem = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_mem);
 
@@ -136,7 +136,7 @@ pub const IPv6Protocol = struct {
             .data = buffer.VectorisedView.init(buf.len, &views),
             .header = buffer.Prependable.init(hdr_mem),
         };
-        
+
         const r = stack.Route{
             .local_address = .{ .v6 = src },
             .remote_address = .{ .v6 = dst },
@@ -145,13 +145,13 @@ pub const IPv6Protocol = struct {
             .net_proto = ProtocolNumber,
             .nic = nic,
         };
-        
+
         // Manual IP header since NetworkEndpoint is not registered yet
         var mut_pkt = pkt;
         const ip_header = mut_pkt.header.prepend(header.IPv6MinimumSize) orelse return tcpip.Error.NoBufferSpace;
         const h = header.IPv6.init(ip_header);
         h.encode(src, dst, 58, @as(u16, @intCast(pkt.data.size)));
-        
+
         nic.linkEP.writePacket(&r, ProtocolNumber, mut_pkt) catch {};
 
         // Also send Router Solicitation to all-routers multicast
@@ -174,27 +174,27 @@ pub const IPv6Protocol = struct {
         }
 
         const dst = [_]u8{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }; // All-Routers multicast
-        
+
         const payload_len = header.ICMPv6MinimumSize + 4 + 8;
         const buf = nic.stack.allocator.alloc(u8, payload_len) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(buf);
-        
+
         var icmp_h = header.ICMPv6.init(buf[0..header.ICMPv6MinimumSize]);
         icmp_h.data[0] = header.ICMPv6RouterSolicitationType;
         icmp_h.data[1] = 0;
         icmp_h.setChecksum(0);
-        
+
         // Reserved 4 bytes
         @memset(buf[header.ICMPv6MinimumSize .. header.ICMPv6MinimumSize + 4], 0);
-        
+
         // Option: Source Link-Layer Address
         buf[header.ICMPv6MinimumSize + 4] = header.ICMPv6OptionSourceLinkLayerAddress;
         buf[header.ICMPv6MinimumSize + 5] = 1;
         @memcpy(buf[header.ICMPv6MinimumSize + 6 .. header.ICMPv6MinimumSize + 12], &nic.linkEP.linkAddress().addr);
-        
+
         const c = icmp_h.calculateChecksum(src, dst, buf[header.ICMPv6MinimumSize..]);
         icmp_h.setChecksum(c);
-        
+
         const hdr_mem = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_mem);
 
@@ -203,7 +203,7 @@ pub const IPv6Protocol = struct {
             .data = buffer.VectorisedView.init(buf.len, &views),
             .header = buffer.Prependable.init(hdr_mem),
         };
-        
+
         const r = stack.Route{
             .local_address = .{ .v6 = src },
             .remote_address = .{ .v6 = dst },
@@ -212,12 +212,12 @@ pub const IPv6Protocol = struct {
             .net_proto = ProtocolNumber,
             .nic = nic,
         };
-        
+
         var mut_pkt = pkt;
         const ip_header = mut_pkt.header.prepend(header.IPv6MinimumSize) orelse return tcpip.Error.NoBufferSpace;
         const h = header.IPv6.init(ip_header);
         h.encode(src, dst, 58, @as(u16, @intCast(pkt.data.size)));
-        
+
         return nic.linkEP.writePacket(&r, ProtocolNumber, mut_pkt);
     }
 };
@@ -254,12 +254,12 @@ pub const IPv6Endpoint = struct {
 
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*IPv6Endpoint, @ptrCast(@alignCast(ptr)));
-        
+
         // Simplified: no fragmentation check yet
         var mut_pkt = pkt;
         const ip_header = mut_pkt.header.prepend(header.IPv6MinimumSize) orelse return tcpip.Error.NoBufferSpace;
         const h = header.IPv6.init(ip_header);
-        
+
         h.encode(r.local_address.v6, r.remote_address.v6, @as(u8, @intCast(protocol)), @as(u16, @intCast(pkt.data.size)));
 
         return self.nic.linkEP.writePacket(r, ProtocolNumber, mut_pkt);
@@ -273,7 +273,7 @@ pub const IPv6Endpoint = struct {
         if (!h.isValid(mut_pkt.data.size)) {
             return;
         }
-        
+
         mut_pkt.network_header = headerView[0..header.IPv6MinimumSize];
 
         const hlen = header.IPv6MinimumSize;

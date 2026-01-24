@@ -12,13 +12,13 @@ pub const AfXdpEndpoint = struct {
     xsk_fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
-    
+
     // XDP Rings (Conceptual)
     // fill_ring: *XskRing,
     // rx_ring: *XskRing,
     // tx_ring: *XskRing,
     // completion_ring: *XskRing,
-    
+
     dispatcher: ?*stack.NetworkDispatcher = null,
 
     pub fn init(if_name: []const u8) !AfXdpEndpoint {
@@ -47,8 +47,10 @@ pub const AfXdpEndpoint = struct {
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfXdpEndpoint, @ptrCast(@alignCast(ptr)));
-        _ = r; _ = protocol; _ = pkt;
-        
+        _ = r;
+        _ = protocol;
+        _ = pkt;
+
         // 1. Reserve descriptor in TX ring
         // 2. Copy pkt.header and pkt.data to UMEM at descriptor offset
         // 3. Submit to kernel (kick)
@@ -79,7 +81,7 @@ pub const AfXdpEndpoint = struct {
         _ = ptr;
         return stack.CapabilityNone;
     }
-    
+
     // Call this when RX ring has data
     pub fn onReadable(self: *AfXdpEndpoint) !void {
         // 1. Peek RX ring for new descriptors

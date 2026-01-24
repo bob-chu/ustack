@@ -95,11 +95,11 @@ pub const VectorisedView = struct {
         const new_views = try allocator.alloc(View, self.views.len + other.views.len);
         @memcpy(new_views[0..self.views.len], self.views);
         @memcpy(new_views[self.views.len..], other.views);
-        
+
         if (self.allocator) |alloc| {
             alloc.free(self.views);
         }
-        
+
         self.views = new_views;
         self.allocator = allocator;
         self.size += other.size;
@@ -108,13 +108,13 @@ pub const VectorisedView = struct {
     pub fn clone(self: VectorisedView, allocator: Allocator) !VectorisedView {
         const new_views = try allocator.alloc(View, self.views.len);
         errdefer allocator.free(new_views);
-        
+
         var i: usize = 0;
         while (i < self.views.len) : (i += 1) {
             new_views[i] = try allocator.alloc(u8, self.views[i].len);
             @memcpy(new_views[i], self.views[i]);
         }
-        
+
         return .{
             .views = new_views,
             .size = self.size,
@@ -182,7 +182,7 @@ test "VectorisedView basic" {
 
     var vv = VectorisedView.init(10, views);
     try std.testing.expectEqual(@as(usize, 10), vv.size);
-    
+
     vv.trimFront(3);
     try std.testing.expectEqual(@as(usize, 7), vv.size);
     try std.testing.expectEqual(@as(usize, 2), vv.views[0].len);
@@ -203,7 +203,7 @@ test "Prependable basic" {
 
     const h = p.prepend(5).?;
     @memcpy(h, "hello");
-    
+
     try std.testing.expectEqual(@as(usize, 5), p.usedLength());
     try std.testing.expectEqualStrings("hello", p.view());
 

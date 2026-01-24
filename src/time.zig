@@ -7,7 +7,7 @@ pub const Timer = struct {
     callback: TimerCallback,
     context: *anyopaque,
     active: bool = false,
-    
+
     // Linked list node for priority queue
     next: ?*Timer = null,
 
@@ -53,11 +53,11 @@ pub const TimerQueue = struct {
     /// Process expired timers. Returns the delay until the next timer in ms, or null if empty.
     pub fn tick(self: *TimerQueue) ?i64 {
         const now = std.time.milliTimestamp();
-        
+
         while (true) {
             self.mutex.lock();
             const head = self.head;
-            
+
             if (head) |timer| {
                 if (timer.expiration <= now) {
                     // Pop expired timer
@@ -65,7 +65,7 @@ pub const TimerQueue = struct {
                     timer.next = null;
                     timer.active = false;
                     self.mutex.unlock();
-                    
+
                     // Execute callback (outside lock)
                     timer.callback(timer.context);
                     continue;
@@ -110,10 +110,10 @@ pub const TimerQueue = struct {
 test "TimerQueue basic" {
     var q = TimerQueue{};
     var fired = false;
-    
+
     const Ctx = struct { fired: *bool };
     var ctx = Ctx{ .fired = &fired };
-    
+
     const cb = struct {
         fn run(ptr: *anyopaque) void {
             const c = @as(*Ctx, @ptrCast(@alignCast(ptr)));
@@ -122,17 +122,17 @@ test "TimerQueue basic" {
     }.run;
 
     var t = Timer.init(cb, &ctx);
-    
+
     q.schedule(&t, 50); // 50ms delay
-    
+
     // Immediate tick, should not fire
     var next = q.tick();
     try std.testing.expect(next != null);
     try std.testing.expect(next.? > 0);
     try std.testing.expect(!fired);
-    
+
     std.time.sleep(60 * std.time.ns_per_ms);
-    
+
     // Tick after sleep, should fire
     next = q.tick();
     try std.testing.expect(fired);

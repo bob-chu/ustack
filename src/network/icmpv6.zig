@@ -30,12 +30,16 @@ pub const ICMPv6Protocol = struct {
     }
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
-        _ = ptr; _ = addr; _ = local_addr; _ = nic;
+        _ = ptr;
+        _ = addr;
+        _ = local_addr;
+        _ = nic;
         return tcpip.Error.NotPermitted;
     }
 
     fn parseAddresses(ptr: *anyopaque, pkt: tcpip.PacketBuffer) stack.NetworkProtocol.AddressPair {
-        _ = ptr; _ = pkt;
+        _ = ptr;
+        _ = pkt;
         return .{
             .src = .{ .v6 = [_]u8{0} ** 16 },
             .dst = .{ .v6 = [_]u8{0} ** 16 },
@@ -43,7 +47,10 @@ pub const ICMPv6Protocol = struct {
     }
 
     fn newEndpoint(ptr: *anyopaque, nic: *stack.NIC, addr: tcpip.AddressWithPrefix, dispatcher: stack.TransportDispatcher) tcpip.Error!stack.NetworkEndpoint {
-        _ = ptr; _ = nic; _ = addr; _ = dispatcher;
+        _ = ptr;
+        _ = nic;
+        _ = addr;
+        _ = dispatcher;
         return tcpip.Error.NotPermitted;
     }
 };
@@ -71,7 +78,10 @@ pub const ICMPv6TransportProtocol = struct {
     }
 
     fn newTransportEndpoint(ptr: *anyopaque, s: *stack.Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
-        _ = ptr; _ = s; _ = net_proto; _ = wait_queue;
+        _ = ptr;
+        _ = s;
+        _ = net_proto;
+        _ = wait_queue;
         return tcpip.Error.NotPermitted;
     }
 
@@ -79,14 +89,15 @@ pub const ICMPv6TransportProtocol = struct {
         _ = ptr;
         const v = pkt.data.first() orelse return .{ .src = 0, .dst = 0 };
         if (v.len >= 8) {
-             const id = std.mem.readInt(u16, v[4..6], .big);
-             return .{ .src = id, .dst = 0 };
+            const id = std.mem.readInt(u16, v[4..6], .big);
+            return .{ .src = id, .dst = 0 };
         }
         return .{ .src = 0, .dst = 0 };
     }
 
     fn handlePacket_external(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
-        _ = ptr; _ = id;
+        _ = ptr;
+        _ = id;
         ICMPv6PacketHandler.handlePacket(r.nic.stack, r, pkt);
     }
 };
@@ -96,34 +107,34 @@ pub const ICMPv6PacketHandler = struct {
         var mut_pkt = pkt;
         const v = mut_pkt.data.first() orelse return;
         var h = header.ICMPv6.init(v);
-        
-        switch (h.@"type"()) {
+
+        switch (h.type()) {
             header.ICMPv6EchoRequestType => {
                 const payload = mut_pkt.data.toView(s.allocator) catch return;
                 defer s.allocator.free(payload);
-                
+
                 var reply_buf = s.allocator.alloc(u8, payload.len) catch return;
                 defer s.allocator.free(reply_buf);
                 @memcpy(reply_buf, payload);
-                
+
                 var reply_h = header.ICMPv6.init(reply_buf);
                 reply_h.data[0] = header.ICMPv6EchoReplyType;
                 reply_h.setChecksum(0);
-                
+
                 const src = r.local_address.v6;
                 const dst = r.remote_address.v6;
                 const c = reply_h.calculateChecksum(src, dst, reply_buf[header.ICMPv6MinimumSize..]);
                 reply_h.setChecksum(c);
-                
+
                 var views = [_]buffer.View{reply_buf};
                 const hdr_mem = s.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer s.allocator.free(hdr_mem);
-                
+
                 const reply_pkt = tcpip.PacketBuffer{
                     .data = buffer.VectorisedView.init(reply_buf.len, &views),
                     .header = buffer.Prependable.init(hdr_mem),
                 };
-                
+
                 var reply_route = r.*;
                 if (r.nic.network_endpoints.get(0x86dd)) |ep| {
                     ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
@@ -133,7 +144,7 @@ pub const ICMPv6PacketHandler = struct {
                 if (v.len < header.ICMPv6MinimumSize + 20) return;
                 const ns = header.ICMPv6NS.init(v[header.ICMPv6MinimumSize..]);
                 const target = ns.targetAddress();
-                
+
                 const src_is_unspecified = r.remote_address.eq(.{ .v6 = [_]u8{0} ** 16 });
                 if (!src_is_unspecified and v.len >= header.ICMPv6MinimumSize + 28) {
                     if (v[header.ICMPv6MinimumSize + 20] == header.ICMPv6OptionSourceLinkLayerAddress) {
@@ -147,33 +158,33 @@ pub const ICMPv6PacketHandler = struct {
 
                 if (r.nic.hasAddress(.{ .v6 = target })) {
                     const is_dad = src_is_unspecified;
-                    
+
                     if (is_dad) {
                         std.debug.print("IPv6 DAD Conflict detected for address {any}\n", .{target});
                     }
 
                     var na_buf = s.allocator.alloc(u8, header.ICMPv6MinimumSize + 20 + 8) catch return;
                     defer s.allocator.free(na_buf);
-                    
+
                     var na_h = header.ICMPv6.init(na_buf[0..header.ICMPv6MinimumSize]);
                     na_h.data[0] = header.ICMPv6NeighborAdvertisementType;
                     na_h.data[1] = 0;
                     na_h.setChecksum(0);
-                    
+
                     var na = header.ICMPv6NA.init(na_buf[header.ICMPv6MinimumSize..]);
                     na.setFlags(if (is_dad) header.ICMPv6NAFlagsOverride else (header.ICMPv6NAFlagsSolicited | header.ICMPv6NAFlagsOverride));
                     na.setTargetAddress(target);
-                    
+
                     na_buf[header.ICMPv6MinimumSize + 20] = header.ICMPv6OptionTargetLinkLayerAddress;
                     na_buf[header.ICMPv6MinimumSize + 21] = 1;
                     @memcpy(na_buf[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28], &r.nic.linkEP.linkAddress().addr);
-                    
+
                     const src = target;
                     const dst = if (is_dad) ([_]u8{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }) else r.remote_address.v6;
-                    
+
                     const c = na_h.calculateChecksum(src, dst, na_buf[header.ICMPv6MinimumSize..]);
                     na_h.setChecksum(c);
-                    
+
                     var views = [_]buffer.View{na_buf};
                     const hdr_mem = s.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                     defer s.allocator.free(hdr_mem);
@@ -182,7 +193,7 @@ pub const ICMPv6PacketHandler = struct {
                         .data = buffer.VectorisedView.init(na_buf.len, &views),
                         .header = buffer.Prependable.init(hdr_mem),
                     };
-                    
+
                     var na_route = stack.Route{
                         .local_address = .{ .v6 = src },
                         .remote_address = .{ .v6 = dst },
@@ -191,7 +202,7 @@ pub const ICMPv6PacketHandler = struct {
                         .net_proto = 0x86dd,
                         .nic = r.nic,
                     };
-                    
+
                     if (r.nic.network_endpoints.get(0x86dd)) |ep| {
                         ep.writePacket(&na_route, ProtocolNumber, na_pkt) catch {};
                     }
@@ -201,12 +212,12 @@ pub const ICMPv6PacketHandler = struct {
                 if (v.len < header.ICMPv6MinimumSize + 20) return;
                 const na = header.ICMPv6NA.init(v[header.ICMPv6MinimumSize..]);
                 const target = na.targetAddress();
-                
+
                 if (v.len >= header.ICMPv6MinimumSize + 28) {
                     if (v[header.ICMPv6MinimumSize + 20] == header.ICMPv6OptionTargetLinkLayerAddress) {
                         var mac: tcpip.LinkAddress = undefined;
                         @memcpy(&mac.addr, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
-                        
+
                         s.mutex.lock();
                         s.link_addr_cache.put(.{ .v6 = target }, mac) catch {};
                         s.mutex.unlock();
@@ -216,7 +227,7 @@ pub const ICMPv6PacketHandler = struct {
             header.ICMPv6RouterAdvertisementType => {
                 if (v.len < header.ICMPv6MinimumSize + 12) return;
                 const ra = header.ICMPv6RA.init(v[header.ICMPv6MinimumSize..]);
-                
+
                 // Add default gateway if lifetime > 0
                 if (ra.routerLifetime() > 0) {
                     s.addRoute(.{
@@ -225,7 +236,7 @@ pub const ICMPv6PacketHandler = struct {
                         .nic = r.nic.id,
                         .mtu = r.nic.linkEP.mtu(),
                     }) catch {};
-                    
+
                     // Learn router's MAC
                     if (r.remote_link_address) |mac| {
                         s.mutex.lock();
@@ -240,13 +251,13 @@ pub const ICMPv6PacketHandler = struct {
                     const opt_type = v[opt_idx];
                     const opt_len = @as(usize, v[opt_idx + 1]) * 8;
                     if (opt_len == 0 or opt_idx + opt_len > v.len) break;
-                    
+
                     if (opt_type == header.ICMPv6OptionPrefixInformation) {
                         if (opt_len >= 32) {
                             const pinfo = header.ICMPv6OptionPrefix.init(v[opt_idx..]);
                             const prefix = pinfo.prefix();
                             const prefix_len = pinfo.prefixLength();
-                            
+
                             // SLAAC: if A flag is set and L flag is set?
                             // Flags are in byte 3 of Prefix Information option
                             // L=0x80, A=0x40
@@ -264,7 +275,7 @@ pub const ICMPv6PacketHandler = struct {
                                 new_addr[13] = mac.addr[3];
                                 new_addr[14] = mac.addr[4];
                                 new_addr[15] = mac.addr[5];
-                                
+
                                 if (!r.nic.hasAddress(.{ .v6 = new_addr })) {
                                     r.nic.addAddress(.{
                                         .protocol = 0x86dd,
@@ -302,7 +313,8 @@ test "ICMPv6 Neighbor Discovery" {
 
         fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            _ = r; _ = protocol;
+            _ = r;
+            _ = protocol;
             const hdr_view = pkt.header.view();
             const data_len = pkt.data.size;
             if (self.last_pkt) |p| self.allocator.free(p);
@@ -315,11 +327,26 @@ test "ICMPv6 Neighbor Discovery" {
             }
             return;
         }
-        fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void { _ = ptr; _ = dispatcher; }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{1, 2, 3, 4, 5, 6} }; }
-        fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
-        fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
-        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
+        fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
+            _ = ptr;
+            _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            _ = ptr;
+            return .{ .addr = [_]u8{ 1, 2, 3, 4, 5, 6 } };
+        }
+        fn mtu(ptr: *anyopaque) u32 {
+            _ = ptr;
+            return 1500;
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void {
+            _ = ptr;
+            _ = m;
+        }
+        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities {
+            _ = ptr;
+            return stack.CapabilityNone;
+        }
     }{ .allocator = allocator };
     defer if (fake_link.last_pkt) |p| allocator.free(p);
 
@@ -337,7 +364,7 @@ test "ICMPv6 Neighbor Discovery" {
 
     try s.createNIC(1, link_ep);
     const nic = s.nics.get(1).?;
-    
+
     const my_addr = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     try nic.addAddress(.{
         .protocol = 0x86dd,
@@ -346,49 +373,49 @@ test "ICMPv6 Neighbor Discovery" {
 
     const sender_addr = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
     const sender_mac = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
-    
+
     var ns_buf = try allocator.alloc(u8, header.ICMPv6MinimumSize + 20 + 8);
     defer allocator.free(ns_buf);
-    
+
     var icmp_h = header.ICMPv6.init(ns_buf[0..header.ICMPv6MinimumSize]);
     icmp_h.data[0] = header.ICMPv6NeighborSolicitationType;
     icmp_h.data[1] = 0;
     icmp_h.setChecksum(0);
-    
+
     var ns = header.ICMPv6NS.init(ns_buf[header.ICMPv6MinimumSize..]);
     ns.setTargetAddress(my_addr);
-    
+
     ns_buf[header.ICMPv6MinimumSize + 20] = header.ICMPv6OptionSourceLinkLayerAddress;
     ns_buf[header.ICMPv6MinimumSize + 21] = 1;
     @memcpy(ns_buf[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28], &sender_mac);
-    
+
     const r = stack.Route{
         .local_address = .{ .v6 = my_addr },
         .remote_address = .{ .v6 = sender_addr },
-        .local_link_address = .{ .addr = [_]u8{1, 2, 3, 4, 5, 6} },
+        .local_link_address = .{ .addr = [_]u8{ 1, 2, 3, 4, 5, 6 } },
         .remote_link_address = .{ .addr = sender_mac },
         .net_proto = 0x86dd,
         .nic = nic,
     };
-    
+
     var views = [_]buffer.View{ns_buf};
     const ns_pkt = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(ns_buf.len, &views),
         .header = buffer.Prependable.init(&[_]u8{}),
     };
-    
+
     ICMPv6PacketHandler.handlePacket(&s, &r, ns_pkt);
-    
+
     const learned_mac = s.link_addr_cache.get(.{ .v6 = sender_addr });
     try std.testing.expect(learned_mac != null);
     try std.testing.expectEqualStrings(&sender_mac, &learned_mac.?.addr);
-    
+
     try std.testing.expect(fake_link.last_pkt != null);
     const na_pkt_data = fake_link.last_pkt.?;
     try std.testing.expect(na_pkt_data.len >= 40 + 28);
     const na_icmp = header.ICMPv6.init(na_pkt_data[40..]);
-    try std.testing.expectEqual(header.ICMPv6NeighborAdvertisementType, na_icmp.@"type"());
-    
+    try std.testing.expectEqual(header.ICMPv6NeighborAdvertisementType, na_icmp.type());
+
     const na = header.ICMPv6NA.init(na_pkt_data[40 + header.ICMPv6MinimumSize ..]);
     try std.testing.expectEqualStrings(&my_addr, &na.targetAddress());
 }
@@ -410,7 +437,8 @@ test "ICMPv6 Router Advertisement & SLAAC" {
 
         fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            _ = r; _ = protocol;
+            _ = r;
+            _ = protocol;
             const hdr_view = pkt.header.view();
             const data_len = pkt.data.size;
             if (self.last_pkt) |p| self.allocator.free(p);
@@ -423,11 +451,26 @@ test "ICMPv6 Router Advertisement & SLAAC" {
             }
             return;
         }
-        fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void { _ = ptr; _ = dispatcher; }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{0x02, 0x00, 0x00, 0x00, 0x00, 0x02} }; }
-        fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
-        fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
-        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
+        fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
+            _ = ptr;
+            _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            _ = ptr;
+            return .{ .addr = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 } };
+        }
+        fn mtu(ptr: *anyopaque) u32 {
+            _ = ptr;
+            return 1500;
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void {
+            _ = ptr;
+            _ = m;
+        }
+        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities {
+            _ = ptr;
+            return stack.CapabilityNone;
+        }
     }{ .allocator = allocator };
     defer if (fake_link.last_pkt) |p| allocator.free(p);
 
@@ -445,7 +488,7 @@ test "ICMPv6 Router Advertisement & SLAAC" {
 
     try s.createNIC(1, link_ep);
     const nic = s.nics.get(1).?;
-    
+
     // Add Link-Local address (triggers RS)
     const my_ll_addr = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
     try nic.addAddress(.{
@@ -457,19 +500,19 @@ test "ICMPv6 Router Advertisement & SLAAC" {
     const router_addr = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     const router_mac = [_]u8{ 0xaa, 0x30, 0x75, 0xe0, 0x61, 0x19 };
     const prefix = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    
+
     // Total len: ICMPv6 header(4) + RA body(12) + Prefix option(32) = 48
     var ra_buf = try allocator.alloc(u8, 48);
     defer allocator.free(ra_buf);
     @memset(ra_buf, 0);
-    
+
     var icmp_h = header.ICMPv6.init(ra_buf[0..header.ICMPv6MinimumSize]);
     icmp_h.data[0] = header.ICMPv6RouterAdvertisementType;
-    
+
     const ra = header.ICMPv6RA.init(ra_buf[header.ICMPv6MinimumSize..]);
     _ = ra;
     std.mem.writeInt(u16, ra_buf[header.ICMPv6MinimumSize + 2 .. header.ICMPv6MinimumSize + 4], 1800, .big); // router lifetime 1800s
-    
+
     // Prefix Option
     const opt_idx = header.ICMPv6MinimumSize + 12;
     ra_buf[opt_idx] = header.ICMPv6OptionPrefixInformation;
@@ -481,20 +524,20 @@ test "ICMPv6 Router Advertisement & SLAAC" {
     const r = stack.Route{
         .local_address = .{ .v6 = my_ll_addr },
         .remote_address = .{ .v6 = router_addr },
-        .local_link_address = .{ .addr = [_]u8{0x02, 0x00, 0x00, 0x00, 0x00, 0x02} },
+        .local_link_address = .{ .addr = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 } },
         .remote_link_address = .{ .addr = router_mac },
         .net_proto = 0x86dd,
         .nic = nic,
     };
-    
+
     var views = [_]buffer.View{ra_buf};
     const ra_pkt = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(ra_buf.len, &views),
         .header = buffer.Prependable.init(&[_]u8{}),
     };
-    
+
     ICMPv6PacketHandler.handlePacket(&s, &r, ra_pkt);
-    
+
     // Check if SLAAC address was generated
     // Interface ID for 02:00:00:00:00:02 is 0000:00ff:fe00:0002
     // but mac[0] ^ 0x02 makes it 0000... so 2001:db8::ff:fe00:2
@@ -507,9 +550,9 @@ test "ICMPv6 Router Advertisement & SLAAC" {
     expected_addr[13] = 0x00;
     expected_addr[14] = 0x00;
     expected_addr[15] = 0x02;
-    
+
     try std.testing.expect(nic.hasAddress(.{ .v6 = expected_addr }));
-    
+
     // Check if default route was added
     const routes = s.getRouteTable();
     var found_default = false;

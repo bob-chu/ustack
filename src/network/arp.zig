@@ -48,7 +48,7 @@ pub const ARPProtocol = struct {
         _ = ptr;
         const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_buf);
-        
+
         var pre = buffer.Prependable.init(hdr_buf);
         const arp_hdr = pre.prepend(header.ARPSize).?;
         var h = header.ARP.init(arp_hdr);
@@ -59,10 +59,10 @@ pub const ARPProtocol = struct {
         @memcpy(h.data[24..28], &addr.v4);
 
         const pb = tcpip.PacketBuffer{
-            .data = .{.views = &[_]buffer.View{}, .size = 0},
+            .data = .{ .views = &[_]buffer.View{}, .size = 0 },
             .header = pre,
         };
-        
+
         const broadcast_hw = tcpip.LinkAddress{ .addr = [_]u8{0xff} ** 6 };
         var r = stack.Route{
             .local_address = local_addr,
@@ -77,7 +77,9 @@ pub const ARPProtocol = struct {
     }
 
     fn newEndpoint(ptr: *anyopaque, nic: *stack.NIC, addr: tcpip.AddressWithPrefix, dispatcher: stack.TransportDispatcher) tcpip.Error!stack.NetworkEndpoint {
-        _ = ptr; _ = addr; _ = dispatcher;
+        _ = ptr;
+        _ = addr;
+        _ = dispatcher;
         const ep = try nic.stack.allocator.create(ARPEndpoint);
         ep.* = .{
             .nic = nic,
@@ -114,7 +116,10 @@ pub const ARPEndpoint = struct {
     }
 
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-        _ = ptr; _ = r; _ = protocol; _ = pkt;
+        _ = ptr;
+        _ = r;
+        _ = protocol;
+        _ = pkt;
         return tcpip.Error.NotPermitted;
     }
 
@@ -127,16 +132,15 @@ pub const ARPEndpoint = struct {
 
         const sender_proto_addr = tcpip.Address{ .v4 = h.protocolAddressSender() };
         const sender_hw_addr = h.hardwareAddressSender();
-        
-        self.nic.stack.addLinkAddress(sender_proto_addr, .{ .addr = sender_hw_addr }) catch {};
 
+        self.nic.stack.addLinkAddress(sender_proto_addr, .{ .addr = sender_hw_addr }) catch {};
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
             if (self.nic.hasAddress(target_proto_addr)) {
                 const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
-                
+
                 var pre = buffer.Prependable.init(hdr_buf);
                 const arp_hdr = pre.prepend(header.ARPSize).?;
                 var reply_h = header.ARP.init(arp_hdr);
@@ -148,10 +152,10 @@ pub const ARPEndpoint = struct {
                 @memcpy(reply_h.data[24..28], h.data[14..18]);
 
                 const pb = tcpip.PacketBuffer{
-                    .data = .{.views = &[_]buffer.View{}, .size = 0},
+                    .data = .{ .views = &[_]buffer.View{}, .size = 0 },
                     .header = pre,
                 };
-                
+
                 self.nic.linkEP.writePacket(null, ProtocolNumber, pb) catch {};
             }
         }

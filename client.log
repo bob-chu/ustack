@@ -1,0 +1,19 @@
+C: Calling ev_default_loop...
+C: loop = 0x7e29546fa060
+C: ev_io_init w=0x7ffc3faafc28, fd=3
+C: ev_io_start loop=0x7e29546fa060, w=0x7ffc3faafc28
+C: ev_timer_init w=0x7ffc3faafc88, after=0.010000, repeat=0.010000
+C: ev_timer_start loop=0x7e29546fa060, w=0x7ffc3faafc88
+C: ev_io_init w=0x7ffc3faafd10, fd=6
+C: ev_io_start loop=0x7e29546fa060, w=0x7ffc3faafd10
+C: ev_run loop=0x7e29546fa060
+TCP: Connected! rcv_nxt=1861211730, snd_nxt=1861211529
+EventMux: upcall triggered
+Client connected!
+TCP: Sending data. seq=1861211529, ack=1861211730, flags=0x18
+EventMux: upcall triggered
+Client received: HTTP/1.1 200 OK
+Content-Length: 13
+Connection: close
+
+Hello World!

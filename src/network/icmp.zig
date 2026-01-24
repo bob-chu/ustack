@@ -30,7 +30,10 @@ pub const ICMPv4TransportProtocol = struct {
     }
 
     fn newTransportEndpoint(ptr: *anyopaque, s: *stack.Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
-        _ = ptr; _ = s; _ = net_proto; _ = wait_queue;
+        _ = ptr;
+        _ = s;
+        _ = net_proto;
+        _ = wait_queue;
         return tcpip.Error.NotPermitted;
     }
 
@@ -45,7 +48,8 @@ pub const ICMPv4TransportProtocol = struct {
     }
 
     fn handlePacket_external(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
-        _ = ptr; _ = id;
+        _ = ptr;
+        _ = id;
         ICMPv4PacketHandler.handlePacket(r.nic.stack, r, pkt);
     }
 };
@@ -55,11 +59,11 @@ pub const ICMPv4PacketHandler = struct {
         var mut_pkt = pkt;
         const v = mut_pkt.data.first() orelse return;
         var h = header.ICMPv4.init(v);
-        
-        if (h.@"type"() == header.ICMPv4EchoType) {
+
+        if (h.type() == header.ICMPv4EchoType) {
             const payload = mut_pkt.data.toView(s.allocator) catch return;
             defer s.allocator.free(payload);
-            
+
             var reply_hdr = [_]u8{0} ** header.ICMPv4MinimumSize;
             @memcpy(&reply_hdr, payload[0..header.ICMPv4MinimumSize]);
             var reply_h = header.ICMPv4.init(&reply_hdr);
@@ -67,13 +71,13 @@ pub const ICMPv4PacketHandler = struct {
             reply_h.setChecksum(0);
             const c = reply_h.calculateChecksum(payload[header.ICMPv4MinimumSize..]);
             reply_h.setChecksum(c);
-            
+
             var views = [_]buffer.View{payload[header.ICMPv4MinimumSize..]};
             const reply_pkt = tcpip.PacketBuffer{
                 .data = buffer.VectorisedView.init(payload.len - header.ICMPv4MinimumSize, &views),
                 .header = buffer.Prependable.initFull(&reply_hdr),
             };
-            
+
             var reply_route = r.*;
             if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
                 ip_ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
@@ -107,7 +111,10 @@ pub const ICMPv4Protocol = struct {
     }
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
-        _ = ptr; _ = addr; _ = local_addr; _ = nic;
+        _ = ptr;
+        _ = addr;
+        _ = local_addr;
+        _ = nic;
         return tcpip.Error.NotPermitted;
     }
 
@@ -167,7 +174,10 @@ pub const ICMPv4Endpoint = struct {
     }
 
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-        _ = ptr; _ = r; _ = protocol; _ = pkt;
+        _ = ptr;
+        _ = r;
+        _ = protocol;
+        _ = pkt;
         return tcpip.Error.NotPermitted;
     }
 

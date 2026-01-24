@@ -50,33 +50,38 @@ fn my_upcall(entry: *waiter.Entry) void {
     _ = std.posix.write(global_mux.signal_fd, std.mem.asBytes(&val)) catch {};
 }
 
-
-    fn libev_tap_io_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) void {
-        _ = loop; _ = watcher; _ = revents;
-        global_tap.readPacket() catch |err| {
-            std.debug.print("readPacket error: {}\n", .{err});
-        };
-    }
+fn libev_tap_io_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) void {
+    _ = loop;
+    _ = watcher;
+    _ = revents;
+    global_tap.readPacket() catch |err| {
+        std.debug.print("readPacket error: {}\n", .{err});
+    };
+}
 
 var global_client: *HttpClient = undefined;
 var last_retry: i64 = 0;
 
-    fn libev_timer_cb(loop: ?*ev_loop, watcher: *ev_timer, revents: i32) callconv(.C) void {
-        _ = loop; _ = watcher; _ = revents;
-        _ = global_stack.timer_queue.tick();
-        
-        const now = std.time.milliTimestamp();
-        if (now - last_retry > 1000) {
-            if (global_client.state == .sending) {
-                std.debug.print("Retrying sendRequest...\n", .{});
-                global_client.onEvent() catch {};
-            }
-            last_retry = now;
+fn libev_timer_cb(loop: ?*ev_loop, watcher: *ev_timer, revents: i32) callconv(.C) void {
+    _ = loop;
+    _ = watcher;
+    _ = revents;
+    _ = global_stack.timer_queue.tick();
+
+    const now = std.time.milliTimestamp();
+    if (now - last_retry > 1000) {
+        if (global_client.state == .sending) {
+            std.debug.print("Retrying sendRequest...\n", .{});
+            global_client.onEvent() catch {};
         }
+        last_retry = now;
     }
+}
 
 fn libev_mux_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     const ready_entries = global_mux.pollReady() catch return;
     defer global_mux.allocator.free(ready_entries);
     for (ready_entries) |entry| {
@@ -122,7 +127,7 @@ const HttpClient = struct {
 
     pub fn start(self: *HttpClient, ip: ustack.tcpip.Address) !void {
         self.state = .connecting;
-        std.debug.print("Connecting to {s} ({})\n", .{self.hostname, ip});
+        std.debug.print("Connecting to {s} ({})\n", .{ self.hostname, ip });
         // Use 10.0.0.2 for ustack endpoint
         try self.ep.bind(.{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 0 });
         self.ep.connect(.{ .nic = 0, .addr = ip, .port = 80 }) catch |err| {
@@ -200,14 +205,14 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
     var s = try ustack.init(allocator);
     global_stack = &s;
-    
+
     var tap = try ustack.drivers.tap.Tap.init("tap_mux");
     global_tap = &tap;
-    
+
     // Set interface UP and IP (Gateway) from program
     _ = my_set_if_up("tap_mux");
     _ = my_set_if_addr("tap_mux", "10.0.0.1"); // Gateway address
-    
+
     var eth_ep = ustack.link.eth.EthernetEndpoint.init(tap.linkEndpoint(), tap.address);
     try s.createNIC(1, eth_ep.linkEndpoint());
     const nic = s.nics.get(1).?;

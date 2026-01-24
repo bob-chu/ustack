@@ -40,6 +40,18 @@ pub const Address = union(enum) {
     }
 };
 
+test "Address.isAny" {
+    const any_v4 = Address{ .v4 = .{ 0, 0, 0, 0 } };
+    const some_v4 = Address{ .v4 = .{ 1, 2, 3, 4 } };
+    const any_v6 = Address{ .v6 = [_]u8{0} ** 16 };
+    const some_v6 = Address{ .v6 = [_]u8{1} ** 16 };
+
+    try std.testing.expect(any_v4.isAny());
+    try std.testing.expect(!some_v4.isAny());
+    try std.testing.expect(any_v6.isAny());
+    try std.testing.expect(!some_v6.isAny());
+}
+
 pub const LinkAddress = struct {
     addr: [6]u8,
     pub fn eq(self: LinkAddress, other: LinkAddress) bool {
@@ -236,7 +248,7 @@ pub const ProtocolAddress = struct {
 pub const PacketBuffer = struct {
     data: buffer.VectorisedView,
     header: buffer.Prependable,
-    
+
     link_header: ?buffer.View = null,
     network_header: ?buffer.View = null,
     transport_header: ?buffer.View = null,

@@ -7,9 +7,9 @@ const stack = @import("../src/stack.zig");
 const tcpip = @import("../src/tcpip.zig");
 
 // Mocking EV structs
-const ev_loop = opaque{};
-const ev_io = opaque{};
-const ev_timer = opaque{};
+const ev_loop = opaque {};
+const ev_io = opaque {};
+const ev_timer = opaque {};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -33,7 +33,9 @@ pub fn main() !void {
 }
 
 fn on_io_readable(loop: *ev_loop, watcher: *ev_io, revents: c_int) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     // tap_ep.onReadable() catch ...
     // s.timer_queue.tick()
 }

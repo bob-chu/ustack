@@ -17,18 +17,19 @@ pub const AfXdp = struct {
     xsk_fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
-    
+
     dispatcher: ?*stack.NetworkDispatcher = null,
 
     /// Initialize an AF_XDP socket on the given interface.
     /// queue_id: The NIC queue to bind to (usually 0 for simple setups).
     pub fn init(if_name: []const u8, queue_id: u32) !AfXdp {
-        _ = if_name; _ = queue_id;
-        
+        _ = if_name;
+        _ = queue_id;
+
         // 1. Create Socket
         // const fd = try std.posix.socket(std.os.linux.AF.XDP, std.posix.SOCK.RAW, 0);
         // For now, return a mock or error if AF_XDP not supported in this zig build
-        
+
         return error.NotImplemented;
     }
 
@@ -48,14 +49,16 @@ pub const AfXdp = struct {
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfXdp, @ptrCast(@alignCast(ptr)));
-        _ = r; _ = protocol; _ = pkt;
+        _ = r;
+        _ = protocol;
+        _ = pkt;
         _ = self;
-        
+
         // Implementation:
         // 1. Get a descriptor from the TX Ring (producer).
         // 2. Copy data into the UMEM area pointed to by descriptor.
         // 3. Kick the kernel (sendto() or notify) if needed.
-        
+
         return tcpip.Error.UnknownDevice;
     }
 
@@ -83,7 +86,7 @@ pub const AfXdp = struct {
         _ = ptr;
         return stack.CapabilityNone;
     }
-    
+
     /// Poll the RX ring for packets and deliver them to the stack.
     pub fn poll(self: *AfXdp) !void {
         _ = self;
