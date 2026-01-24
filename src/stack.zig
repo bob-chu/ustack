@@ -53,10 +53,10 @@ pub const NetworkDispatcher = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        deliverNetworkPacket: *const fn (ptr: *anyopaque, remote: tcpip.LinkAddress, local: tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void,
+        deliverNetworkPacket: *const fn (ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void,
     };
 
-    pub fn deliverNetworkPacket(self: NetworkDispatcher, remote: tcpip.LinkAddress, local: tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+    pub fn deliverNetworkPacket(self: NetworkDispatcher, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         return self.vtable.deliverNetworkPacket(self.ptr, remote, local, protocol, pkt);
     }
 };
@@ -274,7 +274,7 @@ pub const NIC = struct {
         self.linkEP.attach(&self.dispatcher);
     }
 
-    fn deliverNetworkPacket(ptr: *anyopaque, remote: tcpip.LinkAddress, local: tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+    fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // std.debug.print("NIC: Received packet proto=0x{x} remote={any} local={any}\n", .{protocol, remote, local});
         
@@ -282,16 +282,20 @@ pub const NIC = struct {
         const proto_opt = self.stack.network_protocols.get(protocol);
         self.stack.mutex.unlock();
         
-        const proto = proto_opt orelse return;
-        const ep = self.network_endpoints.get(protocol) orelse return;
+        if (proto_opt == null) return;
+        const proto = proto_opt.?;
+        
+        const ep_opt = self.network_endpoints.get(protocol);
+        if (ep_opt == null) return;
+        const ep = ep_opt.?;
         
         const addrs = proto.parseAddresses(pkt);
         
         const r = Route{
             .local_address = addrs.dst,
             .remote_address = addrs.src,
-            .local_link_address = local,
-            .remote_link_address = remote,
+            .local_link_address = local.*,
+            .remote_link_address = remote.*,
             .net_proto = protocol,
             .nic = self,
         };
@@ -548,7 +552,11 @@ pub const Stack = struct {
     }
 
     pub fn unregisterTransportEndpoint(self: *Stack, id: TransportEndpointID) void {
-        _ = self.endpoints.remove(id);
+        const shard_idx = id.hash() % 256;
+        const shard = &self.endpoints.shards[shard_idx];
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
+        _ = shard.endpoints.remove(id);
     }
 
     // Find route using longest-prefix matching in routing table
@@ -658,6 +666,7 @@ pub const Stack = struct {
             ep.handlePacket(r, id, pkt);
             ep.decRef();
         } else {
+            std.debug.print("Stack: No endpoint for id={any}\n", .{id});
             // Try global handler first (for ICMP, etc)
             if (proto.vtable.handlePacket) |handle| {
                 handle(proto.ptr, r, id, pkt);

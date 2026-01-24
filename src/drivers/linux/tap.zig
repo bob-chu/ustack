@@ -4,11 +4,13 @@ const tcpip = @import("../../tcpip.zig");
 const header = @import("../../header.zig");
 const buffer = @import("../../buffer.zig");
 
+extern fn my_tuntap_init(fd: i32, name: [*:0]const u8) i32;
+
 /// A LinkEndpoint implementation for Linux TUN/TAP devices.
 pub const Tap = struct {
     fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
-    address: [6]u8 = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 }, // Default fake MAC
+    address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 } }, // Default fake MAC
     
     // To be set by stack.NIC.attach()
     dispatcher: ?*stack.NetworkDispatcher = null,
@@ -16,37 +18,30 @@ pub const Tap = struct {
     /// Initialize a TAP device by name (e.g., "tap0").
     /// Note: This requires CAP_NET_ADMIN privileges.
     pub fn init(dev_name: []const u8) !Tap {
-        // Open the clone device
-        const fd = try std.posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR }, 0);
+        const fd = try std.posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0);
         
-        // IFF_TAP | IFF_NO_PI
-        const IFF_TAP: c_short = 0x0002;
-        const IFF_NO_PI: c_short = 0x1000;
-        const TUNSETIFF: c_ulong = 0x400454ca; // _IOW('T', 202, int) on x86_64. 
-        // Note: Magic number depends on architecture. Zig's std.os.linux.ioctl might work better if we had ifreq definitions.
+        // Use C wrapper to avoid struct layout issues
+        const name_c = try std.heap.page_allocator.dupeZ(u8, dev_name);
+        defer std.heap.page_allocator.free(name_c);
         
-        // Construct ifreq struct manually
-        var ifr: extern struct {
-            name: [16]u8,
-            flags: c_short,
-            padding: [22]u8 = [_]u8{0} ** 22, // Pad to 40 bytes (sizeof ifreq is usually 40)
-        } = undefined;
-        
-        @memset(&ifr.name, 0);
-        const copy_len = @min(dev_name.len, 15);
-        @memcpy(ifr.name[0..copy_len], dev_name[0..copy_len]);
-        ifr.flags = IFF_TAP | IFF_NO_PI;
-        
-        const rc = std.os.linux.ioctl(fd, TUNSETIFF, @intFromPtr(&ifr));
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => {},
-            else => return error.TunsetiffFailed,
+        const rc = my_tuntap_init(fd, name_c);
+        if (rc < 0) {
+            std.debug.print("my_tuntap_init failed: rc={}\n", .{rc});
+            return error.TunsetiffFailed;
         }
         
+        // Set interface up and assign IP via our new C helpers
+        // Use 10.0.0.1 for the host side of the tap
+        _ = my_set_if_up(name_c);
+        _ = my_set_if_addr(name_c, "10.0.0.1");
+
         return Tap{
             .fd = fd,
         };
     }
+    
+    extern fn my_set_if_up(name: [*:0]const u8) i32;
+    extern fn my_set_if_addr(name: [*:0]const u8, addr: [*:0]const u8) i32;
     
     /// Initialize from an existing file descriptor.
     /// Useful if the FD is passed from a privileged parent process.
@@ -76,11 +71,8 @@ pub const Tap = struct {
         _ = r; _ = protocol;
         
         // We need to linearize the packet for write().
-        // In a high-performance implementation, use writev() with the scatter-gather view directly.
         const total_len = pkt.header.usedLength() + pkt.data.size;
         
-        // For simplicity, we allocate a buffer. 
-        // Optimization TODO: Use a pre-allocated write buffer or writev.
         var buf = std.heap.page_allocator.alloc(u8, total_len) catch return tcpip.Error.NoBufferSpace;
         defer std.heap.page_allocator.free(buf);
         
@@ -92,7 +84,11 @@ pub const Tap = struct {
         defer std.heap.page_allocator.free(view);
         @memcpy(buf[hdr_len..], view);
         
-        _ = std.posix.write(self.fd, buf) catch return tcpip.Error.UnknownDevice;
+        const rc = std.os.linux.write(self.fd, buf.ptr, buf.len);
+        if (std.posix.errno(rc) != .SUCCESS) {
+             std.debug.print("writePacket failed: fd={}, rc={}, err={}\n", .{ self.fd, rc, std.posix.errno(rc) });
+             return tcpip.Error.UnknownDevice;
+        }
     }
 
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
@@ -120,47 +116,34 @@ pub const Tap = struct {
         return stack.CapabilityNone;
     }
     
-    /// Read a packet from the device and inject it into the stack.
-    /// This should be called by the event loop when the FD is readable.
     pub fn readPacket(self: *Tap) !void {
         var buf: [9000]u8 = undefined; // Support up to Jumbo
-        const len = std.posix.read(self.fd, &buf) catch |err| {
-            if (err == error.WouldBlock) return;
-            return err;
-        };
+        const rc = std.os.linux.read(self.fd, &buf, buf.len);
+        const err = std.posix.errno(rc);
+        if (err != .SUCCESS) {
+            if (err == .AGAIN) return;
+            return error.ReadFailed;
+        }
+        const len = rc;
         if (len == 0) return; // EOF
         
-        // Parse Ethernet Header
-        if (len < header.EthernetMinimumSize) return;
-        const eth = header.Ethernet.init(buf[0..len]);
-        const eth_type = eth.etherType();
+        const frame_buf = try std.heap.page_allocator.alloc(u8, len);
+        @memcpy(frame_buf, buf[0..len]);
         
-        // Create PacketBuffer
-        // The stack expects to own the memory or have a valid view.
-        // We allocate a copy here because 'buf' is on the stack.
-        const payload_buf = try std.heap.page_allocator.alloc(u8, len - header.EthernetMinimumSize);
-        // Note: Caller (UDP/TCP endpoint) handles freeing logic or cloning if needed.
-        // But for safety, our UDP stack now clones.
-        // However, if the stack dispatch is synchronous, we must free it after dispatch.
-        // If async/queued, we must NOT free it. 
-        // ustack is currently synchronous dispatch.
-        
-        @memcpy(payload_buf, buf[header.EthernetMinimumSize..len]);
-        
-        var views = [1]buffer.View{payload_buf};
+        var views = [1]buffer.View{frame_buf};
         const pkt = tcpip.PacketBuffer{
-            .data = buffer.VectorisedView.init(payload_buf.len, &views),
+            .data = buffer.VectorisedView.init(frame_buf.len, &views),
             .header = buffer.Prependable.init(&[_]u8{}),
         };
         
         if (self.dispatcher) |d| {
-            d.deliverNetworkPacket(eth.sourceAddress(), eth.destinationAddress(), eth_type, pkt);
+            // For Ethernet devices, we often pass a dummy or zero MAC if it's going to be parsed by EthernetEndpoint anyway.
+            // But EthernetEndpoint.deliverNetworkPacket ignores these arguments anyway.
+            const dst_mac = tcpip.LinkAddress{ .addr = buf[0..6].* };
+            const src_mac = tcpip.LinkAddress{ .addr = buf[6..12].* };
+            d.deliverNetworkPacket(&src_mac, &dst_mac, 0, pkt);
         }
         
-        // Since ustack handles cloning in endpoints if needed, we should be able to free here IF synchronous.
-        // But wait, what if it's queued in an IP fragment reassembly list?
-        // IPv4 reassembly clones.
-        // So we can free here.
-        std.heap.page_allocator.free(payload_buf);
+        std.heap.page_allocator.free(frame_buf);
     }
 };

@@ -38,6 +38,7 @@ pub const Queue = struct {
     head: ?*Entry = null,
     tail: ?*Entry = null,
     mutex: Mutex = .{},
+    ready_mask: EventMask = 0,
 
     pub fn eventRegister(self: *Queue, e: *Entry, mask: EventMask) void {
         self.mutex.lock();
@@ -78,6 +79,7 @@ pub const Queue = struct {
     pub fn notify(self: *Queue, mask: EventMask) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.ready_mask |= mask;
 
         var current = self.head;
         while (current) |e| {
@@ -91,7 +93,13 @@ pub const Queue = struct {
         }
     }
 
-    pub fn events(self: *Queue) EventMask {
+    pub fn clear(self: *Queue, mask: EventMask) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.ready_mask &= ~mask;
+    }
+
+    pub fn interests(self: *Queue) EventMask {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -102,6 +110,12 @@ pub const Queue = struct {
             current = e.next;
         }
         return ret;
+    }
+
+    pub fn events(self: *Queue) EventMask {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.ready_mask;
     }
 
     pub fn isEmpty(self: *Queue) bool {
@@ -119,11 +133,11 @@ test "Queue basic" {
     q.eventRegister(&e1, EventIn);
     q.eventRegister(&e2, EventOut);
 
-    try std.testing.expectEqual(EventIn | EventOut, q.events());
+    try std.testing.expectEqual(EventIn | EventOut, q.interests());
     try std.testing.expect(!q.isEmpty());
 
     q.eventUnregister(&e1);
-    try std.testing.expectEqual(EventOut, q.events());
+    try std.testing.expectEqual(EventOut, q.interests());
 
     q.eventUnregister(&e2);
     try std.testing.expect(q.isEmpty());

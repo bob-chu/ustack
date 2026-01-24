@@ -40,8 +40,8 @@ pub const EthernetEndpoint = struct {
         const eth_header = mut_pkt.header.prepend(header.EthernetMinimumSize) orelse return tcpip.Error.NoBufferSpace;
         var eth = header.Ethernet.init(eth_header);
         
-        const dst = if (r) |route| route.remote_link_address orelse [_]u8{0xff} ** 6 else [_]u8{0xff} ** 6;
-        const src = if (r) |route| route.local_link_address else self.addr;
+        const dst = if (r) |route| (if (route.remote_link_address) |la| la.addr else [_]u8{0xff} ** 6) else [_]u8{0xff} ** 6;
+        const src = if (r) |route| route.local_link_address.addr else self.addr.addr;
         
         eth.encode(src, dst, protocol);
         
@@ -60,7 +60,7 @@ pub const EthernetEndpoint = struct {
         self.lower.attach(&self.wrapped_dispatcher);
     }
 
-    fn deliverNetworkPacket(ptr: *anyopaque, remote: tcpip.LinkAddress, local: tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+    fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
         _ = remote; _ = local; _ = protocol;
         var mut_pkt = pkt;
@@ -73,7 +73,9 @@ pub const EthernetEndpoint = struct {
         mut_pkt.data.trimFront(header.EthernetMinimumSize);
         
         if (self.dispatcher) |d| {
-            d.deliverNetworkPacket(eth.sourceAddress(), eth.destinationAddress(), p, mut_pkt);
+            const src = tcpip.LinkAddress{ .addr = eth.sourceAddress() };
+            const dst = tcpip.LinkAddress{ .addr = eth.destinationAddress() };
+            d.deliverNetworkPacket(&src, &dst, p, mut_pkt);
         }
     }
 

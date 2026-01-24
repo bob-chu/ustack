@@ -69,7 +69,7 @@ pub const NewReno = struct {
 
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));
-        std.debug.print("CC onAck: cwnd={}, ssthresh={}, bytes_acked={}\n", .{self.cwnd, self.ssthresh, bytes_acked});
+        _ = bytes_acked;
         // Simplified: we treat every ACK as full MSS for growth
         if (self.cwnd < self.ssthresh) {
             // Slow Start
@@ -78,7 +78,6 @@ pub const NewReno = struct {
             // Congestion Avoidance
             self.cwnd += self.mss / self.cwnd;
         }
-        std.debug.print("CC after onAck: cwnd={}\n", .{self.cwnd});
     }
 
     fn onLoss(ptr: *anyopaque) void {

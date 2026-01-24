@@ -169,6 +169,7 @@ pub const IPv4Endpoint = struct {
         }
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {
+            std.debug.print("IPv4: Fragment received. offset={}, more={}\n", .{h.fragmentOffset(), h.moreFragments()});
             const key = ReassemblyKey{
                 .src = .{ .v4 = h.sourceAddress() },
                 .dst = .{ .v4 = h.destinationAddress() },
@@ -186,6 +187,14 @@ pub const IPv4Endpoint = struct {
             
             var payload_pkt = pkt;
             payload_pkt.data.trimFront(hlen);
+            // Cap length to what IP header says
+            const tlen = h.totalLength();
+            if (tlen > hlen) {
+                payload_pkt.data.capLength(tlen - hlen);
+            } else {
+                return; // Invalid length
+            }
+
             const cloned_data = payload_pkt.data.clone(self.nic.stack.allocator) catch return;
             
             const fragment = Fragment{
@@ -274,7 +283,7 @@ test "IPv4 fragmentation and reassembly" {
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
             _ = ptr; _ = dispatcher;
         }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return [_]u8{0} ** 6; }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{0} ** 6 }; }
         fn mtu(ptr: *anyopaque) u32 { 
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
             return self.mtu_val; 
@@ -338,7 +347,7 @@ test "IPv4 fragmentation and reassembly" {
     const r = stack.Route{
         .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
         .remote_address = .{ .v4 = .{ 10, 0, 0, 2 } },
-        .local_link_address = [_]u8{0} ** 6,
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
         .net_proto = 0x0800,
         .nic = nic,
     };

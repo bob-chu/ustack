@@ -54,7 +54,7 @@ pub const ARPProtocol = struct {
         var h = header.ARP.init(arp_hdr);
         h.setIPv4OverEthernet();
         h.setOp(1); // Request
-        @memcpy(h.data[8..14], &nic.linkEP.linkAddress());
+        @memcpy(h.data[8..14], &nic.linkEP.linkAddress().addr);
         @memcpy(h.data[14..18], &local_addr.v4);
         @memcpy(h.data[24..28], &addr.v4);
 
@@ -63,7 +63,7 @@ pub const ARPProtocol = struct {
             .header = pre,
         };
         
-        const broadcast_hw = [_]u8{0xff} ** 6;
+        const broadcast_hw = tcpip.LinkAddress{ .addr = [_]u8{0xff} ** 6 };
         var r = stack.Route{
             .local_address = local_addr,
             .remote_address = addr,
@@ -128,9 +128,7 @@ pub const ARPEndpoint = struct {
         const sender_proto_addr = tcpip.Address{ .v4 = h.protocolAddressSender() };
         const sender_hw_addr = h.hardwareAddressSender();
         
-        std.debug.print("ARP: Received op={} sender_proto={any} sender_hw={any}\n", .{h.op(), sender_proto_addr.v4, sender_hw_addr});
-        
-        self.nic.stack.addLinkAddress(sender_proto_addr, sender_hw_addr) catch {};
+        self.nic.stack.addLinkAddress(sender_proto_addr, .{ .addr = sender_hw_addr }) catch {};
 
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
@@ -144,7 +142,7 @@ pub const ARPEndpoint = struct {
                 var reply_h = header.ARP.init(arp_hdr);
                 reply_h.setIPv4OverEthernet();
                 reply_h.setOp(2); // Reply
-                @memcpy(reply_h.data[8..14], &self.nic.linkEP.linkAddress());
+                @memcpy(reply_h.data[8..14], &self.nic.linkEP.linkAddress().addr);
                 @memcpy(reply_h.data[14..18], h.data[24..28]);
                 @memcpy(reply_h.data[18..24], h.data[8..14]);
                 @memcpy(reply_h.data[24..28], h.data[14..18]);
