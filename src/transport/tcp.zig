@@ -391,13 +391,13 @@ pub const TCPEndpoint = struct {
         defer self.mutex.unlock();
 
         const payload_raw = try p.fullPayload();
-        
+
         // Calculate effective window: (last_ack + snd_wnd) - snd_nxt
         const total_allowed = @as(i64, self.last_ack) + self.snd_wnd;
         const current_nxt = @as(i64, self.snd_nxt);
         const avail_signed = total_allowed - current_nxt;
         const avail = if (avail_signed > 0) @as(u32, @intCast(avail_signed)) else 0;
-        
+
         const payload_len = @min(payload_raw.len, avail);
 
         if (payload_len == 0) return tcpip.Error.WouldBlock;
@@ -805,14 +805,38 @@ pub const TCPEndpoint = struct {
                     }
                 }
             },
+
             .syn_sent => {
                 if ((fl & header.TCPFlagSyn != 0) and (fl & header.TCPFlagAck != 0)) {
                     if (h.ackNumber() == self.snd_nxt) {
                         self.state = .established;
                         self.rcv_nxt = h.sequenceNumber() + 1;
                         self.snd_nxt = h.ackNumber();
-                        std.debug.print("TCP: Connected! rcv_nxt={}, snd_nxt={}\n", .{ self.rcv_nxt, self.snd_nxt });
+                        // Clear SYN from snd_queue (it is ACKed)
+                        if (self.snd_queue.popFirst()) |node| {
+                            node.data.data.deinit();
+                            self.stack.allocator.destroy(node);
+                        }
+                        self.stack.timer_queue.cancel(&self.retransmit_timer);
+                        
+                        // Parse options in SYN-ACK
+                        var opt_idx: usize = 20;
+                        while (opt_idx < hlen) {
+                            const kind = v[opt_idx];
+                            if (kind == 0) break;
+                            if (kind == 1) { opt_idx += 1; continue; }
+                            const len = v[opt_idx + 1];
+                            if (kind == 3 and len == 3) {
+                                self.snd_wnd_scale = v[opt_idx + 2];
+                            }
+                            opt_idx += len;
+                        }
+                        self.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(self.snd_wnd_scale));
 
+                        self.sendControl(header.TCPFlagAck) catch {};
+                        notify_mask |= waiter.EventOut;
+                    } else {
+                        std.debug.print("TCP: SYN-ACK ack mismatch: ack={}, snd_nxt={}\n", .{h.ackNumber(), self.snd_nxt});
                     }
                 }
             },
@@ -1117,6 +1141,17 @@ test "TCP retransmission" {
     const ack_pkt = tcpip.PacketBuffer{ .data = .{ .views = &ack_views, .size = fake_ep.last_pkt.?.len - 20 }, .header = buffer.Prependable.init(&[_]u8{}) };
     ep_server.transportEndpoint().handlePacket(&r_to_server, id_to_server, ack_pkt);
 
+    // After handlePacket, the connection is established and pushed to accepted_queue.
+    // The server-side accepted endpoint is created inside handlePacket.
+    // We need to consume it via accept().
+    
+    // The previous accept() call fails with WouldBlock because handlePacket processes synchronously 
+    // but the waiter notification might not have been fully processed or checked in the test flow?
+    // Actually, in handlePacket: "self.accepted_queue.append(node); notify_mask |= waiter.EventIn;"
+    // Then notify() is called. 
+    // The issue is likely that accept() checks the queue.
+    
+    // Wait for accept to return valid
     const accept_res = try ep_server.endpoint().accept();
     const ep_accepted = @as(*TCPEndpoint, @ptrCast(@alignCast(accept_res.ep.ptr)));
     defer accept_res.ep.close();

@@ -37,7 +37,6 @@ pub const EventMultiplexer = struct {
     /// It gets triggered by the stack when data arrives or space opens up.
     pub fn upcall(entry: *waiter.Entry) void {
         const self = @as(*EventMultiplexer, @ptrCast(@alignCast(entry.upcall_ctx.?)));
-        std.debug.print("EventMux: upcall triggered\n", .{});
         self.ready_queue.push(entry) catch return;
         const val: u64 = 1;
         _ = std.posix.write(self.signal_fd, std.mem.asBytes(&val)) catch {};
@@ -97,7 +96,7 @@ test "EventMultiplexer basic" {
     const mux = try EventMultiplexer.init(allocator);
     defer mux.deinit();
 
-    var entry = waiter.Entry.init(mux, EventMultiplexer.upcall);
+    var entry = waiter.Entry.initWithUpcall(null, mux, EventMultiplexer.upcall);
 
     // Trigger upcall
     EventMultiplexer.upcall(&entry);

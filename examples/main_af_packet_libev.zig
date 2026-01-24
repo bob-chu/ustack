@@ -74,7 +74,7 @@ pub fn main() !void {
     });
 
     const loop = my_ev_default_loop();
-    
+
     var io_watcher = std.mem.zeroInit(c.ev_io, .{});
     my_ev_io_init(&io_watcher, libev_af_packet_cb, global_af_packet.fd, c.EV_READ);
     my_ev_io_start(loop, &io_watcher);
@@ -109,19 +109,25 @@ extern fn my_ev_timer_start(loop: ?*anyopaque, w: *c.ev_timer) void;
 extern fn my_ev_run(loop: ?*anyopaque) void;
 
 fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     global_af_packet.readPacket() catch |err| {
         std.debug.print("AF_PACKET read error: {}\n", .{err});
     };
 }
 
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     _ = global_stack.timer_queue.tick();
 }
 
 fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
         defer mux.allocator.free(ready);
@@ -159,7 +165,7 @@ const HttpServer = struct {
             .wait_entry = undefined,
         };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
-        
+
         wq.eventRegister(&self.wait_entry, waiter.EventIn);
         return self;
     }
@@ -212,8 +218,12 @@ const Connection = struct {
         const response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello World!\n";
         const Payloader = struct {
             data: []const u8,
-            pub fn payloader(ctx: *@This()) tcpip.Payloader { return .{ .ptr = ctx, .vtable = &.{ .fullPayload = fullPayload } }; }
-            fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 { return @as(*@This(), @ptrCast(@alignCast(ptr))).data; }
+            pub fn payloader(ctx: *@This()) tcpip.Payloader {
+                return .{ .ptr = ctx, .vtable = &.{ .fullPayload = fullPayload } };
+            }
+            fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
+                return @as(*@This(), @ptrCast(@alignCast(ptr))).data;
+            }
         };
         var p = Payloader{ .data = response };
         _ = self.ep.write(p.payloader(), .{}) catch {};
@@ -225,12 +235,11 @@ const Connection = struct {
         std.debug.print("Closing server connection\n", .{});
         self.wq.eventUnregister(&self.wait_entry);
         self.ep.close();
-        
+
         const alloc = self.allocator;
         alloc.destroy(self);
     }
 };
-
 
 const HttpClient = struct {
     ep: ustack.tcpip.Endpoint,
@@ -300,8 +309,12 @@ const HttpClient = struct {
         const req = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
         const Payloader = struct {
             data: []const u8,
-            pub fn payloader(ctx: *@This()) tcpip.Payloader { return .{ .ptr = ctx, .vtable = &.{ .fullPayload = fullPayload } }; }
-            fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 { return @as(*@This(), @ptrCast(@alignCast(ptr))).data; }
+            pub fn payloader(ctx: *@This()) tcpip.Payloader {
+                return .{ .ptr = ctx, .vtable = &.{ .fullPayload = fullPayload } };
+            }
+            fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
+                return @as(*@This(), @ptrCast(@alignCast(ptr))).data;
+            }
         };
         var p = Payloader{ .data = req };
         _ = self.ep.write(p.payloader(), .{}) catch |err| {
