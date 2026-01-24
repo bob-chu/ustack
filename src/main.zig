@@ -76,6 +76,9 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     return s;
 }
 
+pub const interface = @import("interface.zig");
+pub const utils = @import("utils.zig");
+
 test {
     std.testing.refAllDecls(@This());
     _ = @import("drivers/linux/test_af_xdp.zig");
