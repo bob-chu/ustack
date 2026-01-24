@@ -10,10 +10,11 @@ pub const AfXdp = struct {
     allocator: std.mem.Allocator,
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
+    if_index: i32,
     
     // UMEM
     umem_area: []align(std.mem.page_size) u8,
-    
+
     // Rings
     rx_ring: Ring,
     tx_ring: Ring,
@@ -21,18 +22,50 @@ pub const AfXdp = struct {
     comp_ring: Ring,
 
     dispatcher: ?*stack.NetworkDispatcher = null,
+    frame_manager: FrameManager,
+
+    const FrameManager = struct {
+        free_frames: []u32,
+        top: usize,
+
+        fn init(allocator: std.mem.Allocator, num_frames: u32) !FrameManager {
+            const free_frames = try allocator.alloc(u32, num_frames);
+            for (0..num_frames) |i| {
+                free_frames[i] = @as(u32, @intCast(i));
+            }
+            return .{
+                .free_frames = free_frames,
+                .top = num_frames,
+            };
+        }
+
+        fn alloc(self: *FrameManager) ?u32 {
+            if (self.top == 0) return null;
+            self.top -= 1;
+            return self.free_frames[self.top];
+        }
+
+        fn free(self: *FrameManager, frame: u32) void {
+            self.free_frames[self.top] = frame;
+            self.top += 1;
+        }
+
+        fn deinit(self: *FrameManager, allocator: std.mem.Allocator) void {
+            allocator.free(self.free_frames);
+        }
+    };
 
     const Ring = struct {
         producer: *volatile u32,
         consumer: *volatile u32,
         desc: [*]xdp.xdp_desc, // For RX/TX
-        addr: [*]u64,          // For Fill/Comp
+        addr: [*]u64, // For Fill/Comp
         size: u32,
         mask: u32,
     };
 
     const NUM_FRAMES = 2048;
-    const FRAME_SIZE = 2048; // Must be power of 2 usually? Or just aligned. 2048 is standard.
+    const FRAME_SIZE = 2048; 
     const RING_SIZE = 1024;
 
     pub fn init(allocator: std.mem.Allocator, if_name: []const u8, queue_id: u32) !AfXdp {
@@ -72,40 +105,56 @@ pub const AfXdp = struct {
         const rx_map = try std.posix.mmap(null, off.rx.desc + RING_SIZE * @sizeOf(xdp.xdp_desc), std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED, .POPULATE = true }, fd, xdp.XDP_PGOFF_RX_RING);
         const tx_map = try std.posix.mmap(null, off.tx.desc + RING_SIZE * @sizeOf(xdp.xdp_desc), std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED, .POPULATE = true }, fd, xdp.XDP_PGOFF_TX_RING);
 
-        var self = AfXdp{
-            .fd = fd,
-            .allocator = allocator,
-            .umem_area = umem_area,
-            .fill_ring = initRing(fill_map, off.fr, RING_SIZE, true),
-            .comp_ring = initRing(comp_map, off.cr, RING_SIZE, true),
-            .rx_ring = initRing(rx_map, off.rx, RING_SIZE, false),
-            .tx_ring = initRing(tx_map, off.tx, RING_SIZE, false),
-        };
-
         // 7. Bind
-        // Need to get ifindex first. Using helper from af_packet driver logic or reimplementing.
         const ifindex = try getIfIndex(if_name);
-        std.debug.print("AF_XDP: Binding to {s} (index={}) queue={}\n", .{if_name, ifindex, queue_id});
+        const mac = try getIfMac(if_name);
+        std.debug.print("AF_XDP: Binding to {s} (index={}, mac={x}:{x}:{x}:{x}:{x}:{x}) queue={}\n", .{ 
+            if_name, ifindex, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], queue_id 
+        });
         
         var sa = xdp.sockaddr_xdp{
             .family = std.posix.AF.XDP,
-            .flags = 0, // Let kernel choose (prefer zero-copy, fallback to copy)
+            .flags = 0, 
             .ifindex = ifindex,
             .queue_id = queue_id,
             .shared_umem_fd = 0,
         };
         try std.posix.bind(fd, @as(*const std.posix.sockaddr, @ptrCast(&sa)), @sizeOf(xdp.sockaddr_xdp));
 
+        var fm = try FrameManager.init(allocator, NUM_FRAMES);
+        errdefer fm.deinit(allocator);
+
+        var self = AfXdp{
+            .fd = fd,
+            .allocator = allocator,
+            .mtu_val = 1500,
+            .address = .{ .addr = mac },
+            .if_index = @as(i32, @intCast(ifindex)),
+            .umem_area = umem_area,
+            .fill_ring = initRing(fill_map, off.fr, RING_SIZE, true),
+            .comp_ring = initRing(comp_map, off.cr, RING_SIZE, true),
+            .rx_ring = initRing(rx_map, off.rx, RING_SIZE, false),
+            .tx_ring = initRing(tx_map, off.tx, RING_SIZE, false),
+            .frame_manager = fm,
+        };
+
         // 8. Populate Fill Ring
-        // Give all frames to kernel for RX initially
         var prod = self.fill_ring.producer.*;
-        for (0..RING_SIZE) |i| {
-            self.fill_ring.addr[prod & self.fill_ring.mask] = i * FRAME_SIZE;
-            prod += 1;
+        for (0..RING_SIZE) |_| {
+            if (self.frame_manager.alloc()) |idx| {
+                self.fill_ring.addr[prod & self.fill_ring.mask] = @as(u64, idx) * FRAME_SIZE;
+                prod += 1;
+            }
         }
-        self.fill_ring.producer.* = prod; // Publish
+        self.fill_ring.producer.* = prod; 
 
         return self;
+    }
+
+    pub fn deinit(self: *AfXdp) void {
+        std.posix.close(self.fd);
+        self.allocator.free(self.umem_area);
+        self.frame_manager.deinit(self.allocator);
     }
 
     fn initRing(map: []u8, off: xdp.xdp_ring_offset, size: u32, is_addr: bool) Ring {
@@ -115,7 +164,7 @@ pub const AfXdp = struct {
             .producer = @as(*volatile u32, @ptrCast(@alignCast(map_ptr + off.producer))),
             .consumer = @as(*volatile u32, @ptrCast(@alignCast(map_ptr + off.consumer))),
             .desc = @as([*]xdp.xdp_desc, @ptrCast(@alignCast(map_ptr + off.desc))),
-            .addr = @as([*]u64, @ptrCast(@alignCast(map_ptr + off.desc))), // Reused for addr rings
+            .addr = @as([*]u64, @ptrCast(@alignCast(map_ptr + off.desc))), 
             .size = size,
             .mask = size - 1,
         };
@@ -137,93 +186,115 @@ pub const AfXdp = struct {
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfXdp, @ptrCast(@alignCast(ptr)));
-        _ = r; _ = protocol;
+        _ = r;
+        _ = protocol;
 
-        // Check TX ring space
+        // 1. Reclaim completed frames
+        var comp_cons = self.comp_ring.consumer.*;
+        const comp_prod = self.comp_ring.producer.*;
+        while (comp_cons != comp_prod) {
+            const addr = self.comp_ring.addr[comp_cons & self.comp_ring.mask];
+            const idx = @as(u32, @intCast(addr / FRAME_SIZE));
+            self.frame_manager.free(idx);
+            comp_cons += 1;
+        }
+        self.comp_ring.consumer.* = comp_cons;
+
+        // 2. Check TX ring space
         const prod = self.tx_ring.producer.*;
         const cons = self.tx_ring.consumer.*;
         if (prod - cons >= self.tx_ring.size) return tcpip.Error.NoBufferSpace;
 
-        // Check completion ring to reclaim frames (simplified: just assume we have enough UMEM frames if we manage them)
-        // In this simple implementation, we might run out of UMEM frames if we don't recycle from completion ring.
-        // Let's reclaim first.
-        const comp_cons = self.comp_ring.consumer.*;
-        const comp_prod = self.comp_ring.producer.*;
-        _ = comp_cons;
-        _ = comp_prod;
-        // We don't actually need to do anything with completed frames in this simple model, just advance consumer
-        // effectively "freeing" them for the allocator (if we had one).
-        // Since we are just using frames linearly/randomly, we need a simple allocator.
-        // Hack: Use frames [RING_SIZE..NUM_FRAMES] for TX?
-        // Let's implement a simple stack of free frame indices?
-        
-        // For simplicity: We will just use the last 1024 frames for TX, and first 1024 for RX.
-        // We assume single-threaded access.
-        
-        const frame_idx = (prod & (self.tx_ring.mask)) + RING_SIZE; // Offset to upper half
-        const frame_offset = frame_idx * FRAME_SIZE;
+        // 3. Get a free frame
+        const frame_idx = self.frame_manager.alloc() orelse return tcpip.Error.NoBufferSpace;
+        const frame_offset = @as(u64, frame_idx) * FRAME_SIZE;
         const data_ptr = self.umem_area[frame_offset..];
-        
+
         // Copy packet data to UMEM
         const total_len = pkt.header.usedLength() + pkt.data.size;
-        if (total_len > FRAME_SIZE) return tcpip.Error.MessageTooLong;
-        
+        if (total_len > FRAME_SIZE) {
+            self.frame_manager.free(frame_idx);
+            return tcpip.Error.MessageTooLong;
+        }
+
         const hdr_len = pkt.header.usedLength();
         @memcpy(data_ptr[0..hdr_len], pkt.header.view());
-        
-        const view = pkt.data.toView(self.allocator) catch return tcpip.Error.NoBufferSpace;
-        defer self.allocator.free(view);
-        @memcpy(data_ptr[hdr_len..][0..view.len], view);
-        
-        // Write descriptor
+
+        var current_off = hdr_len;
+        for (pkt.data.views) |v| {
+            @memcpy(data_ptr[current_off..][0..v.len], v);
+            current_off += v.len;
+        }
+
+        // 4. Write descriptor
         self.tx_ring.desc[prod & self.tx_ring.mask] = .{
             .addr = frame_offset,
             .len = @as(u32, @intCast(total_len)),
             .options = 0,
         };
-        
+
         // Kick
         self.tx_ring.producer.* = prod + 1;
-        // Need to notify kernel? sendto()
-        _ = std.posix.sendto(self.fd, &[_]u8{}, 0, null, 0) catch {};
+        // Notify kernel. We use the raw syscall to avoid Zig's safety checks on empty slices.
+        _ = std.os.linux.syscall6(std.os.linux.SYS.sendto, @as(usize, @intCast(self.fd)), 0, 0, 0, 0, 0);
     }
 
     pub fn poll(self: *AfXdp) !void {
-        // Check RX Ring
+        // 1. Reclaim completed TX frames
+        var comp_cons = self.comp_ring.consumer.*;
+        const comp_prod = self.comp_ring.producer.*;
+        while (comp_cons != comp_prod) {
+            const addr = self.comp_ring.addr[comp_cons & self.comp_ring.mask];
+            const idx = @as(u32, @intCast(addr / FRAME_SIZE));
+            self.frame_manager.free(idx);
+            comp_cons += 1;
+        }
+        self.comp_ring.consumer.* = comp_cons;
+
+        // 2. Check RX Ring
         var cons = self.rx_ring.consumer.*;
         const prod = self.rx_ring.producer.*;
-        
+
         while (cons != prod) {
             const desc = self.rx_ring.desc[cons & self.rx_ring.mask];
             const data = self.umem_area[desc.addr .. desc.addr + desc.len];
-            
+
             // Dispatch
-            // Create a packet buffer that copies data (for safety, as we reuse the UMEM frame immediately)
-            const frame_buf = try self.allocator.alloc(u8, desc.len);
-            @memcpy(frame_buf, data);
-            
-            var views = [1]buffer.View{frame_buf};
+            var views = [1]buffer.View{data};
             const pkt = tcpip.PacketBuffer{
-                .data = buffer.VectorisedView.init(frame_buf.len, &views),
+                .data = buffer.VectorisedView.init(data.len, &views),
                 .header = buffer.Prependable.init(&[_]u8{}),
             };
-            
+
             if (self.dispatcher) |d| {
-                // Pass to Ethernet handler (dummy addresses, it parses header)
                 const dummy = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
                 d.deliverNetworkPacket(&dummy, &dummy, 0, pkt);
             }
-            
-            self.allocator.free(frame_buf);
-            
+
             // Recycle frame to Fill Ring
             const fill_prod = self.fill_ring.producer.*;
-            self.fill_ring.addr[fill_prod & self.fill_ring.mask] = desc.addr;
-            self.fill_ring.producer.* = fill_prod + 1;
-            
+            const fill_cons = self.fill_ring.consumer.*;
+            if (fill_prod - fill_cons < self.fill_ring.size) {
+                self.fill_ring.addr[fill_prod & self.fill_ring.mask] = desc.addr;
+                self.fill_ring.producer.* = fill_prod + 1;
+            } else {
+                self.frame_manager.free(@as(u32, @intCast(desc.addr / FRAME_SIZE)));
+            }
+
             cons += 1;
         }
         self.rx_ring.consumer.* = cons;
+
+        // 3. Refill Fill ring from free pool
+        var fill_prod = self.fill_ring.producer.*;
+        const fill_cons = self.fill_ring.consumer.*;
+        while (fill_prod - fill_cons < self.fill_ring.size) {
+            if (self.frame_manager.alloc()) |idx| {
+                self.fill_ring.addr[fill_prod & self.fill_ring.mask] = @as(u64, idx) * FRAME_SIZE;
+                fill_prod += 1;
+            } else break;
+        }
+        self.fill_ring.producer.* = fill_prod;
     }
 
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
@@ -259,7 +330,7 @@ pub const AfXdp = struct {
             else => return error.SetsockoptFailed,
         }
     }
-    
+
     fn getsockopt(fd: std.posix.fd_t, level: u32, optname: u32, optval: []u8, optlen: *u32) !void {
         const rc = std.os.linux.getsockopt(fd, @as(i32, @intCast(level)), optname, optval.ptr, optlen);
         switch (std.posix.errno(rc)) {
@@ -277,9 +348,28 @@ pub const AfXdp = struct {
         const copy_len = @min(name.len, 15);
         @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
         const header = @import("../../header.zig"); // Use header constants
-        
+
         const rc = std.os.linux.ioctl(fd, header.SIOCGIFINDEX, @intFromPtr(&ifr));
         if (std.posix.errno(rc) != .SUCCESS) return error.IoctlFailed;
         return @as(u32, @intCast(ifr.ifru.ivalue));
+    }
+
+    fn getIfMac(name: []const u8) ![6]u8 {
+        const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        defer std.posix.close(fd);
+
+        var ifr: std.os.linux.ifreq = undefined;
+        @memset(std.mem.asBytes(&ifr), 0);
+        const copy_len = @min(name.len, 15);
+        @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
+        const header = @import("../../header.zig");
+
+        const rc = std.os.linux.ioctl(fd, header.SIOCGIFHWADDR, @intFromPtr(&ifr));
+        if (std.posix.errno(rc) != .SUCCESS) return error.IoctlFailed;
+
+        var mac: [6]u8 = undefined;
+        const sockaddr_ptr = @as([*]const u8, @ptrCast(&ifr.ifru.hwaddr));
+        @memcpy(&mac, sockaddr_ptr[2..8]);
+        return mac;
     }
 };

@@ -112,7 +112,7 @@ fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callco
     _ = loop;
     _ = watcher;
     _ = revents;
-    global_af_packet.readPacket() catch |err| {
+    _ = global_af_packet.readPacket() catch |err| {
         std.debug.print("AF_PACKET read error: {}\n", .{err});
     };
 }

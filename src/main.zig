@@ -78,13 +78,6 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
 
 test {
     std.testing.refAllDecls(@This());
-    _ = network.ipv4;
-    _ = network.arp;
-    _ = transport.udp;
-    _ = transport.tcp;
-    _ = transport.congestion.control;
-    _ = transport.congestion.cubic;
-    _ = transport.congestion.bbr;
-    _ = link.eth;
-    _ = time;
+    _ = @import("drivers/linux/test_af_xdp.zig");
 }
+

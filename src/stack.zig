@@ -792,3 +792,192 @@ test "Stack.findRoute 0.0.0.0 bind" {
     try std.testing.expect(route.remote_address.eq(remote_ip));
     try std.testing.expectEqual(@as(tcpip.NICID, 1), route.nic.id);
 }
+
+test "Stack NIC creation" {
+    const FakeLinkEndpoint = struct {
+        address: [6]u8 = [_]u8{ 1, 2, 3, 4, 5, 6 },
+        mtu_val: u32 = 1500,
+
+        fn writePacket(ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            _ = ptr; _ = r; _ = protocol; _ = pkt;
+            return;
+        }
+        fn attach(ptr: *anyopaque, dispatcher: *NetworkDispatcher) void {
+            _ = ptr; _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return .{ .addr = self.address };
+        }
+        fn mtu(ptr: *anyopaque) u32 { 
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return self.mtu_val; 
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void { 
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            self.mtu_val = m;
+        }
+        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities { _ = ptr; return CapabilityNone; }
+    };
+
+    var fake_ep = FakeLinkEndpoint{};
+    const ep = LinkEndpoint{
+        .ptr = &fake_ep,
+        .vtable = &.{
+            .writePacket = FakeLinkEndpoint.writePacket,
+            .attach = FakeLinkEndpoint.attach,
+            .linkAddress = FakeLinkEndpoint.linkAddress,
+            .mtu = FakeLinkEndpoint.mtu,
+            .setMTU = FakeLinkEndpoint.setMTU,
+            .capabilities = FakeLinkEndpoint.capabilities,
+        },
+    };
+
+    var s = try Stack.init(std.testing.allocator);
+    defer s.deinit();
+
+    try s.createNIC(1, ep);
+    try std.testing.expect(s.nics.contains(1));
+}
+
+test "Stack Transport Demux" {
+    const FakeTransportEndpoint = struct {
+        notified: bool = false,
+        stack: *Stack,
+        ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+
+        fn handlePacket(ptr: *anyopaque, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            _ = r; _ = id; _ = pkt;
+            self.notified = true;
+        }
+        fn close(ptr: *anyopaque) void {
+            decRef(ptr);
+        }
+        fn incRef(ptr: *anyopaque) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            _ = self.ref_count.fetchAdd(1, .monotonic);
+        }
+        fn decRef(ptr: *anyopaque) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            if (self.ref_count.fetchSub(1, .release) == 1) {
+                self.ref_count.fence(.acquire);
+                self.stack.allocator.destroy(self);
+            }
+        }
+    };
+
+    const FakeTransportProtocol = struct {
+        fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber { _ = ptr; return 17; }
+        fn newEndpoint(ptr: *anyopaque, s: *Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
+            _ = ptr; _ = s; _ = net_proto; _ = wait_queue;
+            return tcpip.Error.NotPermitted;
+        }
+        fn parsePorts(ptr: *anyopaque, pkt: tcpip.PacketBuffer) TransportProtocol.PortPair {
+            _ = ptr; _ = pkt;
+            return .{ .src = 1234, .dst = 80 };
+        }
+    };
+
+    var s = try Stack.init(std.testing.allocator);
+    defer s.deinit();
+
+    var fake_proto_ptr = FakeTransportProtocol{};
+    const proto = TransportProtocol{
+        .ptr = &fake_proto_ptr,
+        .vtable = &.{
+            .number = FakeTransportProtocol.number,
+            .newEndpoint = FakeTransportProtocol.newEndpoint,
+            .parsePorts = FakeTransportProtocol.parsePorts,
+        },
+    };
+    try s.registerTransportProtocol(proto);
+
+    const fake_ep_ptr = try s.allocator.create(FakeTransportEndpoint);
+    fake_ep_ptr.* = .{ .stack = &s };
+    const ep = TransportEndpoint{
+        .ptr = fake_ep_ptr,
+        .vtable = &.{
+            .handlePacket = FakeTransportEndpoint.handlePacket,
+            .close = FakeTransportEndpoint.close,
+            .incRef = FakeTransportEndpoint.incRef,
+            .decRef = FakeTransportEndpoint.decRef,
+        },
+    };
+
+    const id = TransportEndpointID{
+        .local_port = 80,
+        .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
+        .remote_port = 1234,
+        .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
+    };
+    try s.registerTransportEndpoint(id, ep);
+
+    const r = Route{
+        .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
+        .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = undefined, 
+    };
+
+    Stack.deliverTransportPacket(&s, &r, 17, .{
+        .data = .{ .views = &[_]buffer.View{}, .size = 0 },
+        .header = buffer.Prependable.init(&[_]u8{}),
+    });
+
+    try std.testing.expect(fake_ep_ptr.notified);
+    ep.close();
+}
+
+test "Jumbo Frames" {
+    const FakeLinkEndpoint = struct {
+        address: [6]u8 = [_]u8{ 1, 2, 3, 4, 5, 6 },
+        mtu_val: u32 = 1500,
+        last_pkt_size: usize = 0,
+
+        fn writePacket(ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            _ = r; _ = protocol;
+            self.last_pkt_size = pkt.data.size + pkt.header.usedLength();
+            return;
+        }
+        fn attach(ptr: *anyopaque, dispatcher: *NetworkDispatcher) void {
+            _ = ptr; _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return .{ .addr = self.address };
+        }
+        fn mtu(ptr: *anyopaque) u32 { 
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return self.mtu_val; 
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void { 
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            self.mtu_val = m;
+        }
+        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities { _ = ptr; return CapabilityNone; }
+    };
+
+    var fake_ep = FakeLinkEndpoint{};
+    const ep = LinkEndpoint{
+        .ptr = &fake_ep,
+        .vtable = &.{
+            .writePacket = FakeLinkEndpoint.writePacket,
+            .attach = FakeLinkEndpoint.attach,
+            .linkAddress = FakeLinkEndpoint.linkAddress,
+            .mtu = FakeLinkEndpoint.mtu,
+            .setMTU = FakeLinkEndpoint.setMTU,
+            .capabilities = FakeLinkEndpoint.capabilities,
+        },
+    };
+
+    var s = try Stack.init(std.testing.allocator);
+    defer s.deinit();
+
+    ep.setMTU(9000);
+    try std.testing.expectEqual(@as(u32, 9000), ep.mtu());
+
+    try s.createNIC(1, ep);
+}

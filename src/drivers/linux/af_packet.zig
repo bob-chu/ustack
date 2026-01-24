@@ -108,13 +108,13 @@ pub const AfPacket = struct {
         return stack.CapabilityNone;
     }
 
-    pub fn readPacket(self: *AfPacket) !void {
+    pub fn readPacket(self: *AfPacket) !bool {
         var buf: [9000]u8 = undefined;
         const len = std.posix.read(self.fd, &buf) catch |err| {
-            if (err == error.WouldBlock) return;
+            if (err == error.WouldBlock) return false;
             return err;
         };
-        if (len == 0) return;
+        if (len == 0) return false;
 
         // Pass the FULL frame to the dispatcher (EthernetEndpoint expects it)
         const frame_buf = try self.allocator.alloc(u8, len);
@@ -133,6 +133,7 @@ pub const AfPacket = struct {
         }
 
         self.allocator.free(frame_buf);
+        return true;
     }
 
     // Helpers for IOCTL

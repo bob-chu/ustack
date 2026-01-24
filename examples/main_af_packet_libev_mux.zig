@@ -4,7 +4,7 @@ const stack = ustack.stack;
 const tcpip = ustack.tcpip;
 const buffer = ustack.buffer;
 const waiter = ustack.waiter;
-const AfXdp = ustack.drivers.af_xdp.AfXdp;
+const AfPacket = ustack.drivers.af_packet.AfPacket;
 const EventMultiplexer = ustack.event_mux.EventMultiplexer;
 
 const c = @cImport({
@@ -12,7 +12,7 @@ const c = @cImport({
 });
 
 var global_stack: stack.Stack = undefined;
-var global_af_xdp: AfXdp = undefined;
+var global_af_packet: AfPacket = undefined;
 var global_eth: ustack.link.eth.EthernetEndpoint = undefined;
 var global_mux: ?*EventMultiplexer = null;
 var global_benchmark: Benchmark = undefined;
@@ -46,11 +46,8 @@ pub fn main() !void {
     const ip_cidr = args[3];
 
     global_stack = try ustack.init(allocator);
-
-    // Initialize AF_XDP (queue 0)
-    global_af_xdp = try AfXdp.init(allocator, ifname, 0);
-
-    global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_xdp.linkEndpoint(), global_af_xdp.address);
+    global_af_packet = try AfPacket.init(allocator, ifname);
+    global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
 
     var parts = std.mem.split(u8, ip_cidr, "/");
@@ -82,18 +79,24 @@ pub fn main() !void {
         .mtu = 1500,
     });
 
-    std.debug.print("AF_XDP: Interface {s} up with IP {s}/{d}\n", .{ ifname, ip_str, prefix_len });
+    std.debug.print("AF_PACKET MUX: Interface {s} up with IP {s}/{d}\n", .{ ifname, ip_str, prefix_len });
 
     const loop = my_ev_default_loop();
 
-    // Register AF_XDP FD (xsk_fd)
     var io_watcher = std.mem.zeroInit(c.ev_io, .{});
-    my_ev_io_init(&io_watcher, libev_af_xdp_cb, global_af_xdp.fd, c.EV_READ);
+    my_ev_io_init(&io_watcher, libev_af_packet_cb, global_af_packet.fd, c.EV_READ);
     my_ev_io_start(loop, &io_watcher);
 
     var timer_watcher = std.mem.zeroInit(c.ev_timer, .{});
-    my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.001, 0.001); // 1ms for high perf
+    my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.001, 0.001);
     my_ev_timer_start(loop, &timer_watcher);
+
+    // Safety timeout watcher (30s)
+    if (global_benchmark.total_target > 0) {
+        var safety_watcher = std.mem.zeroInit(c.ev_timer, .{});
+        my_ev_timer_init(&safety_watcher, libev_safety_cb, 30.0, 0.0);
+        my_ev_timer_start(loop, &safety_watcher);
+    }
 
     const mux = try EventMultiplexer.init(allocator);
     global_mux = mux;
@@ -129,13 +132,17 @@ extern fn my_ev_io_start(loop: ?*anyopaque, w: *c.ev_io) void;
 extern fn my_ev_timer_start(loop: ?*anyopaque, w: *c.ev_timer) void;
 extern fn my_ev_run(loop: ?*anyopaque) void;
 
-fn libev_af_xdp_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
+fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
     _ = revents;
-    global_af_xdp.poll() catch |err| {
-        std.debug.print("AF_XDP poll error: {}\n", .{err});
-    };
+    while (true) {
+        const more = global_af_packet.readPacket() catch |err| {
+            std.debug.print("AF_PACKET read error: {}\n", .{err});
+            return;
+        };
+        if (!more) break;
+    }
 }
 
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
@@ -143,6 +150,14 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     _ = watcher;
     _ = revents;
     _ = global_stack.timer_queue.tick();
+}
+
+fn libev_safety_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
+    _ = loop;
+    _ = watcher;
+    _ = revents;
+    std.debug.print("Safety timeout reached. Aborting benchmark.\n", .{});
+    std.process.exit(1);
 }
 
 fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
@@ -171,8 +186,8 @@ const Benchmark = struct {
     target_ip: [4]u8,
     local_ip: [4]u8,
 
-    total_target: usize = 1000, 
-    concurrency_target: usize = 10, 
+    total_target: usize = 10000,
+    concurrency_target: usize = 10,
 
     active_count: usize = 0,
     completed_count: usize = 0,
@@ -183,12 +198,18 @@ const Benchmark = struct {
         std.debug.print("Benchmark started: Target={}, Concurrency={}\n", .{ self.total_target, self.concurrency_target });
         self.start_time = std.time.milliTimestamp();
         self.spawnBatch();
+        
+        // Add a safety timeout to the loop to prevent hanging forever
+        // If we don't complete in 30 seconds, abort.
+        // Or better, just print progress periodically if no events.
     }
 
     fn spawnBatch(self: *Benchmark) void {
         while (self.active_count < self.concurrency_target and self.completed_count + self.active_count < self.total_target) {
             self.spawnOne() catch |err| {
-                std.debug.print("Failed to spawn client: {}\n", .{err});
+                if (err != tcpip.Error.WouldBlock) {
+                    std.debug.print("Failed to spawn client: {}\n", .{err});
+                }
                 break;
             };
         }
@@ -205,8 +226,8 @@ const Benchmark = struct {
         self.active_count -= 1;
         if (success) self.completed_count += 1 else self.failed_count += 1;
 
-        if (self.completed_count % 10 == 0) {
-            std.debug.print("Progress: {}/{} (Active: {})\n", .{ self.completed_count, self.total_target, self.active_count });
+        if ((self.completed_count + self.failed_count) % 100 == 0) {
+            std.debug.print("Progress: {}/{} (Failed: {}, Active: {})\n", .{ self.completed_count, self.total_target, self.failed_count, self.active_count });
         }
 
         if (self.completed_count + self.failed_count >= self.total_target) {
@@ -214,7 +235,8 @@ const Benchmark = struct {
             std.debug.print("Benchmark Complete!\n", .{});
             std.debug.print("Total: {}, Success: {}, Failed: {}\n", .{ self.total_target, self.completed_count, self.failed_count });
             if (duration > 0) {
-                std.debug.print("Time: {} ms, Rate: {} req/s\n", .{ duration, @divTrunc(self.completed_count * 1000, @as(usize, @intCast(duration))) });
+                const dur_secs = @as(f64, @floatFromInt(duration)) / 1000.0;
+                std.debug.print("Time: {d:.3} s, Rate: {d:.2} req/s\n", .{ dur_secs, @as(f64, @floatFromInt(self.completed_count)) / dur_secs });
             }
             std.process.exit(0);
         } else {
@@ -262,11 +284,13 @@ const HttpClient = struct {
         switch (self.state) {
             .connecting => {
                 if (tcp_ep.state == .established) {
-                    // std.debug.print("Client: Connected!\n", .{});
                     self.state = .sending;
                     self.sendRequest();
                 } else if (tcp_ep.state == .error_state or tcp_ep.state == .closed) {
                     std.debug.print("Client: Connection failed (state={})\n", .{tcp_ep.state});
+                    if (tcp_ep.state == .error_state) {
+                         std.debug.print("Client: Retransmit count: {}\n", .{tcp_ep.retransmit_count});
+                    }
                     self.finish(false);
                 }
             },
@@ -328,6 +352,8 @@ const HttpServer = struct {
     allocator: std.mem.Allocator,
     mux: *EventMultiplexer,
     app_entry: AppEntry,
+    transaction_count: usize = 0,
+    max_transactions: usize = 10000,
 
     pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer) !*HttpServer {
         const self = try allocator.create(HttpServer);
@@ -357,8 +383,19 @@ const HttpServer = struct {
                 std.debug.print("Server accept error: {}\n", .{err});
                 return;
             };
-            std.debug.print("Server: Accepted connection\n", .{});
-            _ = Connection.init(self.allocator, res.ep, res.wq, self.mux) catch continue;
+            std.debug.print("Server: Accepted connection from {any}\n", .{res.ep.getRemoteAddress()});
+            _ = Connection.init(self.allocator, res.ep, res.wq, self.mux, self) catch continue;
+        }
+    }
+
+    pub fn onTransactionComplete(self: *HttpServer) void {
+        self.transaction_count += 1;
+        if (self.transaction_count % 100 == 0) {
+            std.debug.print("Server: Progress {}/{}\n", .{self.transaction_count, self.max_transactions});
+        }
+        if (self.transaction_count >= self.max_transactions) {
+            std.debug.print("Server: Max transactions reached ({}), exiting...\n", .{self.max_transactions});
+            std.process.exit(0);
         }
     }
 };
@@ -368,8 +405,9 @@ const Connection = struct {
     wq: *waiter.Queue,
     allocator: std.mem.Allocator,
     app_entry: AppEntry,
+    server_ref: *HttpServer,
 
-    pub fn init(allocator: std.mem.Allocator, ep: ustack.tcpip.Endpoint, wq: *waiter.Queue, mux: *EventMultiplexer) !*Connection {
+    pub fn init(allocator: std.mem.Allocator, ep: ustack.tcpip.Endpoint, wq: *waiter.Queue, mux: *EventMultiplexer, server: *HttpServer) !*Connection {
         const self = try allocator.create(Connection);
         self.* = .{
             .ep = ep,
@@ -379,6 +417,7 @@ const Connection = struct {
                 .wait_entry = waiter.Entry.initWithUpcall(null, mux, EventMultiplexer.upcall),
                 .ctx = .{ .connection = self },
             },
+            .server_ref = server,
         };
         wq.eventRegister(&self.app_entry.wait_entry, waiter.EventIn | waiter.EventHUp | waiter.EventErr);
         return self;
@@ -408,7 +447,9 @@ const Connection = struct {
         var p = Payloader{ .data = response };
         _ = self.ep.write(p.payloader(), .{}) catch {};
         self.allocator.free(buf);
+        const server = self.server_ref;
         self.close();
+        server.onTransactionComplete();
     }
 
     fn close(self: *Connection) void {

@@ -381,3 +381,78 @@ pub const UDPEndpoint = struct {
         return tcpip.Error.UnknownProtocol;
     }
 };
+
+test "UDP handlePacket" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+
+    var wq = waiter.Queue{};
+    var ep = try allocator.create(UDPEndpoint);
+    ep.* = UDPEndpoint.init(&s, &wq);
+    defer ep.transportEndpoint().close();
+
+    var fake_ep = struct {
+        fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            _ = ptr; _ = r; _ = protocol; _ = pkt; return;
+        }
+        fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
+            _ = ptr; _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{0} ** 6 }; }
+        fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
+        fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
+        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
+    }{};
+
+    const link_ep = stack.LinkEndpoint{
+        .ptr = &fake_ep,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_ep).writePacket,
+            .attach = @TypeOf(fake_ep).attach,
+            .linkAddress = @TypeOf(fake_ep).linkAddress,
+            .mtu = @TypeOf(fake_ep).mtu,
+            .setMTU = @TypeOf(fake_ep).setMTU,
+            .capabilities = @TypeOf(fake_ep).capabilities,
+        },
+    };
+
+    const nic = try s.allocator.create(stack.NIC);
+    defer s.allocator.destroy(nic);
+    nic.* = stack.NIC.init(&s, 1, "test0", link_ep, false);
+    defer nic.deinit();
+
+    const r = stack.Route{
+        .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
+        .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = nic,
+    };
+
+    var udp_data = [_]u8{0} ** 12;
+    _ = header.UDP.init(&udp_data);
+    std.mem.writeInt(u16, udp_data[0..2], 1234, .big);
+    std.mem.writeInt(u16, udp_data[2..4], 80, .big);
+    std.mem.writeInt(u16, udp_data[4..6], 12, .big);
+
+    var views = [_]buffer.View{&udp_data};
+    const pkt = tcpip.PacketBuffer{
+        .data = buffer.VectorisedView.init(12, &views),
+        .header = buffer.Prependable.init(&[_]u8{}),
+    };
+
+    const id = stack.TransportEndpointID{
+        .local_port = 80,
+        .local_address = r.local_address,
+        .remote_port = 1234,
+        .remote_address = r.remote_address,
+    };
+
+    ep.transportEndpoint().handlePacket(&r, id, pkt);
+
+    try std.testing.expect(ep.rcv_list.first != null);
+    const p = ep.rcv_list.first.?.data;
+    try std.testing.expectEqual(@as(u16, 1234), p.sender_addr.port);
+    try std.testing.expectEqual(@as(usize, 4), p.data.size);
+}

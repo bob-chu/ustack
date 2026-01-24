@@ -7,7 +7,7 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
     var s = try stack.Stack.init(allocator);
 
-    var xdp = try AfXdpEndpoint.init("eth0");
+    var xdp = try AfXdpEndpoint.init(allocator, "eth0");
     try s.createNIC(1, xdp.linkEndpoint());
 
     std.debug.print("Example: AF_XDP + LibUV starting...\n", .{});
