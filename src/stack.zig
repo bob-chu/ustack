@@ -587,8 +587,19 @@ pub const Stack = struct {
          
         const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
         
+        var final_local_addr = local_addr;
+        if (final_local_addr.isAny()) {
+            // Find address on the NIC that matches the protocol
+            for (nic.addresses.items) |addr| {
+                if (addr.protocol == net_proto) {
+                    final_local_addr = addr.address_with_prefix.address;
+                    break;
+                }
+            }
+        }
+
         return Route{
-            .local_address = local_addr,
+            .local_address = final_local_addr,
             .remote_address = remote_addr,
             .local_link_address = nic.linkEP.linkAddress(),
             .net_proto = net_proto,
@@ -666,7 +677,6 @@ pub const Stack = struct {
             ep.handlePacket(r, id, pkt);
             ep.decRef();
         } else {
-            std.debug.print("Stack: No endpoint for id={any}\n", .{id});
             // Try global handler first (for ICMP, etc)
             if (proto.vtable.handlePacket) |handle| {
                 handle(proto.ptr, r, id, pkt);

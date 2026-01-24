@@ -78,7 +78,6 @@ pub const Queue = struct {
 
     pub fn notify(self: *Queue, mask: EventMask) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.ready_mask |= mask;
 
         var current = self.head;
@@ -86,11 +85,14 @@ pub const Queue = struct {
             const next = e.next;
             if ((mask & e.mask) != 0) {
                 if (e.callback) |cb| {
+                    self.mutex.unlock();
                     cb(e);
+                    self.mutex.lock();
                 }
             }
             current = next;
         }
+        self.mutex.unlock();
     }
 
     pub fn clear(self: *Queue, mask: EventMask) void {

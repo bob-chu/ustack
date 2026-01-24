@@ -16,6 +16,13 @@ pub const Address = union(enum) {
         };
     }
 
+    pub fn isAny(self: Address) bool {
+        return switch (self) {
+            .v4 => |v| std.mem.eql(u8, &v, &[_]u8{ 0, 0, 0, 0 }),
+            .v6 => |v| std.mem.eql(u8, &v, &[_]u8{0} ** 16),
+        };
+    }
+
     pub fn toSolicitedNodeMulticast(self: Address) Address {
         const v6 = switch (self) {
             .v4 => unreachable,

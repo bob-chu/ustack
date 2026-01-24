@@ -228,7 +228,13 @@ pub const TCPEndpoint = struct {
 
     pub fn checkRetransmit(self: *TCPEndpoint) tcpip.Error!void {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        var notify_mask: waiter.EventMask = 0;
+        defer {
+            self.mutex.unlock();
+            if (notify_mask != 0) {
+                self.waiter_queue.notify(notify_mask);
+            }
+        }
         
         const now = std.time.milliTimestamp();
         var it = self.snd_queue.first;
@@ -241,7 +247,7 @@ pub const TCPEndpoint = struct {
                     node.data.data.deinit();
                     self.stack.allocator.destroy(node);
                 }
-                self.waiter_queue.notify(waiter.EventErr);
+                notify_mask = waiter.EventErr;
                 return;
             }
         } else {
@@ -624,7 +630,13 @@ pub const TCPEndpoint = struct {
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
         self.mutex.lock();
-        defer self.mutex.unlock();
+        var notify_mask: waiter.EventMask = 0;
+        defer {
+            self.mutex.unlock();
+            if (notify_mask != 0) {
+                self.waiter_queue.notify(notify_mask);
+            }
+        }
 
         const v = pkt.data.first() orelse return;
         const h = header.TCP.init(v);
@@ -632,7 +644,7 @@ pub const TCPEndpoint = struct {
         
         if (fl & header.TCPFlagRst != 0) {
             self.state = .error_state;
-            self.waiter_queue.notify(waiter.EventErr);
+            notify_mask |= waiter.EventErr;
             return;
         }
 
@@ -706,13 +718,14 @@ pub const TCPEndpoint = struct {
                     reply_h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
                     
                     var opt_ptr = reply_h.data[20..];
-                    // MSS
+                    // MSS Option
                     opt_ptr[0] = 2; opt_ptr[1] = 4;
                     std.mem.writeInt(u16, opt_ptr[2..4], 1460, .big);
                     opt_ptr = opt_ptr[4..];
 
-                    // WScale
-                    opt_ptr[0] = 1; opt_ptr[1] = 3; opt_ptr[2] = 3; opt_ptr[3] = self.rcv_wnd_scale;
+                    // WScale Option
+                    opt_ptr[0] = 1; opt_ptr[1] = 3; opt_ptr[2] = 3;
+                    opt_ptr[3] = self.rcv_wnd_scale;
                     opt_ptr = opt_ptr[4..];
 
                     if (entry.ts_enabled) {
@@ -720,8 +733,9 @@ pub const TCPEndpoint = struct {
                         std.mem.writeInt(u32, opt_ptr[4..8], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
                         std.mem.writeInt(u32, opt_ptr[8..12], entry.ts_recent, .big);
                     }
+
                     reply_h.setChecksum(reply_h.calculateChecksum(id.local_address.v4, id.remote_address.v4, &[_]u8{}));
-                    
+
                     const pb = tcpip.PacketBuffer{
                         .data = .{.views = &[_]buffer.View{}, .size = 0},
                         .header = pre,
@@ -768,7 +782,7 @@ pub const TCPEndpoint = struct {
                         const node = self.stack.allocator.create(std.TailQueue(tcpip.AcceptReturn).Node) catch return;
                         node.data = .{ .ep = new_ep.endpoint(), .wq = new_wq };
                         self.accepted_queue.append(node);
-                        self.waiter_queue.notify(waiter.EventIn);
+                        notify_mask |= waiter.EventIn;
                     }
                 }
             },
@@ -801,7 +815,7 @@ pub const TCPEndpoint = struct {
                         self.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(self.snd_wnd_scale));
 
                         self.sendControl(header.TCPFlagAck) catch {};
-                        self.waiter_queue.notify(waiter.EventOut);
+                        notify_mask |= waiter.EventOut;
                     } else {
                         std.debug.print("TCP: SYN-ACK ack mismatch: ack={}, snd_nxt={}\n", .{h.ackNumber(), self.snd_nxt});
                     }
@@ -834,10 +848,8 @@ pub const TCPEndpoint = struct {
                         if (self.rcv_packets_since_ack >= 2) {
                             self.sendControl(header.TCPFlagAck) catch {};
                         }
-                        self.waiter_queue.notify(waiter.EventIn);
+                        notify_mask |= waiter.EventIn;
                     }
-                } else if (pkt.data.size - h.dataOffset() > 0) {
-                     std.debug.print("TCP: Drop out-of-order data. seq={}, rcv_nxt={}\n", .{h.sequenceNumber(), self.rcv_nxt});
                 }
 
                 // Always check for ACK processing (piggybacked or pure)
@@ -903,7 +915,7 @@ pub const TCPEndpoint = struct {
                                 self.stack.timer_queue.schedule(&self.retransmit_timer, 200);
                             }
                             self.cc.onAck(diff);
-                            self.waiter_queue.notify(waiter.EventOut);
+                            notify_mask |= waiter.EventOut;
                         }
                     }
                 }
@@ -913,7 +925,7 @@ pub const TCPEndpoint = struct {
                     self.state = .close_wait;
                     self.sendControl(header.TCPFlagAck) catch {};
                     self.rcv_packets_since_ack = 0;
-                    self.waiter_queue.notify(waiter.EventIn | waiter.EventHUp);
+                    notify_mask |= waiter.EventIn | waiter.EventHUp;
                 }
             },
             .fin_wait1 => {
@@ -950,7 +962,7 @@ pub const TCPEndpoint = struct {
                  if (fl & header.TCPFlagAck != 0) {
                     if (h.ackNumber() == self.snd_nxt) {
                         self.state = .closed;
-                        self.waiter_queue.notify(waiter.EventHUp);
+                        notify_mask |= waiter.EventHUp;
                     }
                 }
 
@@ -961,7 +973,7 @@ pub const TCPEndpoint = struct {
         if (self.state == .time_wait) {
             // Simplify: just go to closed
             self.state = .closed;
-            self.waiter_queue.notify(waiter.EventHUp);
+            notify_mask |= waiter.EventHUp;
         }
     }
 

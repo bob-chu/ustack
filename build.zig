@@ -41,7 +41,6 @@ pub fn build(b: *std.Build) void {
     const examples = [_]struct { name: []const u8, path: []const u8, lib: []const u8 }{
         .{ .name = "example_tap_libev", .path = "examples/main_tap_libev.zig", .lib = "ev" },
         .{ .name = "example_tap_libev_mux", .path = "examples/main_tap_libev_mux.zig", .lib = "ev" },
-        .{ .name = "example_loopback_libev_mux", .path = "examples/main_loopback_libev_mux.zig", .lib = "ev" },
         .{ .name = "example_af_packet_libev", .path = "examples/main_af_packet_libev.zig", .lib = "ev" },
         .{ .name = "example_af_xdp_libev", .path = "examples/main_af_xdp_libev.zig", .lib = "ev" },
     };
@@ -58,7 +57,10 @@ pub fn build(b: *std.Build) void {
         exe.linkLibC();
 
         exe.linkSystemLibrary(ex.lib);
-        if (std.mem.eql(u8, ex.name, "example_tap_libev") or std.mem.eql(u8, ex.name, "example_tap_libev_mux") or std.mem.eql(u8, ex.name, "example_loopback_libev_mux")) {
+        if (std.mem.eql(u8, ex.name, "example_tap_libev") or 
+            std.mem.eql(u8, ex.name, "example_tap_libev_mux") or 
+            std.mem.eql(u8, ex.name, "example_af_packet_libev") or
+            std.mem.eql(u8, ex.name, "example_af_xdp_libev")) {
             exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
         }
         const install = b.addInstallArtifact(exe, .{});

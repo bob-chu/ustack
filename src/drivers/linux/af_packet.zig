@@ -113,28 +113,23 @@ pub const AfPacket = struct {
         };
         if (len == 0) return;
 
-        if (len < header.EthernetMinimumSize) return;
-        const eth = header.Ethernet.init(buf[0..len]);
-        const eth_type = eth.etherType();
+        // Pass the FULL frame to the dispatcher (EthernetEndpoint expects it)
+        const frame_buf = try std.heap.page_allocator.alloc(u8, len);
+        @memcpy(frame_buf, buf[0..len]);
         
-        // Skip own packets (loopback prevention if needed, though SOCK_RAW normally doesn't loop back unicast to self unless promiscuous)
-        // But for AF_PACKET, we usually see everything.
-        
-        const payload_buf = try std.heap.page_allocator.alloc(u8, len - header.EthernetMinimumSize);
-        @memcpy(payload_buf, buf[header.EthernetMinimumSize..len]);
-        
-        var views = [1]buffer.View{payload_buf};
+        var views = [1]buffer.View{frame_buf};
         const pkt = tcpip.PacketBuffer{
-            .data = buffer.VectorisedView.init(payload_buf.len, &views),
+            .data = buffer.VectorisedView.init(frame_buf.len, &views),
             .header = buffer.Prependable.init(&[_]u8{}),
         };
         
         if (self.dispatcher) |d| {
-            const src = tcpip.LinkAddress{ .addr = eth.sourceAddress() };
-            const dst = tcpip.LinkAddress{ .addr = eth.destinationAddress() };
-            d.deliverNetworkPacket(&src, &dst, eth_type, pkt);
+            // We pass dummy MACs/type because EthernetEndpoint will parse the real ones from the frame
+            const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
+            d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, pkt);
         }
-        std.heap.page_allocator.free(payload_buf);
+        
+        std.heap.page_allocator.free(frame_buf);
     }
     
     // Helpers for IOCTL
@@ -142,9 +137,9 @@ pub const AfPacket = struct {
         var ifr: std.os.linux.ifreq = undefined;
         @memset(std.mem.asBytes(&ifr), 0);
         const copy_len = @min(name.len, 15);
-        @memcpy(ifr.ifr_ifrn.name[0..copy_len], name[0..copy_len]);
+        @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
         
-        try ioctl(fd, std.os.linux.SIOCGIFINDEX, @intFromPtr(&ifr));
+        try ioctl(fd, 0x8933, @intFromPtr(&ifr)); // SIOCGIFINDEX
         return ifr.ifru.ivalue;
     }
     
@@ -152,11 +147,14 @@ pub const AfPacket = struct {
         var ifr: std.os.linux.ifreq = undefined;
         @memset(std.mem.asBytes(&ifr), 0);
         const copy_len = @min(name.len, 15);
-        @memcpy(ifr.ifr_ifrn.name[0..copy_len], name[0..copy_len]);
+        @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
         
-        try ioctl(fd, std.os.linux.SIOCGIFHWADDR, @intFromPtr(&ifr));
+        try ioctl(fd, 0x8927, @intFromPtr(&ifr)); // SIOCGIFHWADDR
         var mac: [6]u8 = undefined;
-        @memcpy(&mac, ifr.ifru.hwaddr.sa_data[0..6]);
+        // In libc's ifreq, hwaddr is a sockaddr, and MAC is in sa_data[0..6]
+        // We use a raw pointer to get the data from the sockaddr part.
+        const sockaddr_ptr = @as([*]const u8, @ptrCast(&ifr.ifru.hwaddr));
+        @memcpy(&mac, sockaddr_ptr[2..8]); // sockaddr.family is 2 bytes, then data
         return mac;
     }
     
