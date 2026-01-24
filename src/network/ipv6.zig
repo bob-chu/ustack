@@ -68,7 +68,7 @@ pub const IPv6Protocol = struct {
         // Option: Source Link-Layer Address
         buf[header.ICMPv6MinimumSize + 20] = header.ICMPv6OptionSourceLinkLayerAddress;
         buf[header.ICMPv6MinimumSize + 21] = 1;
-        @memcpy(buf[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28], &nic.linkEP.linkAddress());
+        @memcpy(buf[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28], &nic.linkEP.linkAddress().addr);
         
         const c = icmp_h.calculateChecksum(src, dst, buf[header.ICMPv6MinimumSize..]);
         icmp_h.setChecksum(c);
@@ -87,7 +87,7 @@ pub const IPv6Protocol = struct {
             .remote_address = .{ .v6 = dst },
             .local_link_address = nic.linkEP.linkAddress(),
             // Ethernet multicast for IPv6: 33:33: + last 32 bits of IPv6 address
-            .remote_link_address = [_]u8{ 0x33, 0x33, dst[12], dst[13], dst[14], dst[15] },
+            .remote_link_address = tcpip.LinkAddress{ .addr = [_]u8{ 0x33, 0x33, dst[12], dst[13], dst[14], dst[15] } },
             .net_proto = ProtocolNumber,
             .nic = nic,
         };
@@ -141,7 +141,7 @@ pub const IPv6Protocol = struct {
             .local_address = .{ .v6 = src },
             .remote_address = .{ .v6 = dst },
             .local_link_address = nic.linkEP.linkAddress(),
-            .remote_link_address = [_]u8{ 0x33, 0x33, dst[12], dst[13], dst[14], dst[15] },
+            .remote_link_address = tcpip.LinkAddress{ .addr = [_]u8{ 0x33, 0x33, dst[12], dst[13], dst[14], dst[15] } },
             .net_proto = ProtocolNumber,
             .nic = nic,
         };
@@ -190,7 +190,7 @@ pub const IPv6Protocol = struct {
         // Option: Source Link-Layer Address
         buf[header.ICMPv6MinimumSize + 4] = header.ICMPv6OptionSourceLinkLayerAddress;
         buf[header.ICMPv6MinimumSize + 5] = 1;
-        @memcpy(buf[header.ICMPv6MinimumSize + 6 .. header.ICMPv6MinimumSize + 12], &nic.linkEP.linkAddress());
+        @memcpy(buf[header.ICMPv6MinimumSize + 6 .. header.ICMPv6MinimumSize + 12], &nic.linkEP.linkAddress().addr);
         
         const c = icmp_h.calculateChecksum(src, dst, buf[header.ICMPv6MinimumSize..]);
         icmp_h.setChecksum(c);
@@ -208,7 +208,7 @@ pub const IPv6Protocol = struct {
             .local_address = .{ .v6 = src },
             .remote_address = .{ .v6 = dst },
             .local_link_address = nic.linkEP.linkAddress(),
-            .remote_link_address = [_]u8{ 0x33, 0x33, 0, 0, 0, 2 },
+            .remote_link_address = tcpip.LinkAddress{ .addr = [_]u8{ 0x33, 0x33, 0, 0, 0, 2 } },
             .net_proto = ProtocolNumber,
             .nic = nic,
         };

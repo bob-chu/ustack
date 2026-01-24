@@ -9,9 +9,9 @@ const buffer = ustack.buffer;
 // Conceptual AF_XDP (Express Data Path) wrapper for Zig
 // Real implementation requires libxdp/libbpf or manual ring management
 pub const AfXdpEndpoint = struct {
-    xsk_fd: std.os.fd_t,
+    xsk_fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
-    address: [6]u8 = [_]u8{ 0, 0, 0, 0, 0, 0 },
+    address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     
     // XDP Rings (Conceptual)
     // fill_ring: *XskRing,
@@ -27,7 +27,7 @@ pub const AfXdpEndpoint = struct {
         // 2. Map UMEM (Shared memory)
         // 3. Initialize Rings
         // 4. Bind to interface/queue
-        const fd: std.os.fd_t = 0; // Mocked
+        const fd: std.posix.fd_t = 0; // Mocked
         return AfXdpEndpoint{ .xsk_fd = fd };
     }
 

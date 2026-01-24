@@ -9,7 +9,7 @@ const buffer = @import("../../buffer.zig");
 pub const AfPacket = struct {
     fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
-    address: [6]u8 = [_]u8{ 0, 0, 0, 0, 0, 0 },
+    address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     if_index: i32,
     
     dispatcher: ?*stack.NetworkDispatcher = null,
@@ -44,7 +44,7 @@ pub const AfPacket = struct {
         return AfPacket{
             .fd = fd,
             .if_index = if_index,
-            .address = mac,
+            .address = .{ .addr = mac },
         };
     }
 
@@ -130,7 +130,9 @@ pub const AfPacket = struct {
         };
         
         if (self.dispatcher) |d| {
-            d.deliverNetworkPacket(eth.sourceAddress(), eth.destinationAddress(), eth_type, pkt);
+            const src = tcpip.LinkAddress{ .addr = eth.sourceAddress() };
+            const dst = tcpip.LinkAddress{ .addr = eth.destinationAddress() };
+            d.deliverNetworkPacket(&src, &dst, eth_type, pkt);
         }
         std.heap.page_allocator.free(payload_buf);
     }

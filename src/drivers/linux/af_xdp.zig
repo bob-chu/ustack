@@ -16,7 +16,7 @@ const buffer = @import("../../buffer.zig");
 pub const AfXdp = struct {
     xsk_fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
-    address: [6]u8 = [_]u8{ 0, 0, 0, 0, 0, 0 },
+    address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     
     dispatcher: ?*stack.NetworkDispatcher = null,
 

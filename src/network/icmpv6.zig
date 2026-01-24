@@ -138,7 +138,7 @@ pub const ICMPv6PacketHandler = struct {
                 if (!src_is_unspecified and v.len >= header.ICMPv6MinimumSize + 28) {
                     if (v[header.ICMPv6MinimumSize + 20] == header.ICMPv6OptionSourceLinkLayerAddress) {
                         var mac: tcpip.LinkAddress = undefined;
-                        @memcpy(&mac, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
+                        @memcpy(&mac.addr, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
                         s.mutex.lock();
                         s.link_addr_cache.put(r.remote_address, mac) catch {};
                         s.mutex.unlock();
@@ -166,7 +166,7 @@ pub const ICMPv6PacketHandler = struct {
                     
                     na_buf[header.ICMPv6MinimumSize + 20] = header.ICMPv6OptionTargetLinkLayerAddress;
                     na_buf[header.ICMPv6MinimumSize + 21] = 1;
-                    @memcpy(na_buf[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28], &r.nic.linkEP.linkAddress());
+                    @memcpy(na_buf[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28], &r.nic.linkEP.linkAddress().addr);
                     
                     const src = target;
                     const dst = if (is_dad) ([_]u8{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }) else r.remote_address.v6;
@@ -187,7 +187,7 @@ pub const ICMPv6PacketHandler = struct {
                         .local_address = .{ .v6 = src },
                         .remote_address = .{ .v6 = dst },
                         .local_link_address = r.nic.linkEP.linkAddress(),
-                        .remote_link_address = if (is_dad) [_]u8{ 0x33, 0x33, 0, 0, 0, 1 } else r.remote_link_address,
+                        .remote_link_address = if (is_dad) tcpip.LinkAddress{ .addr = [_]u8{ 0x33, 0x33, 0, 0, 0, 1 } } else r.remote_link_address,
                         .net_proto = 0x86dd,
                         .nic = r.nic,
                     };
@@ -205,7 +205,7 @@ pub const ICMPv6PacketHandler = struct {
                 if (v.len >= header.ICMPv6MinimumSize + 28) {
                     if (v[header.ICMPv6MinimumSize + 20] == header.ICMPv6OptionTargetLinkLayerAddress) {
                         var mac: tcpip.LinkAddress = undefined;
-                        @memcpy(&mac, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
+                        @memcpy(&mac.addr, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
                         
                         s.mutex.lock();
                         s.link_addr_cache.put(.{ .v6 = target }, mac) catch {};
@@ -256,14 +256,14 @@ pub const ICMPv6PacketHandler = struct {
                                 var new_addr = prefix;
                                 const mac = r.nic.linkEP.linkAddress();
                                 // Modified EUI-64
-                                new_addr[8] = mac[0] ^ 0x02;
-                                new_addr[9] = mac[1];
-                                new_addr[10] = mac[2];
+                                new_addr[8] = mac.addr[0] ^ 0x02;
+                                new_addr[9] = mac.addr[1];
+                                new_addr[10] = mac.addr[2];
                                 new_addr[11] = 0xff;
                                 new_addr[12] = 0xfe;
-                                new_addr[13] = mac[3];
-                                new_addr[14] = mac[4];
-                                new_addr[15] = mac[5];
+                                new_addr[13] = mac.addr[3];
+                                new_addr[14] = mac.addr[4];
+                                new_addr[15] = mac.addr[5];
                                 
                                 if (!r.nic.hasAddress(.{ .v6 = new_addr })) {
                                     r.nic.addAddress(.{
@@ -316,7 +316,7 @@ test "ICMPv6 Neighbor Discovery" {
             return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void { _ = ptr; _ = dispatcher; }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return [_]u8{1, 2, 3, 4, 5, 6}; }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{1, 2, 3, 4, 5, 6} }; }
         fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
         fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
         fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
@@ -365,8 +365,8 @@ test "ICMPv6 Neighbor Discovery" {
     const r = stack.Route{
         .local_address = .{ .v6 = my_addr },
         .remote_address = .{ .v6 = sender_addr },
-        .local_link_address = [_]u8{1, 2, 3, 4, 5, 6},
-        .remote_link_address = sender_mac,
+        .local_link_address = .{ .addr = [_]u8{1, 2, 3, 4, 5, 6} },
+        .remote_link_address = .{ .addr = sender_mac },
         .net_proto = 0x86dd,
         .nic = nic,
     };
@@ -381,7 +381,7 @@ test "ICMPv6 Neighbor Discovery" {
     
     const learned_mac = s.link_addr_cache.get(.{ .v6 = sender_addr });
     try std.testing.expect(learned_mac != null);
-    try std.testing.expectEqualStrings(&sender_mac, &learned_mac.?);
+    try std.testing.expectEqualStrings(&sender_mac, &learned_mac.?.addr);
     
     try std.testing.expect(fake_link.last_pkt != null);
     const na_pkt_data = fake_link.last_pkt.?;
@@ -424,7 +424,7 @@ test "ICMPv6 Router Advertisement & SLAAC" {
             return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void { _ = ptr; _ = dispatcher; }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return [_]u8{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}; }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{0x02, 0x00, 0x00, 0x00, 0x00, 0x02} }; }
         fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
         fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
         fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
@@ -481,8 +481,8 @@ test "ICMPv6 Router Advertisement & SLAAC" {
     const r = stack.Route{
         .local_address = .{ .v6 = my_ll_addr },
         .remote_address = .{ .v6 = router_addr },
-        .local_link_address = [_]u8{0x02, 0x00, 0x00, 0x00, 0x00, 0x02},
-        .remote_link_address = router_mac,
+        .local_link_address = .{ .addr = [_]u8{0x02, 0x00, 0x00, 0x00, 0x00, 0x02} },
+        .remote_link_address = .{ .addr = router_mac },
         .net_proto = 0x86dd,
         .nic = nic,
     };

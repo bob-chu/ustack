@@ -35,27 +35,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_main_tests.step);
 
-    const example = b.addExecutable(.{
-        .name = "example_af_packet",
-        .root_source_file = b.path("examples/main_af_packet_libuv.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    example.root_module.addImport("ustack", ustack_mod);
-    example.linkLibrary(lib); // Link against static lib to enforce library usage
-    example.linkLibC();
-
-    example.linkSystemLibrary("uv");
-
-    const install_example = b.addInstallArtifact(example, .{});
-    const example_step = b.step("example", "Build AF_PACKET libuv example");
-    example_step.dependOn(&install_example.step);
+    const example_step = b.step("example", "Build libev examples");
 
     // Add other examples
     const examples = [_]struct { name: []const u8, path: []const u8, lib: []const u8 }{
         .{ .name = "example_tap_libev", .path = "examples/main_tap_libev.zig", .lib = "ev" },
+        .{ .name = "example_tap_libev_mux", .path = "examples/main_tap_libev_mux.zig", .lib = "ev" },
+        .{ .name = "example_loopback_libev_mux", .path = "examples/main_loopback_libev_mux.zig", .lib = "ev" },
         .{ .name = "example_af_packet_libev", .path = "examples/main_af_packet_libev.zig", .lib = "ev" },
-        .{ .name = "example_af_xdp_libuv", .path = "examples/main_af_xdp_libuv.zig", .lib = "uv" },
         .{ .name = "example_af_xdp_libev", .path = "examples/main_af_xdp_libev.zig", .lib = "ev" },
     };
 
@@ -67,11 +54,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         exe.root_module.addImport("ustack", ustack_mod);
-        exe.linkLibrary(lib);
+        // exe.linkLibrary(lib);
         exe.linkLibC();
 
         exe.linkSystemLibrary(ex.lib);
-        if (std.mem.eql(u8, ex.name, "example_tap_libev")) {
+        if (std.mem.eql(u8, ex.name, "example_tap_libev") or std.mem.eql(u8, ex.name, "example_tap_libev_mux") or std.mem.eql(u8, ex.name, "example_loopback_libev_mux")) {
             exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
         }
         const install = b.addInstallArtifact(exe, .{});

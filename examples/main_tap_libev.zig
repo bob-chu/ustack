@@ -232,12 +232,14 @@ fn doHttpClient(s: *stack.Stack) !void {
             }
             break;
         };
+        defer s.allocator.free(view);
         if (view.len == 0) {
             std.debug.print("EOF reached (peer closed connection)\n", .{});
             break;
         }
         total_received += view.len;
-        std.debug.print("Received {} bytes\n", .{ view.len });
+        std.debug.print("{s}", .{view});
+        // std.debug.print("Received {} bytes\n", .{ view.len });
 
         // Stop after receiving reasonable amount of data
         if (total_received > 20000) break;

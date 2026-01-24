@@ -221,7 +221,7 @@ test "DNS Query and Response Parsing" {
             return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void { _ = ptr; _ = dispatcher; }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return [_]u8{1, 2, 3, 4, 5, 6}; }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{1, 2, 3, 4, 5, 6} }; }
         fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
         fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
         fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
@@ -254,7 +254,7 @@ test "DNS Query and Response Parsing" {
         .mtu = 1500,
     });
     // Add ARP entry for gateway
-    try s.addLinkAddress(.{ .v4 = .{ 10, 0, 0, 254 } }, [_]u8{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF});
+    try s.addLinkAddress(.{ .v4 = .{ 10, 0, 0, 254 } }, .{ .addr = [_]u8{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF} });
 
     const dns_server = tcpip.Address{ .v4 = .{ 8, 8, 8, 8 } };
     var resolver = Resolver.init(&s, dns_server);
@@ -360,8 +360,8 @@ test "DNS Query and Response Parsing" {
     const r = stack.Route{
         .local_address = .{ .v4 = .{10,0,0,1} },
         .remote_address = .{ .v4 = .{8,8,8,8} },
-        .local_link_address = [_]u8{1,2,3,4,5,6},
-        .remote_link_address = [_]u8{0xAA,0xBB,0xCC,0xDD,0xEE,0xFF},
+        .local_link_address = .{ .addr = [_]u8{1,2,3,4,5,6} },
+        .remote_link_address = .{ .addr = [_]u8{0xAA,0xBB,0xCC,0xDD,0xEE,0xFF} },
         .net_proto = 0x0800,
         .nic = nic,
     };

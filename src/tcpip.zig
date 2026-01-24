@@ -33,7 +33,12 @@ pub const Address = union(enum) {
     }
 };
 
-pub const LinkAddress = [6]u8;
+pub const LinkAddress = struct {
+    addr: [6]u8,
+    pub fn eq(self: LinkAddress, other: LinkAddress) bool {
+        return std.mem.eql(u8, &self.addr, &other.addr);
+    }
+};
 
 pub const FullAddress = struct {
     nic: NICID,

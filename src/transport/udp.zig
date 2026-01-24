@@ -61,6 +61,7 @@ pub const UDPEndpoint = struct {
     remote_addr: ?tcpip.FullAddress = null,
 
     pub fn init(s: *stack.Stack, wq: *waiter.Queue) UDPEndpoint {
+        wq.notify(waiter.EventOut);
         return .{
             .stack = s,
             .waiter_queue = wq,
@@ -251,6 +252,9 @@ pub const UDPEndpoint = struct {
         defer self.mutex.unlock();
 
         const node = self.rcv_list.popFirst() orelse return tcpip.Error.WouldBlock;
+        if (self.rcv_list.first == null) {
+            self.waiter_queue.clear(waiter.EventIn);
+        }
         defer {
             node.data.data.deinit();
             self.stack.allocator.destroy(node);

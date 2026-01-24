@@ -24,7 +24,7 @@ pub fn main() !void {
 
     // 2. Open TUN device (mocked)
     // In real code: open /dev/net/tun, ioctl(...)
-    const tun_fd: std.os.fd_t = 0; // StdIn as placeholder
+    const tun_fd: std.posix.fd_t = 0; // StdIn as placeholder
     var tun_ep = TunTapEndpoint.initFromFd(tun_fd);
     
     // 3. Register NIC

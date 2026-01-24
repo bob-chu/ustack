@@ -20,7 +20,7 @@ pub fn main() !void {
     defer s.deinit();
 
     // Setup TAP (from adapter)
-    const tap_fd: std.os.fd_t = 0;
+    const tap_fd: std.posix.fd_t = 0;
     var tap_ep = TunTapEndpoint.initFromFd(tap_fd);
     try s.createNIC(1, tap_ep.linkEndpoint());
 

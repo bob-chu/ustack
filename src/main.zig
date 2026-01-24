@@ -27,12 +27,15 @@ pub const link = struct {
     pub const eth = @import("link/eth.zig");
 };
 pub const dns = @import("dns.zig");
+pub const posix = @import("posix.zig");
+pub const event_mux = @import("event_mux.zig");
 
-pub const drivers = if (builtin.os.tag == .linux) struct {
-    pub const tap = @import("drivers/linux/tap.zig");
-    pub const af_packet = @import("drivers/linux/af_packet.zig");
-    pub const af_xdp = @import("drivers/linux/af_xdp.zig");
-} else struct {};
+pub const drivers = struct {
+    pub const loopback = @import("drivers/loopback.zig");
+    pub const tap = if (builtin.os.tag == .linux) @import("drivers/linux/tap.zig") else struct {};
+    pub const af_packet = if (builtin.os.tag == .linux) @import("drivers/linux/af_packet.zig") else struct {};
+    pub const af_xdp = if (builtin.os.tag == .linux) @import("drivers/linux/af_xdp.zig") else struct {};
+};
 
 pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     var s = try stack.Stack.init(allocator);

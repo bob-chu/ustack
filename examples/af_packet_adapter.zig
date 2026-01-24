@@ -8,9 +8,9 @@ const buffer = ustack.buffer;
 
 // Linux AF_PACKET wrapper
 pub const AfPacketEndpoint = struct {
-    fd: std.os.fd_t,
+    fd: std.posix.fd_t,
     mtu_val: u32 = 1500,
-    address: [6]u8 = [_]u8{ 0, 0, 0, 0, 0, 0 },
+    address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     
     dispatcher: ?*stack.NetworkDispatcher = null,
     wrapped_dispatcher: stack.NetworkDispatcher = undefined,
@@ -19,20 +19,20 @@ pub const AfPacketEndpoint = struct {
         _ = if_index;
         // socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
         // Simplified for example: using mock FD or standard socket creation if available
-        // Zig's std.os.socket supports AF_PACKET on Linux
+        // Zig's std.posix.socket supports AF_PACKET on Linux
         
-        // const fd = try std.os.socket(std.os.AF.PACKET, std.os.SOCK.RAW, std.mem.nativeToBig(u16, 0x0003)); // ETH_P_ALL
+        // const fd = try std.posix.socket(std.posix.AF.PACKET, std.posix.SOCK.RAW, std.mem.nativeToBig(u16, 0x0003)); // ETH_P_ALL
         
         // Bind to interface
-        // var addr = std.os.sockaddr.ll{
-        //     .family = std.os.AF.PACKET,
+        // var addr = std.posix.sockaddr.ll{
+        //     .family = std.posix.AF.PACKET,
         //     .protocol = std.mem.nativeToBig(u16, 0x0003),
         //     .ifindex = if_index,
         //     ...
         // };
-        // try std.os.bind(fd, &addr.any, @sizeOf(std.os.sockaddr.ll));
+        // try std.posix.bind(fd, &addr.any, @sizeOf(std.posix.sockaddr.ll));
         
-        const fd: std.os.fd_t = 0; // Mocked
+        const fd: std.posix.fd_t = 0; // Mocked
         
         return AfPacketEndpoint{
             .fd = fd,
@@ -69,7 +69,7 @@ pub const AfPacketEndpoint = struct {
         @memcpy(buf[hdr_len..], view);
         
         // sendto/write to raw socket
-        _ = std.os.write(self.fd, buf) catch return tcpip.Error.UnknownDevice;
+        _ = std.posix.write(self.fd, buf) catch return tcpip.Error.UnknownDevice;
     }
 
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
@@ -100,23 +100,25 @@ pub const AfPacketEndpoint = struct {
     pub fn onReadable(self: *AfPacketEndpoint) !void {
         var buf: [9000]u8 = undefined;
         // recvfrom(fd, ...)
-        const len = try std.os.read(self.fd, &buf);
+        const len = try std.posix.read(self.fd, &buf);
         if (len < header.EthernetMinimumSize) return;
         
         const eth = header.Ethernet.init(buf[0..len]);
         const eth_type = eth.etherType();
         
-        var payload_buf = std.heap.page_allocator.alloc(u8, len - header.EthernetMinimumSize) catch return;
+        const payload_buf = std.heap.page_allocator.alloc(u8, len - header.EthernetMinimumSize) catch return;
         @memcpy(payload_buf, buf[header.EthernetMinimumSize..len]);
         
-        var views = [_]buffer.View{payload_buf};
-        var pkt = tcpip.PacketBuffer{
+        const views = [_]buffer.View{payload_buf};
+        const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(payload_buf.len, &views),
             .header = undefined,
         };
         
         if (self.dispatcher) |d| {
-            d.deliverNetworkPacket(eth.sourceAddress(), eth.destinationAddress(), eth_type, pkt);
+            const src = tcpip.LinkAddress{ .addr = eth.sourceAddress() };
+            const dst = tcpip.LinkAddress{ .addr = eth.destinationAddress() };
+            d.deliverNetworkPacket(&src, &dst, eth_type, pkt);
         }
         std.heap.page_allocator.free(payload_buf);
     }
