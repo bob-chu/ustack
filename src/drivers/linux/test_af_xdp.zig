@@ -7,7 +7,7 @@ const header = @import("../../header.zig");
 
 test "AfXdp basic properties" {
     const allocator = std.testing.allocator;
-    
+
     // Test that it can be created without crashing (minimal setup)
     // We don't actually call init() here because it requires root and real interfaces
     const dummy_fd: std.posix.fd_t = 0;
@@ -22,13 +22,13 @@ test "AfXdp basic properties" {
         .if_index = 0,
         .frame_manager = undefined,
     };
-    
+
     try std.testing.expectEqual(@as(u32, 1500), xdp.mtu_val);
 }
 
 test "AfXdp functional init" {
     const allocator = std.testing.allocator;
-    
+
     // This test only works if run as root and veth_test0 exists.
     // We use a guard to skip if not available.
     var xdp = AfXdp.init(allocator, "veth_test0", 0) catch |err| {
@@ -37,6 +37,6 @@ test "AfXdp functional init" {
         return;
     };
     defer xdp.deinit();
-    
+
     try std.testing.expect(xdp.fd > 0);
 }

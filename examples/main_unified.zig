@@ -47,9 +47,7 @@ pub fn main() !void {
     const ip_cidr = args[3];
     const driver_str = args[4];
 
-    const driver_type = if (std.mem.eql(u8, driver_str, "xdp")) interface.DriverType.af_xdp
-    else if (std.mem.eql(u8, driver_str, "tap")) interface.DriverType.tap
-    else interface.DriverType.af_packet;
+    const driver_type = if (std.mem.eql(u8, driver_str, "xdp")) interface.DriverType.af_xdp else if (std.mem.eql(u8, driver_str, "tap")) interface.DriverType.tap else interface.DriverType.af_packet;
 
     var parts = std.mem.split(u8, ip_cidr, "/");
     const ip_str = parts.first();
@@ -58,7 +56,7 @@ pub fn main() !void {
     const addr_v4 = try utils.parseIp(ip_str); // Re-parsing just for benchmark struct later
 
     global_stack = try ustack.init(allocator);
-    
+
     // Unified Interface Init
     global_iface = try interface.NetworkInterface.init(allocator, &global_stack, .{
         .name = ifname,
@@ -79,7 +77,7 @@ pub fn main() !void {
     var timer_watcher = std.mem.zeroInit(c.ev_timer, .{});
     my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.001, 0.001);
     my_ev_timer_start(loop, &timer_watcher);
-    
+
     // Safety timeout
     var safety_watcher = std.mem.zeroInit(c.ev_timer, .{});
     my_ev_timer_init(&safety_watcher, libev_safety_cb, 30.0, 0.0);
@@ -127,7 +125,7 @@ fn libev_driver_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(
     _ = watcher;
     _ = revents;
     global_iface.process() catch |err| {
-         std.debug.print("Driver read error: {}\n", .{err});
+        std.debug.print("Driver read error: {}\n", .{err});
     };
 }
 
@@ -269,7 +267,7 @@ const HttpClient = struct {
                     self.state = .sending;
                     self.sendRequest();
                 } else if (tcp_ep.state == .error_state or tcp_ep.state == .closed) {
-                     // Silent fail for benchmark noise
+                    // Silent fail for benchmark noise
                     self.finish(false);
                 }
             },
@@ -368,7 +366,7 @@ const HttpServer = struct {
     pub fn onTransactionComplete(self: *HttpServer) void {
         self.transaction_count += 1;
         if (self.transaction_count % 100 == 0) {
-            std.debug.print("Server: Progress {}/{}\n", .{self.transaction_count, self.max_transactions});
+            std.debug.print("Server: Progress {}/{}\n", .{ self.transaction_count, self.max_transactions });
         }
         if (self.transaction_count >= self.max_transactions) {
             std.debug.print("Server: Max transactions reached ({}), exiting...\n", .{self.max_transactions});

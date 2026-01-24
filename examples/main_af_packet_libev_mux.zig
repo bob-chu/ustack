@@ -198,7 +198,7 @@ const Benchmark = struct {
         std.debug.print("Benchmark started: Target={}, Concurrency={}\n", .{ self.total_target, self.concurrency_target });
         self.start_time = std.time.milliTimestamp();
         self.spawnBatch();
-        
+
         // Add a safety timeout to the loop to prevent hanging forever
         // If we don't complete in 30 seconds, abort.
         // Or better, just print progress periodically if no events.
@@ -289,7 +289,7 @@ const HttpClient = struct {
                 } else if (tcp_ep.state == .error_state or tcp_ep.state == .closed) {
                     std.debug.print("Client: Connection failed (state={})\n", .{tcp_ep.state});
                     if (tcp_ep.state == .error_state) {
-                         std.debug.print("Client: Retransmit count: {}\n", .{tcp_ep.retransmit_count});
+                        std.debug.print("Client: Retransmit count: {}\n", .{tcp_ep.retransmit_count});
                     }
                     self.finish(false);
                 }
@@ -391,7 +391,7 @@ const HttpServer = struct {
     pub fn onTransactionComplete(self: *HttpServer) void {
         self.transaction_count += 1;
         if (self.transaction_count % 100 == 0) {
-            std.debug.print("Server: Progress {}/{}\n", .{self.transaction_count, self.max_transactions});
+            std.debug.print("Server: Progress {}/{}\n", .{ self.transaction_count, self.max_transactions });
         }
         if (self.transaction_count >= self.max_transactions) {
             std.debug.print("Server: Max transactions reached ({}), exiting...\n", .{self.max_transactions});

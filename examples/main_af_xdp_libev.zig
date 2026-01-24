@@ -171,8 +171,8 @@ const Benchmark = struct {
     target_ip: [4]u8,
     local_ip: [4]u8,
 
-    total_target: usize = 1000, 
-    concurrency_target: usize = 10, 
+    total_target: usize = 1000,
+    concurrency_target: usize = 10,
 
     active_count: usize = 0,
     completed_count: usize = 0,

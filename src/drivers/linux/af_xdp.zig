@@ -11,7 +11,7 @@ pub const AfXdp = struct {
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     if_index: i32,
-    
+
     // UMEM
     umem_area: []align(std.mem.page_size) u8,
 
@@ -65,7 +65,7 @@ pub const AfXdp = struct {
     };
 
     const NUM_FRAMES = 2048;
-    const FRAME_SIZE = 2048; 
+    const FRAME_SIZE = 2048;
     const RING_SIZE = 1024;
 
     pub fn init(allocator: std.mem.Allocator, if_name: []const u8, queue_id: u32) !AfXdp {
@@ -108,13 +108,11 @@ pub const AfXdp = struct {
         // 7. Bind
         const ifindex = try getIfIndex(if_name);
         const mac = try getIfMac(if_name);
-        std.debug.print("AF_XDP: Binding to {s} (index={}, mac={x}:{x}:{x}:{x}:{x}:{x}) queue={}\n", .{ 
-            if_name, ifindex, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], queue_id 
-        });
-        
+        std.debug.print("AF_XDP: Binding to {s} (index={}, mac={x}:{x}:{x}:{x}:{x}:{x}) queue={}\n", .{ if_name, ifindex, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], queue_id });
+
         var sa = xdp.sockaddr_xdp{
             .family = std.posix.AF.XDP,
-            .flags = 0, 
+            .flags = 0,
             .ifindex = ifindex,
             .queue_id = queue_id,
             .shared_umem_fd = 0,
@@ -146,7 +144,7 @@ pub const AfXdp = struct {
                 prod += 1;
             }
         }
-        self.fill_ring.producer.* = prod; 
+        self.fill_ring.producer.* = prod;
 
         return self;
     }
@@ -164,7 +162,7 @@ pub const AfXdp = struct {
             .producer = @as(*volatile u32, @ptrCast(@alignCast(map_ptr + off.producer))),
             .consumer = @as(*volatile u32, @ptrCast(@alignCast(map_ptr + off.consumer))),
             .desc = @as([*]xdp.xdp_desc, @ptrCast(@alignCast(map_ptr + off.desc))),
-            .addr = @as([*]u64, @ptrCast(@alignCast(map_ptr + off.desc))), 
+            .addr = @as([*]u64, @ptrCast(@alignCast(map_ptr + off.desc))),
             .size = size,
             .mask = size - 1,
         };

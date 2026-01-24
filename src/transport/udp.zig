@@ -394,15 +394,32 @@ test "UDP handlePacket" {
 
     var fake_ep = struct {
         fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-            _ = ptr; _ = r; _ = protocol; _ = pkt; return;
+            _ = ptr;
+            _ = r;
+            _ = protocol;
+            _ = pkt;
+            return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
-            _ = ptr; _ = dispatcher;
+            _ = ptr;
+            _ = dispatcher;
         }
-        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress { _ = ptr; return .{ .addr = [_]u8{0} ** 6 }; }
-        fn mtu(ptr: *anyopaque) u32 { _ = ptr; return 1500; }
-        fn setMTU(ptr: *anyopaque, m: u32) void { _ = ptr; _ = m; }
-        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities { _ = ptr; return stack.CapabilityNone; }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            _ = ptr;
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(ptr: *anyopaque) u32 {
+            _ = ptr;
+            return 1500;
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void {
+            _ = ptr;
+            _ = m;
+        }
+        fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities {
+            _ = ptr;
+            return stack.CapabilityNone;
+        }
     }{};
 
     const link_ep = stack.LinkEndpoint{

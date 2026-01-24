@@ -799,25 +799,32 @@ test "Stack NIC creation" {
         mtu_val: u32 = 1500,
 
         fn writePacket(ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-            _ = ptr; _ = r; _ = protocol; _ = pkt;
+            _ = ptr;
+            _ = r;
+            _ = protocol;
+            _ = pkt;
             return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *NetworkDispatcher) void {
-            _ = ptr; _ = dispatcher;
+            _ = ptr;
+            _ = dispatcher;
         }
         fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
             return .{ .addr = self.address };
         }
-        fn mtu(ptr: *anyopaque) u32 { 
+        fn mtu(ptr: *anyopaque) u32 {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            return self.mtu_val; 
+            return self.mtu_val;
         }
-        fn setMTU(ptr: *anyopaque, m: u32) void { 
+        fn setMTU(ptr: *anyopaque, m: u32) void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
             self.mtu_val = m;
         }
-        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities { _ = ptr; return CapabilityNone; }
+        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities {
+            _ = ptr;
+            return CapabilityNone;
+        }
     };
 
     var fake_ep = FakeLinkEndpoint{};
@@ -848,7 +855,9 @@ test "Stack Transport Demux" {
 
         fn handlePacket(ptr: *anyopaque, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            _ = r; _ = id; _ = pkt;
+            _ = r;
+            _ = id;
+            _ = pkt;
             self.notified = true;
         }
         fn close(ptr: *anyopaque) void {
@@ -868,13 +877,20 @@ test "Stack Transport Demux" {
     };
 
     const FakeTransportProtocol = struct {
-        fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber { _ = ptr; return 17; }
+        fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber {
+            _ = ptr;
+            return 17;
+        }
         fn newEndpoint(ptr: *anyopaque, s: *Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
-            _ = ptr; _ = s; _ = net_proto; _ = wait_queue;
+            _ = ptr;
+            _ = s;
+            _ = net_proto;
+            _ = wait_queue;
             return tcpip.Error.NotPermitted;
         }
         fn parsePorts(ptr: *anyopaque, pkt: tcpip.PacketBuffer) TransportProtocol.PortPair {
-            _ = ptr; _ = pkt;
+            _ = ptr;
+            _ = pkt;
             return .{ .src = 1234, .dst = 80 };
         }
     };
@@ -918,7 +934,7 @@ test "Stack Transport Demux" {
         .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
         .local_link_address = .{ .addr = [_]u8{0} ** 6 },
         .net_proto = 0x0800,
-        .nic = undefined, 
+        .nic = undefined,
     };
 
     Stack.deliverTransportPacket(&s, &r, 17, .{
@@ -938,26 +954,31 @@ test "Jumbo Frames" {
 
         fn writePacket(ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            _ = r; _ = protocol;
+            _ = r;
+            _ = protocol;
             self.last_pkt_size = pkt.data.size + pkt.header.usedLength();
             return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *NetworkDispatcher) void {
-            _ = ptr; _ = dispatcher;
+            _ = ptr;
+            _ = dispatcher;
         }
         fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
             return .{ .addr = self.address };
         }
-        fn mtu(ptr: *anyopaque) u32 { 
+        fn mtu(ptr: *anyopaque) u32 {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
-            return self.mtu_val; 
+            return self.mtu_val;
         }
-        fn setMTU(ptr: *anyopaque, m: u32) void { 
+        fn setMTU(ptr: *anyopaque, m: u32) void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
             self.mtu_val = m;
         }
-        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities { _ = ptr; return CapabilityNone; }
+        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities {
+            _ = ptr;
+            return CapabilityNone;
+        }
     };
 
     var fake_ep = FakeLinkEndpoint{};

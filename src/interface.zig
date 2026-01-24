@@ -40,9 +40,9 @@ pub const NetworkInterface = struct {
         const self = try allocator.create(NetworkInterface);
         self.allocator = allocator;
         self.stack = s;
-        // Use a simple ID strategy: assume nic_id 1 is primary. 
+        // Use a simple ID strategy: assume nic_id 1 is primary.
         // In a real multi-nic setup, this would need to be dynamic.
-        self.nic_id = 1; 
+        self.nic_id = 1;
 
         // 1. Init Driver
         switch (cfg.driver) {
@@ -68,7 +68,7 @@ pub const NetworkInterface = struct {
             .af_xdp => |*d| d.address,
             .tap => |*d| d.address,
         };
-        
+
         self.eth_endpoint = try allocator.create(EthernetEndpoint);
         self.eth_endpoint.* = EthernetEndpoint.init(link_ep, mac);
 
@@ -79,7 +79,7 @@ pub const NetworkInterface = struct {
         // 4. Add Addresses
         // ARP is always needed for Ethernet
         try nic.addAddress(.{
-            .protocol = 0x0806, 
+            .protocol = 0x0806,
             .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 },
         });
 
@@ -102,7 +102,7 @@ pub const NetworkInterface = struct {
         // 5. Add Default Gateway
         if (cfg.gateway) |gw_str| {
             const gw_addr = try utils.parseIp(gw_str);
-             try s.addRoute(.{
+            try s.addRoute(.{
                 .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 },
                 .gateway = .{ .v4 = gw_addr },
                 .nic = self.nic_id,
@@ -122,7 +122,7 @@ pub const NetworkInterface = struct {
         // Ideally we should close FDs here for packet/tap too if not handled.
         // Currently existing drivers don't have consistent deinit patterns.
         // Let's rely on OS cleanup for now or add deinit to them later.
-        
+
         self.allocator.destroy(self.eth_endpoint);
         self.allocator.destroy(self);
     }
@@ -150,8 +150,8 @@ pub const NetworkInterface = struct {
             .tap => |*d| {
                 while (true) {
                     const more = d.readPacket() catch |err| {
-                         if (err == error.WouldBlock) return;
-                         return err;
+                        if (err == error.WouldBlock) return;
+                        return err;
                     };
                     if (!more) break;
                 }
