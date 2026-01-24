@@ -147,7 +147,15 @@ pub const NetworkInterface = struct {
                 }
             },
             .af_xdp => |*d| try d.poll(),
-            .tap => |*d| try d.readPacket(),
+            .tap => |*d| {
+                while (true) {
+                    const more = d.readPacket() catch |err| {
+                         if (err == error.WouldBlock) return;
+                         return err;
+                    };
+                    if (!more) break;
+                }
+            },
         }
     }
 };

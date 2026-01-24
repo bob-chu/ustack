@@ -117,34 +117,26 @@ pub const Tap = struct {
         return stack.CapabilityNone;
     }
 
-    pub fn readPacket(self: *Tap) !void {
+    pub fn readPacket(self: *Tap) !bool {
         var buf: [9000]u8 = undefined; // Support up to Jumbo
-        const rc = std.os.linux.read(self.fd, &buf, buf.len);
-        const err = std.posix.errno(rc);
-        if (err != .SUCCESS) {
-            if (err == .AGAIN) return;
-            return error.ReadFailed;
-        }
-        const len = rc;
-        if (len == 0) return; // EOF
+        const len = std.posix.read(self.fd, &buf) catch |err| {
+            if (err == error.WouldBlock) return false;
+            return err;
+        };
+        if (len == 0) return false; // EOF
 
-        const frame_buf = try std.heap.page_allocator.alloc(u8, len);
-        @memcpy(frame_buf, buf[0..len]);
-
-        var views = [1]buffer.View{frame_buf};
+        var views = [1]buffer.View{buf[0..len]};
         const pkt = tcpip.PacketBuffer{
-            .data = buffer.VectorisedView.init(frame_buf.len, &views),
+            .data = buffer.VectorisedView.init(len, &views),
             .header = buffer.Prependable.init(&[_]u8{}),
         };
 
         if (self.dispatcher) |d| {
-            // For Ethernet devices, we often pass a dummy or zero MAC if it's going to be parsed by EthernetEndpoint anyway.
-            // But EthernetEndpoint.deliverNetworkPacket ignores these arguments anyway.
             const dst_mac = tcpip.LinkAddress{ .addr = buf[0..6].* };
             const src_mac = tcpip.LinkAddress{ .addr = buf[6..12].* };
             d.deliverNetworkPacket(&src_mac, &dst_mac, 0, pkt);
         }
 
-        std.heap.page_allocator.free(frame_buf);
+        return true;
     }
 };

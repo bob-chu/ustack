@@ -59,8 +59,10 @@ fn libev_io_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) void
     _ = loop;
     _ = watcher;
     _ = revents;
-    global_tap.readPacket() catch |err| {
-        std.debug.print("readPacket error: {}\n", .{err});
+    _ = global_tap.readPacket() catch |err| {
+        if (err != error.WouldBlock) {
+             std.debug.print("readPacket error: {}\n", .{err});
+        }
     };
 }
 
