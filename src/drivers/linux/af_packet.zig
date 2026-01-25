@@ -43,6 +43,11 @@ pub const AfPacket = struct {
         // Get Interface MAC Address
         const mac = try getIfMac(fd, dev_name);
 
+        // Set large socket buffers to avoid drops during bursts
+        const buf_size: i32 = 10 * 1024 * 1024;
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&buf_size));
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&buf_size));
+
         return AfPacket{
             .fd = fd,
             .allocator = allocator,
@@ -56,6 +61,7 @@ pub const AfPacket = struct {
             .ptr = self,
             .vtable = &.{
                 .writePacket = writePacket,
+                .writePackets = writePackets_wrapper,
                 .attach = attach,
                 .linkAddress = linkAddress,
                 .mtu = mtu,
@@ -65,27 +71,40 @@ pub const AfPacket = struct {
         };
     }
 
+    fn writePackets_wrapper(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        _ = r;
+        _ = protocol;
+        const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
+        return self.writePackets(packets);
+    }
+
+    pub fn writePackets(self: *AfPacket, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        for (packets) |pkt| {
+            var iovecs: [16]std.posix.iovec_const = undefined;
+            const hdr_view = pkt.header.view();
+            iovecs[0] = .{ .base = hdr_view.ptr, .len = hdr_view.len };
+            
+            var iov_cnt: usize = 1;
+            for (pkt.data.views) |v| {
+                if (iov_cnt >= 16) break;
+                iovecs[iov_cnt] = .{ .base = v.ptr, .len = v.len };
+                iov_cnt += 1;
+            }
+
+            _ = std.posix.writev(self.fd, iovecs[0..iov_cnt]) catch |err| {
+                if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
+                return tcpip.Error.UnknownDevice;
+            };
+        }
+    }
+
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
         _ = r;
         _ = protocol;
 
-        const total_len = pkt.header.usedLength() + pkt.data.size;
-        log.debug("Tx Packet on {}, len={}", .{ self.fd, total_len });
-        var buf = self.allocator.alloc(u8, total_len) catch return tcpip.Error.NoBufferSpace;
-        defer self.allocator.free(buf);
-
-        const hdr_len = pkt.header.usedLength();
-        @memcpy(buf[0..hdr_len], pkt.header.view());
-
-        const view = pkt.data.toView(self.allocator) catch return tcpip.Error.NoBufferSpace;
-        defer self.allocator.free(view);
-        @memcpy(buf[hdr_len..], view);
-
-        _ = std.posix.write(self.fd, buf) catch |err| {
-            if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
-            return tcpip.Error.UnknownDevice;
-        };
+        const p = [_]tcpip.PacketBuffer{pkt};
+        return self.writePackets(&p);
     }
 
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
@@ -114,34 +133,61 @@ pub const AfPacket = struct {
     }
 
     pub fn readPacket(self: *AfPacket) !bool {
-        var buf: [9000]u8 = undefined;
-        const len = std.posix.read(self.fd, &buf) catch |err| {
-            if (err == error.WouldBlock) return false;
-            return err;
-        };
-        if (len == 0) return false;
+        const batch_size = 64;
+        var msgvec: [batch_size]std.os.linux.mmsghdr = undefined;
+        var iovecs: [batch_size]std.posix.iovec = undefined;
+        var bufs: [batch_size][9216]u8 = undefined;
 
-        // Debug Log
-            log.debug("Rx Packet on {}, len={}", .{ self.fd, len });
-
-
-        // Pass the FULL frame to the dispatcher (EthernetEndpoint expects it)
-        const frame_buf = try self.allocator.alloc(u8, len);
-        @memcpy(frame_buf, buf[0..len]);
-
-        var views = [1]buffer.View{frame_buf};
-        const pkt = tcpip.PacketBuffer{
-            .data = buffer.VectorisedView.init(frame_buf.len, &views),
-            .header = buffer.Prependable.init(&[_]u8{}),
-        };
-
-        if (self.dispatcher) |d| {
-            // We pass dummy MACs/type because EthernetEndpoint will parse the real ones from the frame
-            const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
-            d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, pkt);
+        for (0..batch_size) |j| {
+            iovecs[j] = .{ .base = &bufs[j], .len = bufs[j].len };
+            msgvec[j] = .{
+                .msg_hdr = .{
+                    .name = null,
+                    .namelen = 0,
+                    .iov = @as([*]std.posix.iovec, @ptrCast(&iovecs[j])),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .msg_len = 0,
+            };
         }
 
-        self.allocator.free(frame_buf);
+        const count_raw = std.os.linux.syscall5(.recvmmsg, @as(usize, @intCast(self.fd)), @intFromPtr(&msgvec), batch_size, std.posix.MSG.DONTWAIT, 0);
+        const signed_count = @as(isize, @bitCast(count_raw));
+        if (signed_count < 0) {
+            const err_num = @as(std.os.linux.E, @enumFromInt(@as(i32, @intCast(-signed_count))));
+            if (err_num == .AGAIN) return false;
+            return error.Unexpected;
+        }
+
+        const num_received = @as(usize, @intCast(signed_count));
+        if (num_received == 0) return false;
+
+        for (0..num_received) |j| {
+            const len = msgvec[j].msg_len;
+            if (len == 0) continue;
+
+            // Pass the FULL frame to the dispatcher (EthernetEndpoint expects it)
+            const frame_buf = try self.allocator.alloc(u8, len);
+            @memcpy(frame_buf, bufs[j][0..len]);
+
+            var views = [1]buffer.View{frame_buf};
+            const pkt = tcpip.PacketBuffer{
+                .data = buffer.VectorisedView.init(frame_buf.len, &views),
+                .header = buffer.Prependable.init(&[_]u8{}),
+            };
+
+            if (self.dispatcher) |d| {
+                // We pass dummy MACs/type because EthernetEndpoint will parse the real ones from the frame
+                const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
+                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, pkt);
+            }
+
+            self.allocator.free(frame_buf);
+        }
+
         return true;
     }
 

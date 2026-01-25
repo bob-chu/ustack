@@ -112,6 +112,7 @@ pub const IPv4Endpoint = struct {
 
     const VTableImpl = stack.NetworkEndpoint.VTable{
         .writePacket = writePacket,
+        .writePackets = writePackets,
         .handlePacket = handlePacket,
         .mtu = mtu,
         .close = close,
@@ -133,28 +134,41 @@ pub const IPv4Endpoint = struct {
     }
 
     fn writePacket(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-        const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
+        const p = [_]tcpip.PacketBuffer{pkt};
+        return writePackets(ptr, r, protocol, &p);
+    }
 
+    fn writePackets(ptr: *anyopaque, r: *const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
         const max_payload = self.nic.linkEP.mtu() - header.IPv4MinimumSize;
-        if (pkt.data.size > max_payload) {
-            return tcpip.Error.MessageTooLong;
+
+        // Note: This is an optimization. We could allocate a larger buffer for all packets, 
+        // but for now we just process each packet individually to add the IP header and then
+        // pass the batch down.
+        // We reuse the packet buffers provided.
+        var mut_packets = try self.nic.stack.allocator.alloc(tcpip.PacketBuffer, packets.len);
+        defer self.nic.stack.allocator.free(mut_packets);
+        
+        for (packets, 0..) |pkt, i| {
+            if (pkt.data.size > max_payload) return tcpip.Error.MessageTooLong;
+            
+            var mut_pkt = pkt;
+            const ip_header = mut_pkt.header.prepend(header.IPv4MinimumSize) orelse return tcpip.Error.NoBufferSpace;
+            const h = header.IPv4.init(ip_header);
+
+            @memset(ip_header, 0);
+            ip_header[0] = 0x45;
+            std.mem.writeInt(u16, ip_header[2..4], @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size)), .big);
+            ip_header[8] = 64;
+            ip_header[9] = @as(u8, @intCast(protocol));
+            @memcpy(ip_header[12..16], &r.local_address.v4);
+            @memcpy(ip_header[16..20], &r.remote_address.v4);
+            h.setChecksum(h.calculateChecksum());
+            
+            mut_packets[i] = mut_pkt;
         }
 
-        var mut_pkt = pkt;
-        const ip_header = mut_pkt.header.prepend(header.IPv4MinimumSize) orelse return tcpip.Error.NoBufferSpace;
-        const h = header.IPv4.init(ip_header);
-
-        @memset(ip_header, 0);
-        ip_header[0] = 0x45; // Version 4, IHL 5
-        std.mem.writeInt(u16, ip_header[2..4], @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size)), .big);
-        ip_header[8] = 64; // TTL
-        ip_header[9] = @as(u8, @intCast(protocol));
-        @memcpy(ip_header[12..16], &r.local_address.v4);
-        @memcpy(ip_header[16..20], &r.remote_address.v4);
-
-        h.setChecksum(h.calculateChecksum());
-
-        return self.nic.linkEP.writePacket(r, ProtocolNumber, mut_pkt);
+        return self.nic.linkEP.writePackets(r, ProtocolNumber, mut_packets);
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {

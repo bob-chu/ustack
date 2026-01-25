@@ -37,9 +37,10 @@ pub const EventMultiplexer = struct {
     /// It gets triggered by the stack when data arrives or space opens up.
     pub fn upcall(entry: *waiter.Entry) void {
         const self = @as(*EventMultiplexer, @ptrCast(@alignCast(entry.upcall_ctx.?)));
-        self.ready_queue.push(entry) catch return;
-        const val: u64 = 1;
-        _ = std.posix.write(self.signal_fd, std.mem.asBytes(&val)) catch {};
+        if (self.ready_queue.push(entry) catch false) {
+            const val: u64 = 1;
+            _ = std.posix.write(self.signal_fd, std.mem.asBytes(&val)) catch {};
+        }
     }
 
     /// Drains the signal and returns all ready entries.
@@ -68,16 +69,17 @@ const ReadyQueue = struct {
         self.list.deinit();
     }
 
-    pub fn push(self: *ReadyQueue, entry: *waiter.Entry) !void {
+    pub fn push(self: *ReadyQueue, entry: *waiter.Entry) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         // Deduplicate: Don't add if already in queue
         for (self.list.items) |item| {
-            if (item == entry) return;
+            if (item == entry) return false;
         }
 
         try self.list.append(entry);
+        return true;
     }
 
     pub fn popAll(self: *ReadyQueue) ![]*waiter.Entry {
@@ -121,8 +123,8 @@ test "ReadyQueue deduplication" {
 
     var entry = waiter.Entry.init(null, null);
 
-    try q.push(&entry);
-    try q.push(&entry); // Duplicate
+    _ = try q.push(&entry);
+    _ = try q.push(&entry); // Duplicate
 
     const ready = try q.popAll();
     defer allocator.free(ready);

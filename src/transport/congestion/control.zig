@@ -47,8 +47,8 @@ pub const NewReno = struct {
     pub fn init(allocator: std.mem.Allocator, mss: u32) !CongestionControl {
         const self = try allocator.create(NewReno);
         self.* = .{
-            .cwnd = mss,
-            .ssthresh = 65535,
+            .cwnd = 10 * mss,
+            .ssthresh = 1024 * 1024 * 4,
             .mss = mss,
             .allocator = allocator,
         };
@@ -76,7 +76,8 @@ pub const NewReno = struct {
             self.cwnd += self.mss;
         } else {
             // Congestion Avoidance
-            self.cwnd += self.mss / self.cwnd;
+            // Approximate growth by 1 MSS per RTT: cwnd = cwnd + mss * mss / cwnd
+            self.cwnd += @max(1, (self.mss * self.mss) / self.cwnd);
         }
     }
 

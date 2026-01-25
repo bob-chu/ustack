@@ -174,6 +174,36 @@ pub const TCP = struct {
 pub fn internetChecksum(data: []const u8, initial: u32) u32 {
     var sum: u32 = initial;
     var i: usize = 0;
+
+    // SIMD optimization for large buffers
+    if (data.len >= 64) {
+        const lanes = 32;
+        var acc_even = @as(@Vector(16, u32), @splat(0));
+        var acc_odd = @as(@Vector(16, u32), @splat(0));
+
+        const even_indices = comptime blk: {
+            var indices: [16]u32 = undefined;
+            for (0..16) |j| indices[j] = j * 2;
+            break :blk indices;
+        };
+        const odd_indices = comptime blk: {
+            var indices: [16]u32 = undefined;
+            for (0..16) |j| indices[j] = j * 2 + 1;
+            break :blk indices;
+        };
+
+        while (i + lanes <= data.len) : (i += lanes) {
+            const v = @as(@Vector(32, u8), data[i..][0..32].*);
+            const even_bytes = @shuffle(u8, v, undefined, even_indices);
+            const odd_bytes = @shuffle(u8, v, undefined, odd_indices);
+
+            acc_even += @as(@Vector(16, u32), even_bytes);
+            acc_odd += @as(@Vector(16, u32), odd_bytes);
+        }
+
+        sum += (@reduce(.Add, acc_even) << 8) + @reduce(.Add, acc_odd);
+    }
+
     while (i + 1 < data.len) : (i += 2) {
         sum += std.mem.readInt(u16, data[i..][0..2], .big);
     }
@@ -784,3 +814,29 @@ test "Checksum calculation" {
     const expected: u16 = 0xb1e6; // Precalculated for this header
     try std.testing.expectEqual(expected, finishChecksum(c));
 }
+
+test "Checksum SIMD vs Scalar comparison" {
+    var prng = std.rand.DefaultPrng.init(0);
+    const random = prng.random();
+
+    var buf: [4096]u8 = undefined;
+    for (0..100) |_| {
+        const len = random.uintLessThan(usize, buf.len);
+        random.bytes(buf[0..len]);
+        const initial = random.uintAtMost(u32, 0xFFFF);
+
+        // Scalar implementation (manual copy for verification)
+        var scalar_sum: u32 = initial;
+        var i: usize = 0;
+        while (i + 1 < len) : (i += 2) {
+            scalar_sum += std.mem.readInt(u16, buf[i..][0..2], .big);
+        }
+        if (i < len) {
+            scalar_sum += @as(u32, buf[i]) << 8;
+        }
+
+        const simd_sum = internetChecksum(buf[0..len], initial);
+        try std.testing.expectEqual(scalar_sum, simd_sum);
+    }
+}
+

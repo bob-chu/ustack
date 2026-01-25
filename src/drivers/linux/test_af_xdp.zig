@@ -32,7 +32,7 @@ test "AfXdp functional init" {
     // This test only works if run as root and veth_test0 exists.
     // We use a guard to skip if not available.
     var xdp = AfXdp.init(allocator, "veth_test0", 0) catch |err| {
-        if (err == error.PermissionDenied or err == error.SocketNotSupported or err == error.Unexpected) return;
+        if (err == error.PermissionDenied or err == error.SocketNotSupported or err == error.Unexpected or err == error.IoctlFailed) return;
         std.debug.print("Init failed: {}\n", .{err});
         return;
     };

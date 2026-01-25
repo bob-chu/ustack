@@ -26,12 +26,35 @@ pub const EthernetEndpoint = struct {
 
     const VTableImpl = stack.LinkEndpoint.VTable{
         .writePacket = writePacket,
+        .writePackets = writePackets,
         .attach = attach,
         .linkAddress = linkAddress,
         .mtu = mtu,
         .setMTU = setMTU,
         .capabilities = capabilities,
     };
+
+    fn writePackets(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
+        
+        const dst = if (r) |route| (if (route.remote_link_address) |la| la.addr else [_]u8{0xff} ** 6) else [_]u8{0xff} ** 6;
+        const src = if (r) |route| route.local_link_address.addr else self.addr.addr;
+
+        var batch_buf: [32]tcpip.PacketBuffer = undefined;
+        var i: usize = 0;
+        while (i < packets.len) {
+            const count = @min(packets.len - i, batch_buf.len);
+            for (0..count) |j| {
+                var mut_pkt = packets[i + j];
+                const eth_header = mut_pkt.header.prepend(header.EthernetMinimumSize) orelse return tcpip.Error.NoBufferSpace;
+                var eth = header.Ethernet.init(eth_header);
+                eth.encode(src, dst, protocol);
+                batch_buf[j] = mut_pkt;
+            }
+            try self.lower.writePackets(r, protocol, batch_buf[0..count]);
+            i += count;
+        }
+    }
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));

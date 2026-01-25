@@ -76,6 +76,12 @@ pub fn main() !void {
         .nic = 1,
         .mtu = 1500,
     });
+    try global_stack.addRoute(.{
+        .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 },
+        .gateway = .{ .v4 = .{ 0, 0, 0, 0 } },
+        .nic = 1,
+        .mtu = 1500,
+    });
 
     const loop = my_ev_default_loop();
 
@@ -445,7 +451,7 @@ const IperfConnection = struct {
 
     fn handleServer(self: *IperfConnection) void {
         var count: usize = 0;
-        while (count < 32) : (count += 1) {
+        while (count < 256) : (count += 1) {
             const buf = self.ep.read(null) catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
                 std.debug.print("[{}] Server read error: {}\n", .{self.id, err});
@@ -471,7 +477,7 @@ const IperfConnection = struct {
         }
         
         if (global_mux) |mux| {
-            mux.ready_queue.push(&self.wait_entry) catch {};
+            _ = mux.ready_queue.push(&self.wait_entry) catch false;
             const val: u64 = 1;
             _ = std.posix.write(mux.signal_fd, std.mem.asBytes(&val)) catch {};
         }
@@ -501,7 +507,6 @@ const IperfConnection = struct {
         while (count < 32) : (count += 1) {
             const n = self.ep.write(p.payloader(), .{}) catch |err| {
                 if (err == tcpip.Error.WouldBlock) {
-                    self.wq.notify(waiter.EventOut);
                     return;
                 }
                 std.debug.print("[{}] Client write error: {}\n", .{self.id, err});
@@ -519,7 +524,7 @@ const IperfConnection = struct {
         }
         
         if (global_mux) |mux| {
-            mux.ready_queue.push(&self.wait_entry) catch {};
+            _ = mux.ready_queue.push(&self.wait_entry) catch false;
             const val: u64 = 1;
             _ = std.posix.write(mux.signal_fd, std.mem.asBytes(&val)) catch {};
         }

@@ -45,9 +45,10 @@ var global_tap: *ustack.drivers.tap.Tap = undefined;
 var global_mux: *event_mux.EventMultiplexer = undefined;
 
 fn my_upcall(entry: *waiter.Entry) void {
-    global_mux.ready_queue.push(entry) catch return;
-    const val: u64 = 1;
-    _ = std.posix.write(global_mux.signal_fd, std.mem.asBytes(&val)) catch {};
+    if (global_mux.ready_queue.push(entry) catch false) {
+        const val: u64 = 1;
+        _ = std.posix.write(global_mux.signal_fd, std.mem.asBytes(&val)) catch {};
+    }
 }
 
 fn libev_tap_io_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) void {

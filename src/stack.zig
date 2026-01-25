@@ -17,6 +17,7 @@ pub const LinkEndpoint = struct {
 
     pub const VTable = struct {
         writePacket: *const fn (ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void,
+        writePackets: ?*const fn (ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void = null,
         attach: *const fn (ptr: *anyopaque, dispatcher: *NetworkDispatcher) void,
         linkAddress: *const fn (ptr: *anyopaque) tcpip.LinkAddress,
         mtu: *const fn (ptr: *anyopaque) u32,
@@ -26,6 +27,15 @@ pub const LinkEndpoint = struct {
 
     pub fn writePacket(self: LinkEndpoint, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         return self.vtable.writePacket(self.ptr, r, protocol, pkt);
+    }
+
+    pub fn writePackets(self: LinkEndpoint, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        if (self.vtable.writePackets) |f| {
+            return f(self.ptr, r, protocol, packets);
+        }
+        for (packets) |p| {
+            try self.vtable.writePacket(self.ptr, r, protocol, p);
+        }
     }
 
     pub fn attach(self: LinkEndpoint, dispatcher: *NetworkDispatcher) void {
@@ -68,6 +78,7 @@ pub const NetworkEndpoint = struct {
 
     pub const VTable = struct {
         writePacket: *const fn (ptr: *anyopaque, r: *const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void,
+        writePackets: ?*const fn (ptr: *anyopaque, r: *const Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void = null,
         handlePacket: *const fn (ptr: *anyopaque, r: *const Route, pkt: tcpip.PacketBuffer) void,
         mtu: *const fn (ptr: *anyopaque) u32,
         close: ?*const fn (ptr: *anyopaque) void = null,
@@ -75,6 +86,15 @@ pub const NetworkEndpoint = struct {
 
     pub fn writePacket(self: NetworkEndpoint, r: *const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         return self.vtable.writePacket(self.ptr, r, protocol, pkt);
+    }
+
+    pub fn writePackets(self: NetworkEndpoint, r: *const Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        if (self.vtable.writePackets) |f| {
+            return f(self.ptr, r, protocol, packets);
+        }
+        for (packets) |p| {
+            try self.vtable.writePacket(self.ptr, r, protocol, p);
+        }
     }
 
     pub fn handlePacket(self: NetworkEndpoint, r: *const Route, pkt: tcpip.PacketBuffer) void {
