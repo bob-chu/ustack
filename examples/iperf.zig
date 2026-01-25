@@ -488,6 +488,8 @@ const IperfConnection = struct {
             const tcp_ep = @as(*ustack.transport.tcp.TCPEndpoint, @ptrCast(@alignCast(self.ep.ptr)));
             if (tcp_ep.state != .established) return;
         }
+        
+        self.maybeReport();
 
         const Payloader = struct {
             data: []const u8,
