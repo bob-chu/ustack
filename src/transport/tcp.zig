@@ -167,6 +167,7 @@ pub const TCPEndpoint = struct {
     // TCP Options
     ts_enabled: bool = false,
     ts_recent: u32 = 0,
+    max_segment_size: u16 = 1460,
 
     // Window Scaling
     snd_wnd_scale: u8 = 0,
@@ -191,6 +192,7 @@ pub const TCPEndpoint = struct {
         ts_recent: u32,
         ts_enabled: bool,
         snd_wnd_scale: u8,
+        mss: u16,
     };
 
     pub const Segment = struct {
@@ -467,7 +469,7 @@ pub const TCPEndpoint = struct {
         const avail_signed = total_allowed - current_nxt;
         const avail = if (avail_signed > 0) @as(u32, @intCast(avail_signed)) else 0;
 
-        const payload_len = @min(payload_raw.len, avail);
+        const payload_len = @min(@min(payload_raw.len, avail), @as(u32, self.max_segment_size));
 
         if (payload_len == 0) return tcpip.Error.WouldBlock;
 
@@ -768,9 +770,10 @@ pub const TCPEndpoint = struct {
                         .ts_recent = self.ts_recent,
                         .ts_enabled = self.ts_enabled,
                         .snd_wnd_scale = 0,
+                        .mss = 1460,
                     };
 
-                    // Parse options in SYN to get peer's window scale
+                    // Parse options in SYN to get peer's window scale and MSS
                     var opt_idx: usize = 20;
                     while (opt_idx < hlen) {
                         const kind = v[opt_idx];
@@ -780,7 +783,10 @@ pub const TCPEndpoint = struct {
                             continue;
                         }
                         const len = v[opt_idx + 1];
-                        if (kind == 3 and len == 3) {
+                        if (kind == 2 and len == 4) { // MSS
+                            const mss_val = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2], .big);
+                            @constCast(&entry).mss = mss_val;
+                        } else if (kind == 3 and len == 3) {
                             @constCast(&entry).snd_wnd_scale = v[opt_idx + 2];
                         }
                         opt_idx += len;
@@ -858,6 +864,7 @@ pub const TCPEndpoint = struct {
                         new_ep.ts_enabled = entry.ts_enabled;
                         new_ep.ts_recent = entry.ts_recent;
                         new_ep.snd_wnd_scale = entry.snd_wnd_scale;
+                        new_ep.max_segment_size = entry.mss;
                         new_ep.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(entry.snd_wnd_scale));
 
                         const new_id = stack.TransportEndpointID{
@@ -899,7 +906,9 @@ pub const TCPEndpoint = struct {
                                 continue;
                             }
                             const len = v[opt_idx + 1];
-                            if (kind == 3 and len == 3) {
+                            if (kind == 2 and len == 4) { // MSS
+                                self.max_segment_size = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2], .big);
+                            } else if (kind == 3 and len == 3) {
                                 self.snd_wnd_scale = v[opt_idx + 2];
                             }
                             opt_idx += len;

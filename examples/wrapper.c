@@ -11,29 +11,29 @@
 #include <stdio.h>
 
 void* my_ev_default_loop() { 
-    printf("C: Calling ev_default_loop...\n"); fflush(stdout);
+    // printf("C: Calling ev_default_loop...\n"); fflush(stdout);
     void* loop = ev_default_loop(0); 
-    printf("C: loop = %p\n", loop); fflush(stdout);
+    // printf("C: loop = %p\n", loop); fflush(stdout);
     return loop;
 }
 void my_ev_io_init(ev_io* w, void (*cb)(struct ev_loop *loop, ev_io *w, int revents), int fd, int events) { 
-    printf("C: ev_io_init w=%p, fd=%d\n", w, fd); fflush(stdout);
+    // printf("C: ev_io_init w=%p, fd=%d\n", w, fd); fflush(stdout);
     ev_io_init(w, cb, fd, events); 
 }
 void my_ev_timer_init(ev_timer* w, void (*cb)(struct ev_loop *loop, ev_timer *w, int revents), double after, double repeat) { 
-    printf("C: ev_timer_init w=%p, after=%f, repeat=%f\n", w, after, repeat); fflush(stdout);
+    // printf("C: ev_timer_init w=%p, after=%f, repeat=%f\n", w, after, repeat); fflush(stdout);
     ev_timer_init(w, cb, after, repeat); 
 }
 void my_ev_io_start(void* loop, ev_io* w) { 
-    printf("C: ev_io_start loop=%p, w=%p\n", loop, w); fflush(stdout);
+    // printf("C: ev_io_start loop=%p, w=%p\n", loop, w); fflush(stdout);
     ev_io_start(loop, w); 
 }
 void my_ev_timer_start(void* loop, ev_timer* w) { 
-    printf("C: ev_timer_start loop=%p, w=%p\n", loop, w); fflush(stdout);
+    // printf("C: ev_timer_start loop=%p, w=%p\n", loop, w); fflush(stdout);
     ev_timer_start(loop, w); 
 }
 void my_ev_run(void* loop) { 
-    printf("C: ev_run loop=%p\n", loop); fflush(stdout);
+    // printf("C: ev_run loop=%p\n", loop); fflush(stdout);
     ev_run(loop, 0); 
 }
 

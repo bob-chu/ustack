@@ -82,7 +82,10 @@ pub const AfPacket = struct {
         defer self.allocator.free(view);
         @memcpy(buf[hdr_len..], view);
 
-        _ = std.posix.write(self.fd, buf) catch return tcpip.Error.UnknownDevice;
+        _ = std.posix.write(self.fd, buf) catch |err| {
+            if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
+            return tcpip.Error.UnknownDevice;
+        };
     }
 
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
