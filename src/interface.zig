@@ -18,7 +18,7 @@ pub const DriverType = enum {
 pub const InterfaceConfig = struct {
     name: []const u8,
     driver: DriverType,
-    ipv4: ?[]const u8 = null,
+    address: ?[]const u8 = null, // Supports IPv4 or IPv6
     prefix: u8 = 24,
     gateway: ?[]const u8 = null,
     queue_id: u32 = 0,
@@ -83,17 +83,25 @@ pub const NetworkInterface = struct {
             .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 },
         });
 
-        if (cfg.ipv4) |ip_str| {
+        if (cfg.address) |ip_str| {
             const addr = try utils.parseIp(ip_str);
+            const protocol: tcpip.NetworkProtocolNumber = switch (addr) {
+                .v4 => 0x0800,
+                .v6 => 0x86dd,
+            };
+            
             try nic.addAddress(.{
-                .protocol = 0x0800,
-                .address_with_prefix = .{ .address = .{ .v4 = addr }, .prefix_len = cfg.prefix },
+                .protocol = protocol,
+                .address_with_prefix = .{ .address = addr, .prefix_len = cfg.prefix },
             });
 
             // Route to subnet
             try s.addRoute(.{
-                .destination = .{ .address = .{ .v4 = addr }, .prefix = cfg.prefix },
-                .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, // Direct link
+                .destination = .{ .address = addr, .prefix = cfg.prefix },
+                .gateway = switch (addr) {
+                    .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                },
                 .nic = self.nic_id,
                 .mtu = 1500,
             });
@@ -103,8 +111,11 @@ pub const NetworkInterface = struct {
         if (cfg.gateway) |gw_str| {
             const gw_addr = try utils.parseIp(gw_str);
             try s.addRoute(.{
-                .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 },
-                .gateway = .{ .v4 = gw_addr },
+                .destination = switch (gw_addr) {
+                    .v4 => .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 },
+                    .v6 => .{ .address = .{ .v6 = [_]u8{0} ** 16 }, .prefix = 0 },
+                },
+                .gateway = gw_addr,
                 .nic = self.nic_id,
                 .mtu = 1500,
             });

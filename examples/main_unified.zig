@@ -61,9 +61,9 @@ pub fn main() !void {
     global_iface = try interface.NetworkInterface.init(allocator, &global_stack, .{
         .name = ifname,
         .driver = driver_type,
-        .ipv4 = ip_str,
+        .address = ip_str,
         .prefix = prefix_len,
-        .gateway = "0.0.0.0", // Simplified
+        .gateway = null, // Simplified
     });
 
     std.debug.print("Unified Interface {s} up with IP {s}/{d} using driver {s}\n", .{ ifname, ip_str, prefix_len, driver_str });
@@ -95,14 +95,23 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, mode, "benchmark")) {
         if (args.len < 6) return error.TargetIpRequired;
         const target_ip_str = args[5];
-        const target_ip = try utils.parseIp(target_ip_str);
+        const target_ip_addr = try utils.parseIp(target_ip_str);
+        const target_ip = switch (target_ip_addr) {
+            .v4 => |v| v,
+            .v6 => return error.IPv6NotSupportedInBenchmark,
+        };
+
+        const local_ip = switch (addr_v4) {
+            .v4 => |v| v,
+            .v6 => return error.IPv6NotSupportedInBenchmark,
+        };
 
         global_benchmark = .{
             .allocator = allocator,
             .stack = &global_stack,
             .mux = mux,
             .target_ip = target_ip,
-            .local_ip = addr_v4,
+            .local_ip = local_ip,
             .start_time = std.time.milliTimestamp(),
             .total_target = 10000,
             .concurrency_target = 10,
