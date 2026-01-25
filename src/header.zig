@@ -188,6 +188,13 @@ pub fn finishChecksum(sum: u32) u16 {
     while (s > 0xffff) {
         s = (s & 0xffff) + (s >> 16);
     }
+    // Handle the edge case where result is 0x0000 (meaning summation was 0xFFFF).
+    // In UDP, 0 means "no checksum". But in TCP/IP, 0 means 0xFFFF.
+    // However, the bitwise NOT of 0xFFFF is 0x0000.
+    // If the sum is 0xFFFF, the complement is 0x0000.
+    // Actually, RFC 1624 says:
+    // "One's complement checksum arithmetic is associative and commutative.
+    //  0 and -0 (0xFFFF) are distinct values in 1's complement arithmetic."
     return ~@as(u16, @intCast(s));
 }
 

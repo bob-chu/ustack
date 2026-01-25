@@ -70,6 +70,7 @@ pub const AfPacket = struct {
         _ = protocol;
 
         const total_len = pkt.header.usedLength() + pkt.data.size;
+        // std.debug.print("Tx Packet on {}, len={}\n", .{ self.fd, total_len });
         var buf = self.allocator.alloc(u8, total_len) catch return tcpip.Error.NoBufferSpace;
         defer self.allocator.free(buf);
 
@@ -115,6 +116,9 @@ pub const AfPacket = struct {
             return err;
         };
         if (len == 0) return false;
+
+        // Debug Log
+        // std.debug.print("Rx Packet on {}, len={}\n", .{ self.fd, len });
 
         // Pass the FULL frame to the dispatcher (EthernetEndpoint expects it)
         const frame_buf = try self.allocator.alloc(u8, len);

@@ -28,6 +28,7 @@ pub const ev_io = extern struct {
     next: ?*anyopaque = null,
     fd: i32 = 0,
     events: i32 = 0,
+    filled: [32]u8 = undefined,
 };
 pub const ev_timer = extern struct {
     active: i32 = 0,
@@ -37,6 +38,7 @@ pub const ev_timer = extern struct {
     cb: ?*const fn (loop: ?*ev_loop, w: *ev_timer, revents: i32) callconv(.C) void = null,
     at: f64 = 0,
     repeat: f64 = 0,
+    filled: [32]u8 = undefined,
 };
 
 pub const EV_READ = 0x01;
@@ -169,8 +171,6 @@ fn doHttpClient(s: *stack.Stack) !void {
     const dest_ip = switch (google_ip) {
         .v4 => |v| v,
         .v6 => |v| blk: {
-            // Just take first 4 bytes if someone resolves v6? No, we need proper dual stack support.
-            // But example is mostly v4 focused.
             _ = v;
             break :blk [4]u8{ 142, 250, 190, 4 };
         },
@@ -244,7 +244,6 @@ fn doHttpClient(s: *stack.Stack) !void {
         }
         total_received += view.len;
         std.debug.print("{s}", .{view});
-        // std.debug.print("Received {} bytes\n", .{ view.len });
 
         // Stop after receiving reasonable amount of data
         if (total_received > 20000) break;

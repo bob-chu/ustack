@@ -185,6 +185,7 @@ const Benchmark = struct {
     active_count: usize = 0,
     completed_count: usize = 0,
     failed_count: usize = 0,
+    failed_print_count: usize = 0,
     start_time: i64 = 0,
 
     pub fn start(self: *Benchmark) void {
@@ -276,6 +277,12 @@ const HttpClient = struct {
                     self.state = .sending;
                     self.sendRequest();
                 } else if (tcp_ep.state == .error_state or tcp_ep.state == .closed) {
+                    if (self.benchmark_ref) |bench| {
+                        if (bench.failed_print_count < 5) {
+                            std.debug.print("Client connection failed: State={}\n", .{tcp_ep.state});
+                            bench.failed_print_count += 1;
+                        }
+                    }
                     // Silent fail for benchmark noise
                     self.finish(false);
                 }

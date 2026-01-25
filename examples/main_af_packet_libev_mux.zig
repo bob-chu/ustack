@@ -91,12 +91,10 @@ pub fn main() !void {
     my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.001, 0.001);
     my_ev_timer_start(loop, &timer_watcher);
 
-    // Safety timeout watcher (30s)
-    if (global_benchmark.total_target > 0) {
-        var safety_watcher = std.mem.zeroInit(c.ev_timer, .{});
-        my_ev_timer_init(&safety_watcher, libev_safety_cb, 30.0, 0.0);
-        my_ev_timer_start(loop, &safety_watcher);
-    }
+    // Safety timeout watcher (300s)
+    var safety_watcher = std.mem.zeroInit(c.ev_timer, .{});
+    my_ev_timer_init(&safety_watcher, libev_safety_cb, 300.0, 0.0);
+    my_ev_timer_start(loop, &safety_watcher);
 
     const mux = try EventMultiplexer.init(allocator);
     global_mux = mux;
@@ -136,7 +134,8 @@ fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callco
     _ = loop;
     _ = watcher;
     _ = revents;
-    while (true) {
+    var count: usize = 0;
+    while (count < 64) : (count += 1) {
         const more = global_af_packet.readPacket() catch |err| {
             std.debug.print("AF_PACKET read error: {}\n", .{err});
             return;
@@ -166,6 +165,9 @@ fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C)
     _ = revents;
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
+        if (ready.len > 0) {
+            std.debug.print("Mux Ready: {} entries\n", .{ready.len});
+        }
         defer mux.allocator.free(ready);
         for (ready) |entry| {
             const app_entry: *AppEntry = @fieldParentPtr("wait_entry", entry);
@@ -198,10 +200,6 @@ const Benchmark = struct {
         std.debug.print("Benchmark started: Target={}, Concurrency={}\n", .{ self.total_target, self.concurrency_target });
         self.start_time = std.time.milliTimestamp();
         self.spawnBatch();
-
-        // Add a safety timeout to the loop to prevent hanging forever
-        // If we don't complete in 30 seconds, abort.
-        // Or better, just print progress periodically if no events.
     }
 
     fn spawnBatch(self: *Benchmark) void {
@@ -281,56 +279,60 @@ const HttpClient = struct {
 
     fn onEvent(self: *HttpClient) void {
         const tcp_ep = @as(*ustack.transport.tcp.TCPEndpoint, @ptrCast(@alignCast(self.ep.ptr)));
-        switch (self.state) {
-            .connecting => {
-                if (tcp_ep.state == .established) {
-                    self.state = .sending;
-                    self.sendRequest();
-                } else if (tcp_ep.state == .error_state or tcp_ep.state == .closed) {
-                    std.debug.print("Client: Connection failed (state={})\n", .{tcp_ep.state});
-                    if (tcp_ep.state == .error_state) {
-                        std.debug.print("Client: Retransmit count: {}\n", .{tcp_ep.retransmit_count});
+        while (true) {
+            const current_state = self.state;
+            switch (self.state) {
+                .connecting => {
+                    if (tcp_ep.state == .established) {
+                        self.state = .sending;
+                    } else if (tcp_ep.state == .error_state or tcp_ep.state == .closed) {
+                        self.finish(false);
+                        return;
+                    } else {
+                        return;
                     }
-                    self.finish(false);
-                }
-            },
-            .sending => self.sendRequest(),
-            .receiving => {
-                while (true) {
-                    const buf = self.ep.read(null) catch |err| {
+                },
+                .sending => {
+                    const req = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+                    const Payloader = struct {
+                        data: []const u8,
+                        pub fn payloader(ctx: *@This()) tcpip.Payloader {
+                            return .{ .ptr = ctx, .vtable = &.{ .fullPayload = fullPayload } };
+                        }
+                        fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
+                            return @as(*@This(), @ptrCast(@alignCast(ptr))).data;
+                        }
+                    };
+                    var p = Payloader{ .data = req };
+                    _ = self.ep.write(p.payloader(), .{}) catch |err| {
                         if (err == tcpip.Error.WouldBlock) return;
                         self.finish(false);
                         return;
                     };
-                    defer self.allocator.free(buf);
-                    if (buf.len == 0) {
-                        self.finish(true);
+                    self.state = .receiving;
+                },
+                .receiving => {
+                    if (tcp_ep.state == .error_state or tcp_ep.state == .closed) {
+                        self.finish(false);
                         return;
                     }
-                }
-            },
-            .closed => {},
+                    while (true) {
+                        const buf = self.ep.read(null) catch |err| {
+                            if (err == tcpip.Error.WouldBlock) return;
+                            self.finish(false);
+                            return;
+                        };
+                        defer self.allocator.free(buf);
+                        if (buf.len == 0) {
+                            self.finish(true);
+                            return;
+                        }
+                    }
+                },
+                .closed => return,
+            }
+            if (self.state == current_state) break;
         }
-    }
-
-    fn sendRequest(self: *HttpClient) void {
-        const req = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
-        const Payloader = struct {
-            data: []const u8,
-            pub fn payloader(ctx: *@This()) tcpip.Payloader {
-                return .{ .ptr = ctx, .vtable = &.{ .fullPayload = fullPayload } };
-            }
-            fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
-                return @as(*@This(), @ptrCast(@alignCast(ptr))).data;
-            }
-        };
-        var p = Payloader{ .data = req };
-        _ = self.ep.write(p.payloader(), .{}) catch |err| {
-            if (err == tcpip.Error.WouldBlock) return;
-            self.finish(false);
-            return;
-        };
-        self.state = .receiving;
     }
 
     fn finish(self: *HttpClient, success: bool) void {
@@ -380,11 +382,11 @@ const HttpServer = struct {
         while (true) {
             const res = self.listener.accept() catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
-                std.debug.print("Server accept error: {}\n", .{err});
+                // std.debug.print("Server accept error: {}\n", .{err});
                 return;
             };
-            std.debug.print("Server: Accepted connection from {any}\n", .{res.ep.getRemoteAddress()});
-            _ = Connection.init(self.allocator, res.ep, res.wq, self.mux, self) catch continue;
+            const conn = Connection.init(self.allocator, res.ep, res.wq, self.mux, self) catch continue;
+            conn.onData();
         }
     }
 
@@ -454,6 +456,7 @@ const Connection = struct {
 
     fn close(self: *Connection) void {
         self.wq.eventUnregister(&self.app_entry.wait_entry);
+        _ = self.ep.shutdown(0) catch {};
         self.ep.close();
         self.allocator.destroy(self);
     }

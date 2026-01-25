@@ -166,13 +166,14 @@ pub const IPv4Endpoint = struct {
         }
 
         const hlen = h.headerLength();
-        if (header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0)) != 0) {
-            std.debug.print("IPv4: Checksum failure from {any}\n", .{h.sourceAddress()});
-            // return; // Disable drop for debugging
+        const csum_calc = header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0));
+        if (csum_calc != 0) {
+            // std.debug.print("IPv4: Checksum failure from {any} (Calculated: 0x{x}, Header: 0x{x})\n", .{h.sourceAddress(), csum_calc, h.checksum()});
+            return;
         }
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {
-            std.debug.print("IPv4: Fragment received. offset={}, more={}\n", .{ h.fragmentOffset(), h.moreFragments() });
+            // std.debug.print("IPv4: Fragment received. offset={}, more={}\n", .{ h.fragmentOffset(), h.moreFragments() });
             const key = ReassemblyKey{
                 .src = .{ .v4 = h.sourceAddress() },
                 .dst = .{ .v4 = h.destinationAddress() },

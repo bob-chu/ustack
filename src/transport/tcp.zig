@@ -12,6 +12,19 @@ const congestion = @import("congestion/control.zig");
 
 pub const ProtocolNumber = 6;
 
+fn seqBefore(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) < 0;
+}
+fn seqBeforeEq(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) <= 0;
+}
+fn seqAfter(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) > 0;
+}
+fn seqAfterEq(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) >= 0;
+}
+
 pub const EndpointState = enum {
     initial,
     bound,
@@ -29,6 +42,8 @@ pub const EndpointState = enum {
     closing,
     error_state,
 };
+
+var ephemeral_counter: std.atomic.Value(u16) = std.atomic.Value(u16).init(0);
 
 pub const TCPProtocol = struct {
     pub fn init() TCPProtocol {
@@ -65,6 +80,10 @@ pub const TCPProtocol = struct {
 
     fn handlePacket_external(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
         _ = ptr;
+        
+        // Debug Dispatch
+        // std.debug.print("TCP Dispatch: Local={any}:{d} Remote={any}:{d}\n", .{id.local_address, id.local_port, id.remote_address, id.remote_port});
+
         // Global handler for TCP packets (e.g. for SYN to listening sockets)
         // Find existing endpoint
         const ep_opt = r.nic.stack.endpoints.get(id);
@@ -285,6 +304,7 @@ pub const TCPEndpoint = struct {
         if (it != null) {
             self.retransmit_count += 1;
             if (self.retransmit_count > 30) { // Roughly 6 seconds with 200ms ticks
+                // std.debug.print("TCP: Connection timed out (too many retransmits)\n", .{});
                 self.state = .error_state;
                 // Clear snd_queue to stop retransmissions
                 while (self.snd_queue.popFirst()) |node| {
@@ -300,6 +320,7 @@ pub const TCPEndpoint = struct {
 
         while (it) |node| {
             if (now - node.data.timestamp > 200) {
+                // std.debug.print("Retransmit: Seq={} LastAck={} QueueLen=Unknown\n", .{node.data.seq, self.last_ack});
                 self.cc.onLoss();
 
                 const local_address = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
@@ -410,6 +431,7 @@ pub const TCPEndpoint = struct {
         defer self.mutex.unlock();
 
         const node = self.rcv_list.popFirst() orelse {
+            if (self.state == .error_state) return tcpip.Error.InvalidEndpointState;
             if (self.state == .close_wait or self.state == .closed or self.state == .last_ack or self.state == .time_wait) {
                 return @as(buffer.View, &[_]u8{});
             }
@@ -617,7 +639,9 @@ pub const TCPEndpoint = struct {
         self.local_addr = addr;
         if (self.local_addr.?.port == 0) {
             // Assign ephemeral port
-            self.local_addr.?.port = 10000 + @as(u16, @intCast(@mod(std.time.milliTimestamp(), 10000)));
+            // Use global counter to ensure uniqueness in tight loops
+            const off = ephemeral_counter.fetchAdd(1, .monotonic);
+            self.local_addr.?.port = 30000 + @as(u16, @intCast((@as(u64, @intCast(std.time.milliTimestamp())) + off) % 20000));
         }
         return;
     }
@@ -691,9 +715,12 @@ pub const TCPEndpoint = struct {
 
         const v = pkt.data.first() orelse return;
         const h = header.TCP.init(v);
+        
         const fl = h.flags();
-
+        // std.debug.print("TCP Rx: State={} Flags=0x{x} Seq={} Ack={} SndNxt={} Ports={}:{}\n", .{self.state, fl, h.sequenceNumber(), h.ackNumber(), self.snd_nxt, h.sourcePort(), h.destinationPort()});
+        
         if (fl & header.TCPFlagRst != 0) {
+            // std.debug.print("TCP: Connection reset by peer (RST received)\n", .{});
             self.state = .error_state;
             notify_mask |= waiter.EventErr;
             return;
@@ -853,6 +880,7 @@ pub const TCPEndpoint = struct {
                         self.state = .established;
                         self.rcv_nxt = h.sequenceNumber() + 1;
                         self.snd_nxt = h.ackNumber();
+                        self.last_ack = self.snd_nxt;
                         // Clear SYN from snd_queue (it is ACKed)
                         if (self.snd_queue.popFirst()) |node| {
                             node.data.data.deinit();
@@ -887,6 +915,7 @@ pub const TCPEndpoint = struct {
                 if (h.sequenceNumber() == self.rcv_nxt) {
                     const data_len = pkt.data.size - h.dataOffset();
                     if (data_len > 0) {
+                        // std.debug.print("TCP: Received {} bytes of data. Seq={} RcvNxt={}\n", .{data_len, h.sequenceNumber(), self.rcv_nxt});
                         var mut_pkt = pkt;
                         mut_pkt.data.trimFront(h.dataOffset());
 
@@ -903,12 +932,24 @@ pub const TCPEndpoint = struct {
                         }
                         notify_mask |= waiter.EventIn;
                     }
+                    if (fl & header.TCPFlagFin != 0) {
+                        self.rcv_nxt += 1;
+                        self.state = .close_wait;
+                        self.sendControl(header.TCPFlagAck) catch {};
+                        self.rcv_packets_since_ack = 0;
+                        notify_mask |= waiter.EventIn | waiter.EventHUp;
+                    }
+                } else {
+                    // Send duplicate ACK for reliability (peer might have missed previous ACK)
+                    if (fl & header.TCPFlagRst == 0) {
+                        self.sendControl(header.TCPFlagAck) catch {};
+                    }
                 }
 
-                // Always check for ACK processing (piggybacked or pure)
+                // Ack processing
                 if (fl & header.TCPFlagAck != 0) {
                     const ack = h.ackNumber();
-                    if (ack <= self.snd_nxt and ack >= self.last_ack) {
+                    if (seqBeforeEq(ack, self.snd_nxt) and seqAfterEq(ack, self.last_ack)) {
                         // Valid ACK
                         self.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(self.snd_wnd_scale));
 
@@ -959,8 +1000,9 @@ pub const TCPEndpoint = struct {
                             var it = self.snd_queue.first;
 
                             while (it) |node| {
-                                const seg_end = node.data.seq + node.data.len;
-                                if (seg_end <= ack) {
+                                const flag_len: u32 = if ((node.data.flags & (header.TCPFlagSyn | header.TCPFlagFin)) != 0) 1 else 0;
+                                const seg_end = node.data.seq + node.data.len + flag_len;
+                                if (seqBeforeEq(seg_end, ack)) {
                                     const next = node.next;
                                     self.snd_queue.remove(node);
                                     node.data.data.deinit();
@@ -979,14 +1021,6 @@ pub const TCPEndpoint = struct {
                             notify_mask |= waiter.EventOut;
                         }
                     }
-                }
-
-                if (fl & header.TCPFlagFin != 0) {
-                    self.rcv_nxt += 1;
-                    self.state = .close_wait;
-                    self.sendControl(header.TCPFlagAck) catch {};
-                    self.rcv_packets_since_ack = 0;
-                    notify_mask |= waiter.EventIn | waiter.EventHUp;
                 }
             },
             .fin_wait1 => {
