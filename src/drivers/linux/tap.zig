@@ -3,6 +3,7 @@ const stack = @import("../../stack.zig");
 const tcpip = @import("../../tcpip.zig");
 const header = @import("../../header.zig");
 const buffer = @import("../../buffer.zig");
+const log = @import("../../log.zig").scoped(.tap);
 
 extern fn my_tuntap_init(fd: i32, name: [*:0]const u8) i32;
 
@@ -26,7 +27,7 @@ pub const Tap = struct {
 
         const rc = my_tuntap_init(fd, name_c);
         if (rc < 0) {
-            std.debug.print("my_tuntap_init failed: rc={}\n", .{rc});
+            log.err("my_tuntap_init failed: rc={}", .{rc});
             return error.TunsetiffFailed;
         }
 
@@ -87,7 +88,7 @@ pub const Tap = struct {
 
         const rc = std.os.linux.write(self.fd, buf.ptr, buf.len);
         if (std.posix.errno(rc) != .SUCCESS) {
-            std.debug.print("writePacket failed: fd={}, rc={}, err={}\n", .{ self.fd, rc, std.posix.errno(rc) });
+            log.err("writePacket failed: fd={}, rc={}, err={}", .{ self.fd, rc, std.posix.errno(rc) });
             return tcpip.Error.UnknownDevice;
         }
     }

@@ -4,12 +4,26 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const LogLevel = enum {
+        err,
+        warn,
+        info,
+        debug,
+        none,
+    };
+    const log_level = b.option(LogLevel, "log_level", "Log level for ustack (default: warn)") orelse .warn;
+
+    const options = b.addOptions();
+    options.addOption(LogLevel, "log_level", log_level);
+    const options_mod = options.createModule();
+
     const lib = b.addStaticLibrary(.{
         .name = "ustack",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    lib.root_module.addImport("build_options", options_mod);
     b.installArtifact(lib);
 
     const dylib = b.addSharedLibrary(.{
@@ -18,17 +32,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    dylib.root_module.addImport("build_options", options_mod);
     b.installArtifact(dylib);
 
     const ustack_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
     });
+    ustack_mod.addImport("build_options", options_mod);
 
     const main_tests = b.addTest(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    main_tests.root_module.addImport("build_options", options_mod);
 
     const run_main_tests = b.addRunArtifact(main_tests);
 

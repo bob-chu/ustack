@@ -3,6 +3,7 @@ const stack = @import("../../stack.zig");
 const tcpip = @import("../../tcpip.zig");
 const header = @import("../../header.zig");
 const buffer = @import("../../buffer.zig");
+const log = @import("../../log.zig").scoped(.af_packet);
 
 /// A LinkEndpoint implementation for Linux AF_PACKET (Raw Sockets).
 /// This allows sending/receiving raw Ethernet frames on a physical interface.
@@ -70,7 +71,7 @@ pub const AfPacket = struct {
         _ = protocol;
 
         const total_len = pkt.header.usedLength() + pkt.data.size;
-        // std.debug.print("Tx Packet on {}, len={}\n", .{ self.fd, total_len });
+        log.debug("Tx Packet on {}, len={}", .{ self.fd, total_len });
         var buf = self.allocator.alloc(u8, total_len) catch return tcpip.Error.NoBufferSpace;
         defer self.allocator.free(buf);
 
@@ -118,7 +119,8 @@ pub const AfPacket = struct {
         if (len == 0) return false;
 
         // Debug Log
-        // std.debug.print("Rx Packet on {}, len={}\n", .{ self.fd, len });
+            log.debug("Rx Packet on {}, len={}", .{ self.fd, len });
+
 
         // Pass the FULL frame to the dispatcher (EthernetEndpoint expects it)
         const frame_buf = try self.allocator.alloc(u8, len);

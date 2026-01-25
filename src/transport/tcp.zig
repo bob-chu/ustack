@@ -5,6 +5,7 @@ const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
 const waiter = @import("../waiter.zig");
 const ipv4 = @import("../network/ipv4.zig");
+const log = @import("../log.zig").scoped(.tcp);
 
 const time = @import("../time.zig");
 
@@ -82,7 +83,7 @@ pub const TCPProtocol = struct {
         _ = ptr;
         
         // Debug Dispatch
-        // std.debug.print("TCP Dispatch: Local={any}:{d} Remote={any}:{d}\n", .{id.local_address, id.local_port, id.remote_address, id.remote_port});
+        log.debug("TCP Dispatch: Local={any}:{d} Remote={any}:{d}", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
 
         // Global handler for TCP packets (e.g. for SYN to listening sockets)
         // Find existing endpoint
@@ -304,7 +305,7 @@ pub const TCPEndpoint = struct {
         if (it != null) {
             self.retransmit_count += 1;
             if (self.retransmit_count > 30) { // Roughly 6 seconds with 200ms ticks
-                // std.debug.print("TCP: Connection timed out (too many retransmits)\n", .{});
+                log.warn("TCP: Connection timed out (too many retransmits)", .{});
                 self.state = .error_state;
                 // Clear snd_queue to stop retransmissions
                 while (self.snd_queue.popFirst()) |node| {
@@ -320,7 +321,7 @@ pub const TCPEndpoint = struct {
 
         while (it) |node| {
             if (now - node.data.timestamp > 200) {
-                // std.debug.print("Retransmit: Seq={} LastAck={} QueueLen=Unknown\n", .{node.data.seq, self.last_ack});
+                log.debug("Retransmit: Seq={} LastAck={} QueueLen=Unknown", .{ node.data.seq, self.last_ack });
                 self.cc.onLoss();
 
                 const local_address = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
@@ -717,10 +718,10 @@ pub const TCPEndpoint = struct {
         const h = header.TCP.init(v);
         
         const fl = h.flags();
-        // std.debug.print("TCP Rx: State={} Flags=0x{x} Seq={} Ack={} SndNxt={} Ports={}:{}\n", .{self.state, fl, h.sequenceNumber(), h.ackNumber(), self.snd_nxt, h.sourcePort(), h.destinationPort()});
+        log.debug("TCP Rx: State={} Flags=0x{x} Seq={} Ack={} SndNxt={} Ports={}:{}", .{ self.state, fl, h.sequenceNumber(), h.ackNumber(), self.snd_nxt, h.sourcePort(), h.destinationPort() });
         
         if (fl & header.TCPFlagRst != 0) {
-            // std.debug.print("TCP: Connection reset by peer (RST received)\n", .{});
+            log.warn("TCP: Connection reset by peer (RST received)", .{});
             self.state = .error_state;
             notify_mask |= waiter.EventErr;
             return;
@@ -915,7 +916,7 @@ pub const TCPEndpoint = struct {
                 if (h.sequenceNumber() == self.rcv_nxt) {
                     const data_len = pkt.data.size - h.dataOffset();
                     if (data_len > 0) {
-                        // std.debug.print("TCP: Received {} bytes of data. Seq={} RcvNxt={}\n", .{data_len, h.sequenceNumber(), self.rcv_nxt});
+                        log.debug("TCP: Received {} bytes of data. Seq={} RcvNxt={}", .{ data_len, h.sequenceNumber(), self.rcv_nxt });
                         var mut_pkt = pkt;
                         mut_pkt.data.trimFront(h.dataOffset());
 

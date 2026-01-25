@@ -4,6 +4,7 @@ const buffer = @import("buffer.zig");
 const header = @import("header.zig");
 const waiter = @import("waiter.zig");
 const time = @import("time.zig");
+const log = @import("log.zig").scoped(.stack);
 
 pub const LinkEndpointCapabilities = u32;
 pub const CapabilityNone: LinkEndpointCapabilities = 0;
@@ -276,7 +277,7 @@ pub const NIC = struct {
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
-        // std.debug.print("NIC: Received packet proto=0x{x} remote={any} local={any}\n", .{protocol, remote, local});
+        log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
 
         self.stack.mutex.lock();
         const proto_opt = self.stack.network_protocols.get(protocol);
@@ -721,10 +722,10 @@ pub const Stack = struct {
                     ep.decRef();
                 } else {
                     if (protocol == 17) {
-                        std.debug.print("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}\n", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
-                        // print ids
-                        std.debug.print("Exact: local={any}:{} remote={any}:{}\n", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
-                        std.debug.print("Any: local={any}:{} remote={any}:{}\n", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });
+        log.warn("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
+        log.debug("Exact: local={any}:{} remote={any}:{}", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
+        log.debug("Any: local={any}:{} remote={any}:{}", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });
+
                     }
                 }
             }

@@ -4,6 +4,7 @@ const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
 const waiter = @import("../waiter.zig");
+const log = @import("../log.zig").scoped(.icmpv6);
 
 pub const ProtocolNumber = 58;
 
@@ -160,7 +161,7 @@ pub const ICMPv6PacketHandler = struct {
                     const is_dad = src_is_unspecified;
 
                     if (is_dad) {
-                        std.debug.print("IPv6 DAD Conflict detected for address {any}\n", .{target});
+                        log.err("IPv6 DAD Conflict detected for address {any}", .{target});
                     }
 
                     var na_buf = s.allocator.alloc(u8, header.ICMPv6MinimumSize + 20 + 8) catch return;

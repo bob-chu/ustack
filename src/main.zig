@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 pub const buffer = @import("buffer.zig");
 pub const header = @import("header.zig");
+pub const log = @import("log.zig");
 pub const stack = @import("stack.zig");
 pub const waiter = @import("waiter.zig");
 pub const time = @import("time.zig");

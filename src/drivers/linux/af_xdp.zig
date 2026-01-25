@@ -3,6 +3,7 @@ const stack = @import("../../stack.zig");
 const tcpip = @import("../../tcpip.zig");
 const buffer = @import("../../buffer.zig");
 const xdp = @import("xdp_defs.zig");
+const log = @import("../../log.zig").scoped(.af_xdp);
 
 /// A LinkEndpoint implementation for Linux AF_XDP (Express Data Path).
 pub const AfXdp = struct {
@@ -108,7 +109,7 @@ pub const AfXdp = struct {
         // 7. Bind
         const ifindex = try getIfIndex(if_name);
         const mac = try getIfMac(if_name);
-        std.debug.print("AF_XDP: Binding to {s} (index={}, mac={x}:{x}:{x}:{x}:{x}:{x}) queue={}\n", .{ if_name, ifindex, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], queue_id });
+        log.info("AF_XDP: Binding to {s} (index={}, mac={x}:{x}:{x}:{x}:{x}:{x}) queue={}", .{ if_name, ifindex, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], queue_id });
 
         var sa = xdp.sockaddr_xdp{
             .family = std.posix.AF.XDP,

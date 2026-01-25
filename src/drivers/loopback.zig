@@ -2,6 +2,7 @@ const std = @import("std");
 const stack = @import("../stack.zig");
 const tcpip = @import("../tcpip.zig");
 const buffer = @import("../buffer.zig");
+const log = @import("../log.zig").scoped(.loopback);
 
 /// A simple LinkEndpoint for loopback.
 /// It queues packets and delivers them on tick() to avoid recursive deadlocks.
@@ -42,7 +43,7 @@ pub const Loopback = struct {
         const self = @as(*Loopback, @ptrCast(@alignCast(ptr)));
         _ = r;
 
-        std.debug.print("Loopback: Queuing packet proto=0x{x} len={}\n", .{ protocol, pkt.data.size });
+        log.debug("Loopback: Queuing packet proto=0x{x} len={}", .{ protocol, pkt.data.size });
 
         // Deep clone packet to store in queue
         const node = self.allocator.create(std.TailQueue(Packet).Node) catch return tcpip.Error.NoBufferSpace;
@@ -58,7 +59,7 @@ pub const Loopback = struct {
 
     pub fn tick(self: *Loopback) void {
         while (self.queue.popFirst()) |node| {
-            std.debug.print("Loopback: Delivering packet proto=0x{x}\n", .{node.data.protocol});
+            log.debug("Loopback: Delivering packet proto=0x{x}", .{node.data.protocol});
             if (self.dispatcher) |d| {
                 d.deliverNetworkPacket(&self.address, &self.address, node.data.protocol, node.data.pkt);
             }

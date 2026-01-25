@@ -4,6 +4,7 @@ const stack = @import("stack.zig");
 const header = @import("header.zig");
 const waiter = @import("waiter.zig");
 const buffer = @import("buffer.zig");
+const log = @import("log.zig").scoped(.dns);
 
 pub const Resolver = struct {
     stack: *stack.Stack,
@@ -51,9 +52,9 @@ pub const Resolver = struct {
         try ep.bind(.{ .nic = 1, .addr = bind_addr, .port = 0 });
 
         // Debug: check assigned port
-        // if (ep.getLocalAddress()) |la| {
-        //     std.debug.print("DNS: Bound to port {}\n", .{la.port});
-        // } else |_| {}
+        if (ep.getLocalAddress()) |la| {
+            log.debug("DNS: Bound to port {}", .{la.port});
+        } else |_| {}
 
         // Build DNS query
         var dns_buf = try self.allocator.alloc(u8, 512);

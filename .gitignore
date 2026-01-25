@@ -18,3 +18,4 @@ test_ev_only.zig
 test_if_only.zig
 test_tun_only.zig
 test_writev.zig
+LOGGING_CHECKLIST.md
