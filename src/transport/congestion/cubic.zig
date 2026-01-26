@@ -17,8 +17,8 @@ pub const Cubic = struct {
     pub fn init(allocator: std.mem.Allocator, mss: u32) !CongestionControl {
         const self = try allocator.create(Cubic);
         self.* = .{
-            .cwnd = mss,
-            .ssthresh = 65535,
+            .cwnd = 32 * mss,
+            .ssthresh = 1024 * 1024 * 4,
             .mss = mss,
             .w_max = 0,
             .k = 0,

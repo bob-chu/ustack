@@ -91,10 +91,11 @@ pub const AfPacket = struct {
                 iov_cnt += 1;
             }
 
-            _ = std.posix.writev(self.fd, iovecs[0..iov_cnt]) catch |err| {
+            const n = std.posix.writev(self.fd, iovecs[0..iov_cnt]) catch |err| {
                 if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
                 return tcpip.Error.UnknownDevice;
             };
+            log.debug("Tx {} bytes on {}", .{ n, self.fd });
         }
     }
 

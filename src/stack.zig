@@ -306,11 +306,17 @@ pub const NIC = struct {
         if (proto_opt == null) return;
         const proto = proto_opt.?;
 
+        self.stack.mutex.lock();
         const ep_opt = self.network_endpoints.get(protocol);
+        self.stack.mutex.unlock();
+        
         if (ep_opt == null) return;
         const ep = ep_opt.?;
 
         const addrs = proto.parseAddresses(pkt);
+        if (!addrs.src.isAny()) {
+            self.stack.addLinkAddress(addrs.src, remote.*) catch {};
+        }
 
         const r = Route{
             .local_address = addrs.dst,
@@ -650,8 +656,9 @@ pub const Stack = struct {
         return self.route_table.removeRoutes(match);
     }
 
-    // Get all routes
     pub fn getRouteTable(self: *Stack) []const RouteEntry {
+        self.route_table.mutex.lock();
+        defer self.route_table.mutex.unlock();
         return self.route_table.getRoutes();
     }
 

@@ -26,6 +26,7 @@ pub const Entry = struct {
     mask: EventMask = 0,
     next: ?*Entry = null,
     prev: ?*Entry = null,
+    is_queued: bool = false,
 
     pub fn init(context: ?*anyopaque, callback: ?*const fn (e: *Entry) void) Entry {
         return .{

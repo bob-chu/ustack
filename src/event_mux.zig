@@ -73,12 +73,10 @@ const ReadyQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Deduplicate: Don't add if already in queue
-        for (self.list.items) |item| {
-            if (item == entry) return false;
-        }
+        if (entry.is_queued) return false;
 
         try self.list.append(entry);
+        entry.is_queued = true;
         return true;
     }
 
@@ -87,6 +85,10 @@ const ReadyQueue = struct {
         defer self.mutex.unlock();
 
         if (self.list.items.len == 0) return &[_]*waiter.Entry{};
+
+        for (self.list.items) |entry| {
+            entry.is_queued = false;
+        }
 
         const results = try self.list.toOwnedSlice();
         return results;

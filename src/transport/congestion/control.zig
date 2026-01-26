@@ -1,5 +1,8 @@
 const std = @import("std");
 
+pub const BBR = @import("bbr.zig").BBR;
+pub const Cubic = @import("cubic.zig").Cubic;
+
 pub const CongestionControl = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -47,7 +50,7 @@ pub const NewReno = struct {
     pub fn init(allocator: std.mem.Allocator, mss: u32) !CongestionControl {
         const self = try allocator.create(NewReno);
         self.* = .{
-            .cwnd = 10 * mss,
+            .cwnd = 32 * mss,
             .ssthresh = 1024 * 1024 * 4,
             .mss = mss,
             .allocator = allocator,

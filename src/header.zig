@@ -93,7 +93,12 @@ pub const TCPFlagsOffset = 13;
 pub const TCPWinSizeOffset = 14;
 pub const TCPChecksumOffset = 16;
 
+pub const TCPOptionSackPermitted = 4;
+pub const TCPOptionSackPermittedLen = 2;
+pub const TCPOptionSack = 5;
+
 pub const TCPFlagFin = 0x01;
+
 pub const TCPFlagSyn = 0x02;
 pub const TCPFlagRst = 0x04;
 pub const TCPFlagPsh = 0x08;

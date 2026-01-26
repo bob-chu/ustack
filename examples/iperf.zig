@@ -18,6 +18,7 @@ var global_af_packet: AfPacket = undefined;
 var global_eth: ustack.link.eth.EthernetEndpoint = undefined;
 var global_mux: ?*EventMultiplexer = null;
 var global_server: ?*IperfServer = null;
+var global_client: ?*IperfClient = null;
 
 const Protocol = enum { tcp, udp };
 
@@ -48,9 +49,13 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     const config = try parseArgs(args);
+    std.debug.print("Starting iperf with config: {any}\n", .{config});
 
     global_stack = try ustack.init(allocator);
+    std.debug.print("Stack initialized\n", .{});
+    
     global_af_packet = try AfPacket.init(allocator, config.interface);
+    std.debug.print("AF_PACKET initialized on {s}\n", .{config.interface});
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
 
@@ -111,6 +116,7 @@ pub fn main() !void {
         std.debug.print("Iperf server listening on port {}\n", .{config.port});
     } else {
         const client = try IperfClient.init(&global_stack, allocator, mux, config);
+        global_client = client;
         try client.start();
         std.debug.print("Iperf client connecting to {any} port {}\n", .{config.target_ip.?, config.port});
     }
@@ -207,6 +213,9 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     if (global_server) |s| {
         s.report();
     }
+    if (global_client) |c_ptr| {
+        c_ptr.report();
+    }
 }
 
 fn libev_safety_timeout_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
@@ -241,6 +250,7 @@ const IperfServer = struct {
 
     bytes_received: u64 = 0,
     last_report_time: i64 = 0,
+    start_time: i64 = 0, // Added
     udp_start_time: i64 = 0,
     udp_session_active: bool = false,
 
@@ -257,6 +267,7 @@ const IperfServer = struct {
             try ep.listen(128);
         }
 
+        const now = std.time.milliTimestamp();
         self.* = .{
             .listener = ep,
             .allocator = allocator,
@@ -264,7 +275,8 @@ const IperfServer = struct {
             .config = config,
             .mux_ctx = .{ .server = self },
             .wait_entry = undefined,
-            .last_report_time = std.time.milliTimestamp(),
+            .last_report_time = now,
+            .start_time = now,
             .conns = std.ArrayList(*IperfConnection).init(allocator),
         };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
@@ -277,16 +289,50 @@ const IperfServer = struct {
 
     fn report(self: *IperfServer) void {
         if (self.config.protocol == .udp) return;
+        const now = std.time.milliTimestamp();
+        const elapsed = now - self.last_report_time;
+        if (elapsed < 1000) return;
+
+        var total_bytes_interval: u64 = 0;
+        var active_conns: usize = 0;
+
         var i: usize = 0;
         while (i < self.conns.items.len) {
             const conn = self.conns.items[i];
             if (conn.closed) {
                 _ = self.conns.swapRemove(i);
+                self.allocator.destroy(conn.wq);
+                self.allocator.destroy(conn);
                 continue;
             }
-            conn.maybeReport();
+            
+            const bytes = conn.bytes_since_last_report;
+            total_bytes_interval += bytes;
+            active_conns += 1;
+
+            const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
+            const mbps = (@as(f64, @floatFromInt(bytes)) * 8.0) / seconds / 1000000.0;
+            const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
+            const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+
+            std.debug.print("[{d: >3}] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n",
+                .{conn.id, start_sec, end_sec, @as(f64, @floatFromInt(bytes)) / 1024.0 / 1024.0, mbps});
+
+            conn.bytes_since_last_report = 0;
             i += 1;
         }
+
+        if (active_conns > 1) {
+            const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
+            const mbps = (@as(f64, @floatFromInt(total_bytes_interval)) * 8.0) / seconds / 1000000.0;
+            const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
+            const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+
+            std.debug.print("[SUM] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n",
+                .{start_sec, end_sec, @as(f64, @floatFromInt(total_bytes_interval)) / 1024.0 / 1024.0, mbps});
+        }
+
+        self.last_report_time = now;
     }
 
     fn onEvent(self: *IperfServer) void {
@@ -298,6 +344,7 @@ const IperfServer = struct {
                 };
                 std.debug.print("Accepted connection from {any}\n", .{res.ep.getRemoteAddress()});
                 if (IperfConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config)) |conn| {
+                    conn.id = self.conns.items.len; // Assign ID based on count
                     self.conns.append(conn) catch {};
                     conn.onEvent();
                 } else |err| {
@@ -353,16 +400,61 @@ const IperfClient = struct {
     config: Config,
     conns: std.ArrayList(*IperfConnection),
 
+    last_report_time: i64 = 0,
+    start_time: i64 = 0,
+
     pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*IperfClient {
         const self = try allocator.create(IperfClient);
+        const now = std.time.milliTimestamp();
         self.* = .{
             .stack = s,
             .allocator = allocator,
             .mux = mux,
             .config = config,
             .conns = std.ArrayList(*IperfConnection).init(allocator),
+            .last_report_time = now,
+            .start_time = now,
         };
         return self;
+    }
+
+    pub fn report(self: *IperfClient) void {
+        const now = std.time.milliTimestamp();
+        const elapsed = now - self.last_report_time;
+        if (elapsed < 1000) return;
+
+        var total_bytes_interval: u64 = 0;
+        var active_conns: usize = 0;
+
+        for (self.conns.items) |conn| {
+            if (conn.closed) continue;
+            
+            const bytes = conn.bytes_since_last_report;
+            total_bytes_interval += bytes;
+            active_conns += 1;
+
+            const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
+            const mbps = (@as(f64, @floatFromInt(bytes)) * 8.0) / seconds / 1000000.0;
+            const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
+            const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+
+            std.debug.print("[{d: >3}] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n",
+                .{conn.id, start_sec, end_sec, @as(f64, @floatFromInt(bytes)) / 1024.0 / 1024.0, mbps});
+
+            conn.bytes_since_last_report = 0;
+        }
+
+        if (active_conns > 1) {
+            const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
+            const mbps = (@as(f64, @floatFromInt(total_bytes_interval)) * 8.0) / seconds / 1000000.0;
+            const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
+            const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+
+            std.debug.print("[SUM] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n",
+                .{start_sec, end_sec, @as(f64, @floatFromInt(total_bytes_interval)) / 1024.0 / 1024.0, mbps});
+        }
+
+        self.last_report_time = now;
     }
 
     pub fn start(self: *IperfClient) !void {
@@ -466,9 +558,26 @@ const IperfConnection = struct {
                 std.debug.print("[{d: >3}]  0.00-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  receiver\n",
                     .{self.id, total_seconds, @as(f64, @floatFromInt(self.total_bytes)) / 1024.0 / 1024.0, total_mbps});
 
-                std.debug.print("[{}] Server EOF. Total bytes: {}\n", .{self.id, self.total_bytes});
                 self.allocator.free(buf);
                 self.close();
+
+                if (global_server) |s| {
+                    var all_closed = true;
+                    var total_all: u64 = 0;
+                    var max_time: i64 = 0;
+                    for (s.conns.items) |c_ptr| {
+                        if (!c_ptr.closed) all_closed = false;
+                        total_all += c_ptr.total_bytes;
+                        const t = now - c_ptr.start_time;
+                        if (t > max_time) max_time = t;
+                    }
+                    if (all_closed and s.conns.items.len > 1) {
+                        const sum_seconds = @as(f64, @floatFromInt(max_time)) / 1000.0;
+                        const sum_mbps = (@as(f64, @floatFromInt(total_all)) * 8.0) / sum_seconds / 1000000.0;
+                        std.debug.print("[SUM]  0.00-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  receiver\n",
+                            .{sum_seconds, @as(f64, @floatFromInt(total_all)) / 1024.0 / 1024.0, sum_mbps});
+                    }
+                }
                 return;
             }
             self.bytes_since_last_report += buf.len;
@@ -489,8 +598,6 @@ const IperfConnection = struct {
             if (tcp_ep.state != .established) return;
         }
         
-        self.maybeReport();
-
         const Payloader = struct {
             data: []const u8,
             pub fn payloader(ctx: *@This()) tcpip.Payloader {
@@ -519,9 +626,29 @@ const IperfConnection = struct {
             self.total_bytes += n;
             
             if (std.time.milliTimestamp() - self.start_time > self.config.time * 1000) {
-                std.debug.print("[{}] Test finished. Total: {} bytes\n", .{self.id, self.total_bytes});
                 self.close();
-                std.process.exit(0);
+                if (global_client) |c_ptr| {
+                    var all_closed = true;
+                    var total_all: u64 = 0;
+                    for (c_ptr.conns.items) |conn| {
+                        if (!conn.closed) {
+                            all_closed = false;
+                        }
+                        total_all += conn.total_bytes;
+                    }
+                    if (all_closed) {
+                        const total_elapsed = std.time.milliTimestamp() - c_ptr.start_time;
+                        const total_seconds = @as(f64, @floatFromInt(total_elapsed)) / 1000.0;
+                        const total_mbps = (@as(f64, @floatFromInt(total_all)) * 8.0) / total_seconds / 1000000.0;
+                        std.debug.print("[SUM]  0.00-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  sender\n",
+                            .{total_seconds, @as(f64, @floatFromInt(total_all)) / 1024.0 / 1024.0, total_mbps});
+                        std.debug.print("Test finished. Total: {} bytes\n", .{total_all});
+                        std.process.exit(0);
+                    }
+                } else {
+                    std.process.exit(0);
+                }
+                return;
             }
         }
         
@@ -529,26 +656,6 @@ const IperfConnection = struct {
             _ = mux.ready_queue.push(&self.wait_entry) catch false;
             const val: u64 = 1;
             _ = std.posix.write(mux.signal_fd, std.mem.asBytes(&val)) catch {};
-        }
-    }
-
-    fn maybeReport(self: *IperfConnection) void {
-        if (self.closed) return;
-        const now = std.time.milliTimestamp();
-        const elapsed = now - self.last_report_time;
-        if (elapsed >= 1000) {
-            const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
-            const bytes = @as(f64, @floatFromInt(self.bytes_since_last_report));
-            const mbps = (bytes * 8.0) / seconds / 1000000.0;
-
-            const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
-            const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
-
-            std.debug.print("[{d: >3}] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n",
-                .{self.id, start_sec, end_sec, bytes / 1024.0 / 1024.0, mbps});
-
-            self.bytes_since_last_report = 0;
-            self.last_report_time = now;
         }
     }
 

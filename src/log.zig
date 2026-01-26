@@ -1,9 +1,15 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-pub const Level = @TypeOf(build_options.log_level);
+pub const Level = enum { err, warn, info, debug, none };
 
-pub const log_level: Level = build_options.log_level;
+pub const log_level: Level = switch (build_options.log_level) {
+    .err => .err,
+    .warn => .warn,
+    .info => .info,
+    .debug => .debug,
+    .none => .none,
+};
 
 pub fn err(comptime format: []const u8, args: anytype) void {
     if (@intFromEnum(log_level) != @intFromEnum(Level.none) and @intFromEnum(Level.err) <= @intFromEnum(log_level)) {
