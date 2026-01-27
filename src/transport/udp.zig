@@ -10,14 +10,23 @@ pub const ProtocolNumber = 17;
 pub const UDPProtocol = struct {
     view_pool: buffer.BufferPool,
     header_pool: buffer.BufferPool,
+    packet_node_pool: buffer.Pool(std.TailQueue(UDPEndpoint.Packet).Node),
 
     pub fn init(allocator: std.mem.Allocator) *UDPProtocol {
         const self = allocator.create(UDPProtocol) catch unreachable;
         self.* = .{
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 131072),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 131072),
+            .packet_node_pool = buffer.Pool(std.TailQueue(UDPEndpoint.Packet).Node).init(allocator, 131072),
         };
         return self;
+    }
+
+    pub fn deinit(self: *UDPProtocol, allocator: std.mem.Allocator) void {
+        self.view_pool.deinit();
+        self.header_pool.deinit();
+        self.packet_node_pool.deinit();
+        allocator.destroy(self);
     }
 
     pub fn protocol(self: *UDPProtocol) stack.TransportProtocol {
@@ -114,7 +123,7 @@ pub const UDPEndpoint = struct {
         self.mutex.lock();
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
-            self.stack.allocator.destroy(node);
+            self.proto.packet_node_pool.release(node);
         }
         self.mutex.unlock();
         self.stack.allocator.destroy(self);
@@ -199,9 +208,11 @@ pub const UDPEndpoint = struct {
         const h = header.UDP.init(mut_pkt.data.first() orelse return);
         mut_pkt.data.trimFront(header.UDPMinimumSize);
 
-        const cloned_data = mut_pkt.data.clone(self.stack.allocator) catch return;
+        // We MUST clone the data because the underlying views (from onReadable)
+        // are stack-allocated or temporary and will be invalid after this function returns.
+        const cloned_data = mut_pkt.data.cloneInPool(&self.proto.view_pool) catch return;
 
-        const node = self.stack.allocator.create(std.TailQueue(Packet).Node) catch {
+        const node = self.proto.packet_node_pool.acquire() catch {
             var tmp = cloned_data;
             tmp.deinit();
             return;
@@ -277,7 +288,7 @@ pub const UDPEndpoint = struct {
         }
 
         const res = node.data.data;
-        self.stack.allocator.destroy(node);
+        self.proto.packet_node_pool.release(node);
         return res;
     }
 
@@ -397,6 +408,7 @@ test "UDP handlePacket" {
 
     var wq = waiter.Queue{};
     const udp_proto = UDPProtocol.init(allocator);
+    defer udp_proto.deinit(allocator);
     var ep = try allocator.create(UDPEndpoint);
     ep.* = UDPEndpoint.init(&s, udp_proto, &wq);
     defer ep.transportEndpoint().close();

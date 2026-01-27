@@ -142,19 +142,27 @@ pub const IPv4Endpoint = struct {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
         const max_payload = self.nic.linkEP.mtu() - header.IPv4MinimumSize;
 
-        if (r.remote_link_address == null) {
-            // log.debug("IPv4: Triggering ARP for {any}", .{r.remote_address});
+        var remote_link_address = r.remote_link_address;
+        if (remote_link_address == null) {
+            self.nic.stack.mutex.lock();
+            const next_hop = r.next_hop orelse r.remote_address;
+            remote_link_address = self.nic.stack.link_addr_cache.get(next_hop);
+            self.nic.stack.mutex.unlock();
+        }
+
+        if (remote_link_address == null) {
             const arp_proto_ptr = self.nic.stack.network_protocols.get(0x0806) orelse return tcpip.Error.NoRoute;
             arp_proto_ptr.linkAddressRequest(r.remote_address, r.local_address, self.nic) catch {};
             return tcpip.Error.WouldBlock;
         }
 
-        // Note: This is an optimization. We could allocate a larger buffer for all packets, 
-        // but for now we just process each packet individually to add the IP header and then
-        // pass the batch down.
-        // We reuse the packet buffers provided.
-        var mut_packets = try self.nic.stack.allocator.alloc(tcpip.PacketBuffer, packets.len);
-        defer self.nic.stack.allocator.free(mut_packets);
+        var mut_r = r.*;
+        mut_r.remote_link_address = remote_link_address;
+
+        // Use a stack-allocated buffer for the mutable packet pointers to avoid heap allocation.
+        var mut_packets_storage: [64]tcpip.PacketBuffer = undefined;
+        if (packets.len > 64) return tcpip.Error.MessageTooLong;
+        const mut_packets = mut_packets_storage[0..packets.len];
         
         for (packets, 0..) |pkt, i| {
             if (pkt.data.size > max_payload) return tcpip.Error.MessageTooLong;
@@ -176,7 +184,7 @@ pub const IPv4Endpoint = struct {
             mut_packets[i] = mut_pkt;
         }
 
-        return self.nic.linkEP.writePackets(r, ProtocolNumber, mut_packets);
+        return self.nic.linkEP.writePackets(&mut_r, ProtocolNumber, mut_packets);
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {
@@ -196,7 +204,7 @@ pub const IPv4Endpoint = struct {
         }
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {
-            log.debug("IPv4: Fragment received. offset={}, more={}", .{ h.fragmentOffset(), h.moreFragments() });
+            // log.debug("IPv4: Fragment received. offset={}, more={}", .{ h.fragmentOffset(), h.moreFragments() });
             const key = ReassemblyKey{
                 .src = .{ .v4 = h.sourceAddress() },
                 .dst = .{ .v4 = h.destinationAddress() },
@@ -282,18 +290,6 @@ pub const IPv4Endpoint = struct {
                 };
 
                 const p = h.protocol();
-                // Pass ownership of reassembled_buf to dispatcher/upper layers
-                // The upper layer is responsible for freeing it, or we rely on the fact that
-                // VectorisedView points to it. BUT, packet buffers usually don't own their views.
-                // Here we allocated it.
-                // Ideally, we should wrap it in a way that it gets freed.
-                // For now, we assume the dispatcher will consume it immediately.
-                // To be safe against leaks, we should probably rely on a smarter buffer management.
-                // But for this fix, we just ensure we don't leak if dispatch fails or we return.
-                // Wait, if we free it here (as in the original code), the upper layer receives a dangling pointer!
-                // The original code had: self.nic.stack.allocator.free(reassembled_buf); AFTER deliverTransportPacket.
-                // This implies deliverTransportPacket MUST copy or process synchronously.
-                // If it queues it, it's a bug. But let's assume sync processing for now.
                 self.dispatcher.deliverTransportPacket(r, p, reassembled_pkt);
                 self.nic.stack.allocator.free(reassembled_buf);
             }

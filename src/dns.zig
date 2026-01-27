@@ -195,7 +195,8 @@ test "DNS Query and Response Parsing" {
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
 
-    var udp_proto = @import("transport/udp.zig").UDPProtocol.init();
+    var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
+    defer udp_proto.deinit(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
 
     var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
@@ -216,8 +217,8 @@ test "DNS Query and Response Parsing" {
             @memcpy(self.last_pkt.?[0..hdr_view.len], hdr_view);
             var offset = hdr_view.len;
             for (pkt.data.views) |v| {
-                @memcpy(self.last_pkt.?[offset .. offset + v.len], v);
-                offset += v.len;
+                @memcpy(self.last_pkt.?[offset .. offset + v.view.len], v.view);
+                offset += v.view.len;
             }
             return;
         }
@@ -374,7 +375,7 @@ test "DNS Query and Response Parsing" {
     udp_h.setChecksum(0);
     @memcpy(full_resp[8..], resp_buf[0..idx]);
 
-    var full_views = [_]buffer.View{full_resp};
+    var full_views = [_]buffer.ClusterView{.{ .cluster = null, .view = full_resp }};
     const full_pkt = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(full_resp.len, &full_views),
         .header = buffer.Prependable.init(&[_]u8{}),

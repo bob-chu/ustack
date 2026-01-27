@@ -272,7 +272,8 @@ test "POSIX API TCP client/server" {
     defer s.deinit();
 
     // Setup protocols
-    var tcp_proto = @import("transport/tcp.zig").TCPProtocol.init();
+    var tcp_proto = @import("transport/tcp.zig").TCPProtocol.init(allocator);
+    defer tcp_proto.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
     var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
@@ -299,8 +300,8 @@ test "POSIX API TCP client/server" {
             @memcpy(buf[0..hdr_view.len], hdr_view);
             var off = hdr_view.len;
             for (pkt.data.views) |v| {
-                @memcpy(buf[off .. off + v.len], v);
-                off += v.len;
+                @memcpy(buf[off .. off + v.view.len], v.view);
+                off += v.view.len;
             }
 
             // "Transmit" by delivering back to stack (loopback)
@@ -511,6 +512,7 @@ test "POSIX upoll basic" {
     defer s.deinit();
 
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
+    defer udp_proto.deinit(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
     var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
@@ -574,7 +576,7 @@ test "POSIX upoll basic" {
     allocator.free(payload_buf);
     const buf = try allocator.alloc(u8, 8 + 4); // 8 header + 4 payload
     @memset(buf, 0);
-    var views2 = [_]buffer.View{buf};
+    var views2 = [_]buffer.ClusterView{.{ .cluster = null, .view = buf }};
     const pkt = tcpip.PacketBuffer{ .data = buffer.VectorisedView.init(buf.len, &views2), .header = buffer.Prependable.init(&[_]u8{}) };
 
     // Inject directly into endpoint handler (bypassing stack dispatch for simplicity)

@@ -304,7 +304,7 @@ pub const NIC = struct {
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
-        log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
+        // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
 
         self.stack.mutex.lock();
         const proto_opt = self.stack.network_protocols.get(protocol);
@@ -349,9 +349,8 @@ pub const Route = struct {
     route_entry: ?*const RouteEntry = null,
 
     pub fn writePacket(self: *Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-        // std.debug.print("Route: writePacket protocol={}\n", .{protocol});
         // Determine next hop (gateway if route has one, otherwise destination)
-        const next_hop = if (self.route_entry) |entry| entry.gateway else self.remote_address;
+        const next_hop = self.next_hop orelse self.remote_address;
 
         if (self.remote_link_address == null) {
             self.nic.stack.mutex.lock();
@@ -361,7 +360,6 @@ pub const Route = struct {
             if (link_addr_opt) |link_addr| {
                 self.remote_link_address = link_addr;
             } else {
-                std.debug.print("Route: Triggering link address request for {any} via {any}\n", .{next_hop, self.local_address});
                 self.nic.stack.mutex.lock();
                 var it = self.nic.stack.network_protocols.valueIterator();
                 while (it.next()) |proto| {
@@ -538,7 +536,7 @@ pub const Stack = struct {
     route_table: RouteTable,
     timer_queue: time.TimerQueue,
     cluster_pool: buffer.ClusterPool,
-    ephemeral_port: std.atomic.Value(u16) = std.atomic.Value(u16).init(32768),
+    ephemeral_port: std.atomic.Value(u16),
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
         return .{
@@ -551,6 +549,7 @@ pub const Stack = struct {
             .route_table = RouteTable.init(allocator),
             .timer_queue = .{},
             .cluster_pool = buffer.ClusterPool.init(allocator),
+            .ephemeral_port = std.atomic.Value(u16).init(32768),
         };
     }
 
@@ -583,18 +582,28 @@ pub const Stack = struct {
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
         self.mutex.lock();
-        try self.link_addr_cache.put(addr, link_addr);
+        const prev = try self.link_addr_cache.fetchPut(addr, link_addr);
         self.mutex.unlock();
+
+        if (prev != null and prev.?.value.eq(link_addr)) return;
 
         // Notify all transport endpoints that they might be writable now (due to ARP resolution)
         for (&self.endpoints.shards) |*shard| {
             shard.mutex.lock();
+            // Collect references to avoid holding shard lock during notify
+            var entries = std.ArrayList(TransportEndpoint).init(self.allocator);
             var it = shard.endpoints.valueIterator();
             while (it.next()) |ep| {
-                // We notify EventOut. Endpoints that are blocked on ARP should care.
-                ep.vtable.notify.?(ep.ptr, waiter.EventOut);
+                ep.incRef();
+                entries.append(ep.*) catch {};
             }
             shard.mutex.unlock();
+
+            for (entries.items) |ep| {
+                ep.notify(waiter.EventOut);
+                ep.decRef();
+            }
+            entries.deinit();
         }
     }
 
@@ -624,6 +633,8 @@ pub const Stack = struct {
         if (nic_id != 0) {
             self.mutex.lock();
             const nic_opt = self.nics.get(nic_id);
+            const next_hop = remote_addr;
+            const link_addr_opt = self.link_addr_cache.get(next_hop);
             self.mutex.unlock();
 
             const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
@@ -632,8 +643,10 @@ pub const Stack = struct {
                 .local_address = local_addr,
                 .remote_address = remote_addr,
                 .local_link_address = nic.linkEP.linkAddress(),
+                .remote_link_address = link_addr_opt,
                 .net_proto = net_proto,
                 .nic = nic,
+                .next_hop = null,
                 .route_entry = null,
             };
         }
@@ -643,6 +656,8 @@ pub const Stack = struct {
 
         self.mutex.lock();
         const nic_opt = self.nics.get(route_entry.nic);
+        const next_hop = route_entry.gateway;
+        const link_addr_opt = if (next_hop.isAny()) self.link_addr_cache.get(remote_addr) else self.link_addr_cache.get(next_hop);
         self.mutex.unlock();
 
         const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
@@ -662,9 +677,10 @@ pub const Stack = struct {
             .local_address = final_local_addr,
             .remote_address = remote_addr,
             .local_link_address = nic.linkEP.linkAddress(),
+            .remote_link_address = link_addr_opt,
             .net_proto = net_proto,
             .nic = nic,
-            .next_hop = route_entry.gateway,
+            .next_hop = if (next_hop.isAny()) null else next_hop,
             .route_entry = route_entry,
         };
     }
@@ -690,8 +706,6 @@ pub const Stack = struct {
     }
 
     pub fn getRouteTable(self: *Stack) []const RouteEntry {
-        self.route_table.mutex.lock();
-        defer self.route_table.mutex.unlock();
         return self.route_table.getRoutes();
     }
 
@@ -999,7 +1013,7 @@ test "Stack Transport Demux" {
     };
 
     Stack.deliverTransportPacket(&s, &r, 17, .{
-        .data = .{ .views = &[_]buffer.View{}, .size = 0 },
+        .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
         .header = buffer.Prependable.init(&[_]u8{}),
     });
 

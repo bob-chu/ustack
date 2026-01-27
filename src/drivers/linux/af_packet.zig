@@ -198,9 +198,12 @@ pub const AfPacket = struct {
         const num_received = @as(usize, @intCast(signed_count));
         if (num_received == 0) return false;
 
+        //std.debug.print("AfPacket: Received {} packets\n", .{num_received});
+
         for (0..num_received) |j| {
             const len = msgvec[j].msg_len;
             if (len == 0) continue;
+            //std.debug.print("AfPacket: pkt[{}] len={}\n", .{j, len});
 
             const c = self.rx_clusters[j].?;
             // We increment refcount because we are giving a reference to the stack.

@@ -86,7 +86,6 @@ fn libev_mux_cb(loop: ?*ev_loop, watcher: *ev_io, revents: i32) callconv(.C) voi
     _ = watcher;
     _ = revents;
     const ready_entries = global_mux.pollReady() catch return;
-    defer global_mux.allocator.free(ready_entries);
     for (ready_entries) |entry| {
         const client = @as(*HttpClient, @ptrCast(@alignCast(entry.context.?)));
         client.onEvent() catch |err| {

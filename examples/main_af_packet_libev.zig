@@ -130,7 +130,6 @@ fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C)
     _ = revents;
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
-        defer mux.allocator.free(ready);
         for (ready) |entry| {
             const ctx = @as(*MuxContext, @ptrCast(@alignCast(entry.context.?)));
             switch (ctx.*) {

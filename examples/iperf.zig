@@ -8,8 +8,6 @@ const header = ustack.header;
 const AfPacket = ustack.drivers.af_packet.AfPacket;
 const EventMultiplexer = ustack.event_mux.EventMultiplexer;
 
-pub const std_log_level = .debug;
-
 const c = @cImport({
     @cInclude("ev.h");
     @cInclude("stdio.h");
@@ -44,8 +42,8 @@ const MuxContext = union(enum) {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 0 }){};
+const allocator = gpa.allocator();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -230,7 +228,6 @@ fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C)
     _ = loop; _ = watcher; _ = revents;
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
-        defer mux.allocator.free(ready);
         for (ready) |entry| {
             const ctx = @as(*MuxContext, @ptrCast(@alignCast(entry.context.?)));
             switch (ctx.*) {

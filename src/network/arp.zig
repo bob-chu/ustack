@@ -125,6 +125,7 @@ pub const ARPEndpoint = struct {
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {
         const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
+        // std.debug.print("ARP: handlePacket from nic={}\n", .{self.nic.id});
         _ = r;
         const v = pkt.data.first() orelse return;
         const h = header.ARP.init(v);

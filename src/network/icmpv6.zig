@@ -323,8 +323,8 @@ test "ICMPv6 Neighbor Discovery" {
             @memcpy(self.last_pkt.?[0..hdr_view.len], hdr_view);
             var offset = hdr_view.len;
             for (pkt.data.views) |v| {
-                @memcpy(self.last_pkt.?[offset .. offset + v.len], v);
-                offset += v.len;
+                @memcpy(self.last_pkt.?[offset .. offset + v.view.len], v.view);
+                offset += v.view.len;
             }
             return;
         }
@@ -447,8 +447,8 @@ test "ICMPv6 Router Advertisement & SLAAC" {
             @memcpy(self.last_pkt.?[0..hdr_view.len], hdr_view);
             var offset = hdr_view.len;
             for (pkt.data.views) |v| {
-                @memcpy(self.last_pkt.?[offset .. offset + v.len], v);
-                offset += v.len;
+                @memcpy(self.last_pkt.?[offset .. offset + v.view.len], v.view);
+                offset += v.view.len;
             }
             return;
         }

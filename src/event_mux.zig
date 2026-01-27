@@ -58,15 +58,18 @@ pub const EventMultiplexer = struct {
 const ReadyQueue = struct {
     mutex: std.Thread.Mutex = .{},
     list: std.ArrayList(*waiter.Entry),
+    results: std.ArrayList(*waiter.Entry),
 
     pub fn init(allocator: std.mem.Allocator) ReadyQueue {
         return .{
             .list = std.ArrayList(*waiter.Entry).init(allocator),
+            .results = std.ArrayList(*waiter.Entry).init(allocator),
         };
     }
 
     pub fn deinit(self: *ReadyQueue) void {
         self.list.deinit();
+        self.results.deinit();
     }
 
     pub fn push(self: *ReadyQueue, entry: *waiter.Entry) !bool {
@@ -86,12 +89,15 @@ const ReadyQueue = struct {
 
         if (self.list.items.len == 0) return &[_]*waiter.Entry{};
 
+        self.results.clearRetainingCapacity();
+        try self.results.appendSlice(self.list.items);
+        
         for (self.list.items) |entry| {
             entry.is_queued = false;
         }
+        self.list.clearRetainingCapacity();
 
-        const results = try self.list.toOwnedSlice();
-        return results;
+        return self.results.items;
     }
 };
 
@@ -107,14 +113,12 @@ test "EventMultiplexer basic" {
 
     // Verify ready
     const ready = try mux.pollReady();
-    defer allocator.free(ready);
 
     try std.testing.expectEqual(@as(usize, 1), ready.len);
     try std.testing.expectEqual(&entry, ready[0]);
 
     // Verify eventfd was cleared (pollReady again should be empty)
     const ready2 = try mux.pollReady();
-    defer allocator.free(ready2);
     try std.testing.expectEqual(@as(usize, 0), ready2.len);
 }
 
@@ -129,7 +133,6 @@ test "ReadyQueue deduplication" {
     _ = try q.push(&entry); // Duplicate
 
     const ready = try q.popAll();
-    defer allocator.free(ready);
 
     try std.testing.expectEqual(@as(usize, 1), ready.len);
 }
