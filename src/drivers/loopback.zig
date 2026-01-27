@@ -30,6 +30,7 @@ pub const Loopback = struct {
             .ptr = self,
             .vtable = &.{
                 .writePacket = writePacket,
+                .writePackets = writePackets,
                 .attach = attach,
                 .linkAddress = linkAddress,
                 .mtu = mtu,
@@ -39,14 +40,17 @@ pub const Loopback = struct {
         };
     }
 
-    fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+    fn writePackets(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        for (packets) |p| {
+            try writePacket(ptr, r, protocol, p);
+        }
+    }
+
+    pub fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*Loopback, @ptrCast(@alignCast(ptr)));
         _ = r;
 
-        log.debug("Loopback: Queuing packet proto=0x{x} len={}", .{ protocol, pkt.data.size });
-
-        // Deep clone packet to store in queue
-        const node = self.allocator.create(std.TailQueue(Packet).Node) catch return tcpip.Error.NoBufferSpace;
+        const node = self.allocator.create(std.TailQueue(Packet).Node) catch return tcpip.Error.OutOfMemory;
         node.data = .{
             .protocol = protocol,
             .pkt = pkt.clone(self.allocator) catch {
@@ -56,6 +60,7 @@ pub const Loopback = struct {
         };
         self.queue.append(node);
     }
+
 
     pub fn tick(self: *Loopback) void {
         while (self.queue.popFirst()) |node| {

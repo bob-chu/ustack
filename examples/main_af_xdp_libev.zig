@@ -273,13 +273,13 @@ const HttpClient = struct {
             .sending => self.sendRequest(),
             .receiving => {
                 while (true) {
-                    const buf = self.ep.read(null) catch |err| {
+                    var buf = self.ep.read(null) catch |err| {
                         if (err == tcpip.Error.WouldBlock) return;
                         self.finish(false);
                         return;
                     };
-                    defer self.allocator.free(buf);
-                    if (buf.len == 0) {
+                    defer buf.deinit();
+                    if (buf.size == 0) {
                         self.finish(true);
                         return;
                     }
@@ -385,13 +385,13 @@ const Connection = struct {
     }
 
     fn onData(self: *Connection) void {
-        const buf = self.ep.read(null) catch |err| {
+        var buf = self.ep.read(null) catch |err| {
             if (err == tcpip.Error.WouldBlock) return;
             self.close();
             return;
         };
-        if (buf.len == 0) {
-            self.allocator.free(buf);
+        defer buf.deinit();
+        if (buf.size == 0) {
             self.close();
             return;
         }
@@ -407,7 +407,6 @@ const Connection = struct {
         };
         var p = Payloader{ .data = response };
         _ = self.ep.write(p.payloader(), .{}) catch {};
-        self.allocator.free(buf);
         self.close();
     }
 

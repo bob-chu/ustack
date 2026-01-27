@@ -111,7 +111,7 @@ pub const Endpoint = struct {
 
     pub const VTable = struct {
         close: *const fn (ptr: *anyopaque) void,
-        read: *const fn (ptr: *anyopaque, addr: ?*FullAddress) Error!buffer.View,
+        read: *const fn (ptr: *anyopaque, addr: ?*FullAddress) Error!buffer.VectorisedView,
         write: *const fn (ptr: *anyopaque, p: Payloader, opts: WriteOptions) Error!usize,
         connect: *const fn (ptr: *anyopaque, addr: FullAddress) Error!void,
         shutdown: *const fn (ptr: *anyopaque, flags: u8) Error!void,
@@ -128,7 +128,7 @@ pub const Endpoint = struct {
     pub fn close(self: Endpoint) void {
         self.vtable.close(self.ptr);
     }
-    pub fn read(self: Endpoint, addr: ?*FullAddress) Error!buffer.View {
+    pub fn read(self: Endpoint, addr: ?*FullAddress) Error!buffer.VectorisedView {
         return self.vtable.read(self.ptr, addr);
     }
     pub fn write(self: Endpoint, p: Payloader, opts: WriteOptions) Error!usize {
@@ -253,12 +253,10 @@ pub const PacketBuffer = struct {
     network_header: ?buffer.View = null,
     transport_header: ?buffer.View = null,
 
-    pub fn clone(self: PacketBuffer, allocator: std.mem.Allocator) !PacketBuffer {
-        var new_pb = self;
-        // Simplified clone for now, just copy views slice
-        const new_views = allocator.alloc(buffer.View, self.data.views.len) catch return Error.OutOfMemory;
-        @memcpy(new_views, self.data.views);
-        new_pb.data.views = new_views;
-        return new_pb;
+    pub fn clone(self: PacketBuffer, allocator: std.mem.Allocator) Error!PacketBuffer {
+        return .{
+            .data = try self.data.clone(allocator),
+            .header = self.header,
+        };
     }
 };

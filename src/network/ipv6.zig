@@ -76,7 +76,7 @@ pub const IPv6Protocol = struct {
         const hdr_mem = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_mem);
 
-        var views = [_]buffer.View{buf};
+        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = buf }};
         const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(buf.len, &views),
             .header = buffer.Prependable.init(hdr_mem),
@@ -131,7 +131,7 @@ pub const IPv6Protocol = struct {
         const hdr_mem = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_mem);
 
-        var views = [_]buffer.View{buf};
+        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = buf }};
         const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(buf.len, &views),
             .header = buffer.Prependable.init(hdr_mem),
@@ -198,7 +198,7 @@ pub const IPv6Protocol = struct {
         const hdr_mem = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_mem);
 
-        var views = [_]buffer.View{buf};
+        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = buf }};
         const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(buf.len, &views),
             .header = buffer.Prependable.init(hdr_mem),

@@ -52,9 +52,8 @@ pub fn main() !void {
     std.debug.print("Starting iperf with config: {any}\n", .{config});
 
     global_stack = try ustack.init(allocator);
-    std.debug.print("Stack initialized\n", .{});
-    
-    global_af_packet = try AfPacket.init(allocator, config.interface);
+    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
+
     std.debug.print("AF_PACKET initialized on {s}\n", .{config.interface});
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
@@ -198,7 +197,8 @@ extern fn my_ev_run(loop: ?*anyopaque) void;
 
 fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop; _ = watcher; _ = revents;
-    while (true) {
+    var budget: usize = 16; // Limit to 16 batches (64 packets each) per event loop iteration
+    while (budget > 0) : (budget -= 1) {
         const ok = global_af_packet.readPacket() catch |err| {
             std.debug.print("AF_PACKET read error: {}\n", .{err});
             return;
@@ -301,7 +301,9 @@ const IperfServer = struct {
             const conn = self.conns.items[i];
             if (conn.closed) {
                 _ = self.conns.swapRemove(i);
-                self.allocator.destroy(conn.wq);
+                // conn.wq is owned by the endpoint for server connections (accepted sockets)
+                // so we should not destroy it here, as ep.close() (called in conn.close()) will trigger
+                // TCPEndpoint.deinit which destroys the wq if owns_waiter_queue is true.
                 self.allocator.destroy(conn);
                 continue;
             }
@@ -359,11 +361,11 @@ const IperfServer = struct {
     fn handleUdp(self: *IperfServer) void {
         while (true) {
             var remote_addr: tcpip.FullAddress = undefined;
-            const buf = self.listener.read(&remote_addr) catch |err| {
+            var buf = self.listener.read(&remote_addr) catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
                 return;
             };
-            defer self.allocator.free(buf);
+            defer buf.deinit();
 
             const now = std.time.milliTimestamp();
             if (!self.udp_session_active) {
@@ -373,7 +375,7 @@ const IperfServer = struct {
                 std.debug.print("Accepted connection from {any}\n", .{remote_addr});
             }
 
-            self.bytes_received += buf.len;
+            self.bytes_received += buf.size;
             const elapsed = now - self.last_report_time;
             if (elapsed >= 1000) {
                 const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
@@ -544,13 +546,14 @@ const IperfConnection = struct {
     fn handleServer(self: *IperfConnection) void {
         var count: usize = 0;
         while (count < 256) : (count += 1) {
-            const buf = self.ep.read(null) catch |err| {
+            var buf = self.ep.read(null) catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
                 std.debug.print("[{}] Server read error: {}\n", .{self.id, err});
                 self.close();
                 return;
             };
-            if (buf.len == 0) {
+            defer buf.deinit();
+            if (buf.size == 0) {
                 const now = std.time.milliTimestamp();
                 const total_elapsed = now - self.start_time;
                 const total_seconds = @as(f64, @floatFromInt(total_elapsed)) / 1000.0;
@@ -558,7 +561,6 @@ const IperfConnection = struct {
                 std.debug.print("[{d: >3}]  0.00-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  receiver\n",
                     .{self.id, total_seconds, @as(f64, @floatFromInt(self.total_bytes)) / 1024.0 / 1024.0, total_mbps});
 
-                self.allocator.free(buf);
                 self.close();
 
                 if (global_server) |s| {
@@ -580,9 +582,8 @@ const IperfConnection = struct {
                 }
                 return;
             }
-            self.bytes_since_last_report += buf.len;
-            self.total_bytes += buf.len;
-            self.allocator.free(buf);
+            self.bytes_since_last_report += buf.size;
+            self.total_bytes += buf.size;
         }
         
         if (global_mux) |mux| {

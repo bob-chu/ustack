@@ -46,7 +46,7 @@ pub fn main() !void {
     const ip_cidr = args[3];
 
     global_stack = try ustack.init(allocator);
-    global_af_packet = try AfPacket.init(allocator, ifname);
+    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, ifname);
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
 
@@ -317,13 +317,13 @@ const HttpClient = struct {
                         return;
                     }
                     while (true) {
-                        const buf = self.ep.read(null) catch |err| {
+                        var buf = self.ep.read(null) catch |err| {
                             if (err == tcpip.Error.WouldBlock) return;
                             self.finish(false);
                             return;
                         };
-                        defer self.allocator.free(buf);
-                        if (buf.len == 0) {
+                        defer buf.deinit();
+                        if (buf.size == 0) {
                             self.finish(true);
                             return;
                         }
@@ -426,13 +426,13 @@ const Connection = struct {
     }
 
     fn onData(self: *Connection) void {
-        const buf = self.ep.read(null) catch |err| {
+        var buf = self.ep.read(null) catch |err| {
             if (err == tcpip.Error.WouldBlock) return;
             self.close();
             return;
         };
-        if (buf.len == 0) {
-            self.allocator.free(buf);
+        defer buf.deinit();
+        if (buf.size == 0) {
             self.close();
             return;
         }
@@ -448,7 +448,6 @@ const Connection = struct {
         };
         var p = Payloader{ .data = response };
         _ = self.ep.write(p.payloader(), .{}) catch {};
-        self.allocator.free(buf);
         const server = self.server_ref;
         self.close();
         server.onTransactionComplete();

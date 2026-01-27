@@ -59,7 +59,7 @@ pub const ARPProtocol = struct {
         @memcpy(h.data[24..28], &addr.v4);
 
         const pb = tcpip.PacketBuffer{
-            .data = .{ .views = &[_]buffer.View{}, .size = 0 },
+            .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
             .header = pre,
         };
 
@@ -152,7 +152,7 @@ pub const ARPEndpoint = struct {
                 @memcpy(reply_h.data[24..28], h.data[14..18]);
 
                 const pb = tcpip.PacketBuffer{
-                    .data = .{ .views = &[_]buffer.View{}, .size = 0 },
+                    .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
                     .header = pre,
                 };
 

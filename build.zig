@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         debug,
         none,
     };
-    const log_level = b.option(LogLevel, "log_level", "Log level for ustack (default: warn)") orelse .warn;
+    const log_level = b.option(LogLevel, "log_level", "Log level for ustack (default: debug)") orelse .debug;
 
     const options = b.addOptions();
     options.addOption(LogLevel, "log_level", log_level);

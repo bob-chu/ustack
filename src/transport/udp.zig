@@ -162,8 +162,8 @@ pub const UDPEndpoint = struct {
             sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
 
             sum = header.internetChecksum(h.data, sum);
-            for (data.views) |view| {
-                sum = header.internetChecksum(view, sum);
+            for (data.views) |v| {
+                sum = header.internetChecksum(v.view, sum);
             }
             const csum = header.finishChecksum(sum);
             h.setChecksum(if (csum == 0) 0xffff else csum);
@@ -248,7 +248,7 @@ pub const UDPEndpoint = struct {
         };
     }
 
-    fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.View {
+    fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.VectorisedView {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -257,23 +257,21 @@ pub const UDPEndpoint = struct {
         if (self.rcv_list.first == null) {
             self.waiter_queue.clear(waiter.EventIn);
         }
-        defer {
-            node.data.data.deinit();
-            self.stack.allocator.destroy(node);
-        }
 
         if (addr) |a| {
             a.* = node.data.sender_addr;
         }
 
-        return node.data.data.toView(self.stack.allocator) catch return tcpip.Error.NoBufferSpace;
+        const res = node.data.data;
+        self.stack.allocator.destroy(node);
+        return res;
     }
 
     fn write_external(ptr: *anyopaque, p: tcpip.Payloader, opts: tcpip.WriteOptions) tcpip.Error!usize {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         const data_buf = try p.fullPayload();
 
-        var views = [_]buffer.View{@constCast(data_buf)};
+        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(data_buf) }};
         const data = buffer.VectorisedView.init(data_buf.len, &views);
 
         if (opts.to) |to| {
@@ -371,14 +369,12 @@ pub const UDPEndpoint = struct {
 
     fn getLocalAddress(ptr: *anyopaque) tcpip.Error!tcpip.FullAddress {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.local_addr orelse tcpip.Error.InvalidEndpointState;
     }
 
     fn getRemoteAddress(ptr: *anyopaque) tcpip.Error!tcpip.FullAddress {
-        _ = ptr;
-        return tcpip.Error.UnknownProtocol;
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        return self.remote_addr orelse tcpip.Error.InvalidEndpointState;
     }
 };
 
@@ -453,7 +449,7 @@ test "UDP handlePacket" {
     std.mem.writeInt(u16, udp_data[2..4], 80, .big);
     std.mem.writeInt(u16, udp_data[4..6], 12, .big);
 
-    var views = [_]buffer.View{&udp_data};
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = &udp_data }};
     const pkt = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(12, &views),
         .header = buffer.Prependable.init(&[_]u8{}),

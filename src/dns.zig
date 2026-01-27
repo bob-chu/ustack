@@ -121,18 +121,21 @@ pub const Resolver = struct {
         // Wait for response with timeout
         var timeout: usize = 0;
         while (timeout < 500) : (timeout += 1) { // 5 seconds
-            const packet = ep.read(null) catch |err| {
+            var packet = ep.read(null) catch |err| {
                 if (err == tcpip.Error.WouldBlock) {
                     std.time.sleep(10 * std.time.ns_per_ms);
                     continue;
                 }
                 return err;
             };
-            defer self.allocator.free(packet);
+            defer packet.deinit();
 
-            if (packet.len < header.DNSHeaderSize) continue;
+            if (packet.size < header.DNSHeaderSize) continue;
 
-            const resp_h = header.DNS.init(@constCast(packet[0..header.DNSHeaderSize]));
+            const packet_flat = try packet.toView(self.allocator);
+            defer self.allocator.free(packet_flat);
+
+            const resp_h = header.DNS.init(@constCast(packet_flat[0..header.DNSHeaderSize]));
 
             if (resp_h.id() != query_id) continue;
 
@@ -143,8 +146,8 @@ pub const Resolver = struct {
             // Skip questions
             var q_count = resp_h.questionCount();
             while (q_count > 0) : (q_count -= 1) {
-                while (pos < packet.len and packet[pos] != 0) {
-                    pos += packet[pos] + 1;
+                while (pos < packet_flat.len and packet_flat[pos] != 0) {
+                    pos += packet_flat[pos] + 1;
                 }
                 pos += 1; // Skip null
                 pos += 4; // Skip Type + Class
@@ -153,30 +156,30 @@ pub const Resolver = struct {
             // Parse Answers
             var ans_count = resp_h.answerCount();
 
-            while (ans_count > 0 and pos < packet.len) : (ans_count -= 1) {
+            while (ans_count > 0 and pos < packet_flat.len) : (ans_count -= 1) {
                 // Name
-                if (packet[pos] & 0xC0 == 0xC0) {
+                if (packet_flat[pos] & 0xC0 == 0xC0) {
                     pos += 2; // Pointer
                 } else {
-                    while (pos < packet.len and packet[pos] != 0) {
-                        pos += packet[pos] + 1;
+                    while (pos < packet_flat.len and packet_flat[pos] != 0) {
+                        pos += packet_flat[pos] + 1;
                     }
                     pos += 1;
                 }
 
-                if (pos + 10 > packet.len) break;
-                const rtype = std.mem.readInt(u16, packet[pos..][0..2], .big);
-                const rclass = std.mem.readInt(u16, packet[pos + 2 ..][0..2], .big);
+                if (pos + 10 > packet_flat.len) break;
+                const rtype = std.mem.readInt(u16, packet_flat[pos..][0..2], .big);
+                const rclass = std.mem.readInt(u16, packet_flat[pos + 2 ..][0..2], .big);
                 _ = rclass;
                 // TTL (4)
-                const rdlen = std.mem.readInt(u16, packet[pos + 8 ..][0..2], .big);
+                const rdlen = std.mem.readInt(u16, packet_flat[pos + 8 ..][0..2], .big);
                 pos += 10;
 
-                if (pos + rdlen > packet.len) break;
+                if (pos + rdlen > packet_flat.len) break;
 
                 if (rtype == 1 and rdlen == 4) { // A Record
                     var ip: [4]u8 = undefined;
-                    @memcpy(&ip, packet[pos..][0..4]);
+                    @memcpy(&ip, packet_flat[pos..][0..4]);
                     return tcpip.Address{ .v4 = ip };
                 }
                 pos += rdlen;

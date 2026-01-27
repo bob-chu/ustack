@@ -158,7 +158,8 @@ pub const IPv4Endpoint = struct {
 
             @memset(ip_header, 0);
             ip_header[0] = 0x45;
-            std.mem.writeInt(u16, ip_header[2..4], @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size)), .big);
+            const total_len = @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size));
+            std.mem.writeInt(u16, ip_header[2..4], total_len, .big);
             ip_header[8] = 64;
             ip_header[9] = @as(u8, @intCast(protocol));
             @memcpy(ip_header[12..16], &r.local_address.v4);
@@ -267,7 +268,7 @@ pub const IPv4Endpoint = struct {
                 ctx.fragments.deinit();
                 _ = self.reassembly_list.remove(key);
 
-                var views = [_]buffer.View{reassembled_buf};
+                var views = [_]buffer.ClusterView{.{ .cluster = null, .view = reassembled_buf }};
                 const reassembled_pkt = tcpip.PacketBuffer{
                     .data = buffer.VectorisedView.init(total_size, &views),
                     .header = undefined,
@@ -425,7 +426,7 @@ test "IPv4 fragmentation and reassembly" {
     @memcpy(frag2_buf[20..], payload[16..]);
     frag2_h.setChecksum(frag2_h.calculateChecksum());
 
-    var views1 = [_]buffer.View{&frag1_buf};
+    var views1 = [_]buffer.ClusterView{.{ .cluster = null, .view = &frag1_buf }};
     const pkt1 = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(frag1_buf.len, &views1),
         .header = undefined,
@@ -434,7 +435,7 @@ test "IPv4 fragmentation and reassembly" {
 
     try std.testing.expect(!delivered);
 
-    var views2 = [_]buffer.View{frag2_buf};
+    var views2 = [_]buffer.ClusterView{.{ .cluster = null, .view = frag2_buf }};
     const pkt2 = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(frag2_buf.len, &views2),
         .header = undefined,

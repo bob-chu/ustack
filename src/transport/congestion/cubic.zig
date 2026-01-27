@@ -5,13 +5,13 @@ pub const Cubic = struct {
     cwnd: u32,
     ssthresh: u32,
     mss: u32,
-
+    
     // CUBIC specific variables
     w_max: u32,
     k: f64,
     epoch_start: i64,
     origin_point: u32,
-
+    
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, mss: u32) !CongestionControl {
@@ -53,19 +53,21 @@ pub const Cubic = struct {
                 self.origin_point = self.cwnd;
             }
         }
-
+        
         const t = @as(f64, @floatFromInt(now - self.epoch_start)) / 1000.0 + self.k;
         const target = 0.4 * (t - self.k) * (t - self.k) * (t - self.k) * @as(f64, @floatFromInt(self.mss)) + @as(f64, @floatFromInt(self.origin_point));
-
+        
         if (target > @as(f64, @floatFromInt(self.cwnd))) {
-            self.cwnd += @as(u32, @intFromFloat((target - @as(f64, @floatFromInt(self.cwnd))) / @as(f64, @floatFromInt(self.cwnd)) * @as(f64, @floatFromInt(self.mss))));
+            const diff = target - @as(f64, @floatFromInt(self.cwnd));
+            const incr = @as(u32, @intFromFloat(@max(1.0, (diff / @as(f64, @floatFromInt(self.cwnd))) * @as(f64, @floatFromInt(self.mss)))));
+            self.cwnd += incr;
         }
     }
 
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*Cubic, @ptrCast(@alignCast(ptr)));
         _ = bytes_acked;
-
+        
         if (self.cwnd < self.ssthresh) {
             // Slow start
             self.cwnd += self.mss;

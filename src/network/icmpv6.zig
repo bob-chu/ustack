@@ -127,7 +127,7 @@ pub const ICMPv6PacketHandler = struct {
                 const c = reply_h.calculateChecksum(src, dst, reply_buf[header.ICMPv6MinimumSize..]);
                 reply_h.setChecksum(c);
 
-                var views = [_]buffer.View{reply_buf};
+                var views = [_]buffer.ClusterView{.{ .cluster = null, .view = reply_buf }};
                 const hdr_mem = s.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer s.allocator.free(hdr_mem);
 
@@ -186,7 +186,7 @@ pub const ICMPv6PacketHandler = struct {
                     const c = na_h.calculateChecksum(src, dst, na_buf[header.ICMPv6MinimumSize..]);
                     na_h.setChecksum(c);
 
-                    var views = [_]buffer.View{na_buf};
+                    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = na_buf }};
                     const hdr_mem = s.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                     defer s.allocator.free(hdr_mem);
 
@@ -399,7 +399,7 @@ test "ICMPv6 Neighbor Discovery" {
         .nic = nic,
     };
 
-    var views = [_]buffer.View{ns_buf};
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = ns_buf }};
     const ns_pkt = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(ns_buf.len, &views),
         .header = buffer.Prependable.init(&[_]u8{}),
@@ -531,7 +531,7 @@ test "ICMPv6 Router Advertisement & SLAAC" {
         .nic = nic,
     };
 
-    var views = [_]buffer.View{ra_buf};
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = ra_buf }};
     const ra_pkt = tcpip.PacketBuffer{
         .data = buffer.VectorisedView.init(ra_buf.len, &views),
         .header = buffer.Prependable.init(&[_]u8{}),

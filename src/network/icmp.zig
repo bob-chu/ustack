@@ -72,7 +72,7 @@ pub const ICMPv4PacketHandler = struct {
             const c = reply_h.calculateChecksum(payload[header.ICMPv4MinimumSize..]);
             reply_h.setChecksum(c);
 
-            var views = [_]buffer.View{payload[header.ICMPv4MinimumSize..]};
+            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = payload[header.ICMPv4MinimumSize..] }};
             const reply_pkt = tcpip.PacketBuffer{
                 .data = buffer.VectorisedView.init(payload.len - header.ICMPv4MinimumSize, &views),
                 .header = buffer.Prependable.initFull(&reply_hdr),

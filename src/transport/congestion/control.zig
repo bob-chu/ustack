@@ -72,15 +72,11 @@ pub const NewReno = struct {
 
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));
-        _ = bytes_acked;
-        // Simplified: we treat every ACK as full MSS for growth
         if (self.cwnd < self.ssthresh) {
-            // Slow Start
-            self.cwnd += self.mss;
+            self.cwnd += bytes_acked;
         } else {
-            // Congestion Avoidance
-            // Approximate growth by 1 MSS per RTT: cwnd = cwnd + mss * mss / cwnd
-            self.cwnd += @max(1, (self.mss * self.mss) / self.cwnd);
+            const incr = (@as(u64, self.mss) * bytes_acked) / self.cwnd;
+            self.cwnd += @as(u32, @intCast(@max(1, incr)));
         }
     }
 
@@ -92,7 +88,6 @@ pub const NewReno = struct {
 
     fn onRetransmit(ptr: *anyopaque) void {
         const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));
-        // Fast Recovery entry
         self.ssthresh = @max(self.cwnd / 2, 2 * self.mss);
         self.cwnd = self.ssthresh + 3 * self.mss;
     }

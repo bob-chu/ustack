@@ -221,8 +221,8 @@ pub const AfXdp = struct {
 
         var current_off = hdr_len;
         for (pkt.data.views) |v| {
-            @memcpy(data_ptr[current_off..][0..v.len], v);
-            current_off += v.len;
+            @memcpy(data_ptr[current_off..][0..v.view.len], v.view);
+            current_off += v.view.len;
         }
 
         // 4. Write descriptor
@@ -259,7 +259,7 @@ pub const AfXdp = struct {
             const data = self.umem_area[desc.addr .. desc.addr + desc.len];
 
             // Dispatch
-            var views = [1]buffer.View{data};
+            var views = [1]buffer.ClusterView{.{ .cluster = null, .view = data }};
             const pkt = tcpip.PacketBuffer{
                 .data = buffer.VectorisedView.init(data.len, &views),
                 .header = buffer.Prependable.init(&[_]u8{}),

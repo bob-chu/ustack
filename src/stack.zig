@@ -528,6 +528,8 @@ pub const Stack = struct {
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
     timer_queue: time.TimerQueue,
+    cluster_pool: buffer.ClusterPool,
+    ephemeral_port: std.atomic.Value(u16) = std.atomic.Value(u16).init(32768),
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
         return .{
@@ -539,10 +541,12 @@ pub const Stack = struct {
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
             .timer_queue = .{},
+            .cluster_pool = buffer.ClusterPool.init(allocator),
         };
     }
 
     pub fn deinit(self: *Stack) void {
+        self.cluster_pool.deinit();
         var nic_it = self.nics.valueIterator();
         while (nic_it.next()) |nic| {
             nic.*.deinit();
@@ -584,6 +588,15 @@ pub const Stack = struct {
         shard.mutex.lock();
         defer shard.mutex.unlock();
         _ = shard.endpoints.remove(id);
+    }
+
+    pub fn getNextEphemeralPort(self: *Stack) u16 {
+        const port = self.ephemeral_port.fetchAdd(1, .monotonic);
+        if (port < 32768) {
+            self.ephemeral_port.store(32769, .monotonic);
+            return 32768;
+        }
+        return port;
     }
 
     // Find route using longest-prefix matching in routing table

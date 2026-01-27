@@ -62,8 +62,7 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     icmpv4_transport.* = network.icmp.ICMPv4TransportProtocol.init();
     try s.registerTransportProtocol(icmpv4_transport.protocol());
 
-    const tcp_proto = try allocator.create(transport.tcp.TCPProtocol);
-    tcp_proto.* = transport.tcp.TCPProtocol.init();
+    const tcp_proto = transport.tcp.TCPProtocol.init(allocator);
     try s.registerTransportProtocol(tcp_proto.protocol());
 
     const udp_proto = try allocator.create(transport.udp.UDPProtocol);

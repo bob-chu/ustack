@@ -1,4 +1,5 @@
 const std = @import("std");
+const buffer = @import("buffer.zig");
 
 pub const IPv4MinimumSize = 20;
 pub const IPv4MaximumHeaderSize = 60;
@@ -173,42 +174,27 @@ pub const TCP = struct {
         sum = internetChecksum(payload, sum);
         return finishChecksum(sum);
     }
+
+    pub fn calculateChecksumVectorised(self: TCP, src: [4]u8, dst: [4]u8, payload: buffer.VectorisedView) u16 {
+        var sum: u32 = 0;
+        sum += std.mem.readInt(u16, src[0..2], .big);
+        sum += std.mem.readInt(u16, src[2..4], .big);
+        sum += std.mem.readInt(u16, dst[0..2], .big);
+        sum += std.mem.readInt(u16, dst[2..4], .big);
+        sum += 6; // Protocol TCP
+        sum += @as(u16, @intCast(self.data.len + payload.size));
+
+        sum = internetChecksum(self.data, sum);
+        for (payload.views) |v| {
+            sum = internetChecksum(v.view, sum);
+        }
+        return finishChecksum(sum);
+    }
 };
 
-/// internetChecksum calculates the internet checksum of the given data.
 pub fn internetChecksum(data: []const u8, initial: u32) u32 {
     var sum: u32 = initial;
     var i: usize = 0;
-
-    // SIMD optimization for large buffers
-    if (data.len >= 64) {
-        const lanes = 32;
-        var acc_even = @as(@Vector(16, u32), @splat(0));
-        var acc_odd = @as(@Vector(16, u32), @splat(0));
-
-        const even_indices = comptime blk: {
-            var indices: [16]u32 = undefined;
-            for (0..16) |j| indices[j] = j * 2;
-            break :blk indices;
-        };
-        const odd_indices = comptime blk: {
-            var indices: [16]u32 = undefined;
-            for (0..16) |j| indices[j] = j * 2 + 1;
-            break :blk indices;
-        };
-
-        while (i + lanes <= data.len) : (i += lanes) {
-            const v = @as(@Vector(32, u8), data[i..][0..32].*);
-            const even_bytes = @shuffle(u8, v, undefined, even_indices);
-            const odd_bytes = @shuffle(u8, v, undefined, odd_indices);
-
-            acc_even += @as(@Vector(16, u32), even_bytes);
-            acc_odd += @as(@Vector(16, u32), odd_bytes);
-        }
-
-        sum += (@reduce(.Add, acc_even) << 8) + @reduce(.Add, acc_odd);
-    }
-
     while (i + 1 < data.len) : (i += 2) {
         sum += std.mem.readInt(u16, data[i..][0..2], .big);
     }
@@ -273,6 +259,8 @@ pub const Ethernet = struct {
 pub const ARPProtocolNumber = 0x0806;
 pub const ARPSize = 28;
 pub const ReservedHeaderSize = 128;
+pub const ClusterSize = 16384;
+pub const MaxViewsPerPacket = 16;
 
 // Linux IOCTL constants for network interfaces
 pub const SIOCGIFINDEX = 0x8933;

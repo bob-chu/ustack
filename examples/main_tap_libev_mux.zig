@@ -160,21 +160,23 @@ const HttpClient = struct {
             },
             .receiving => {
                 while (true) {
-                    const view = self.ep.read(null) catch |err| {
+                    var view = self.ep.read(null) catch |err| {
                         if (err == tcpip.Error.WouldBlock) return;
                         return err;
                     };
-                    defer self.allocator.free(view);
-                    // std.debug.print("Read {} bytes\n", .{view.len});
-                    if (view.len == 0) {
+                    defer view.deinit();
+                    // std.debug.print("Read {} bytes\n", .{view.size});
+                    if (view.size == 0) {
                         std.debug.print("EOF reached. Total received: {} bytes\n", .{self.total_received});
                         self.state = .done;
                         self.ep.close();
                         std.process.exit(0);
                         return;
                     }
-                    self.total_received += view.len;
-                    std.debug.print("{s}", .{view});
+                    self.total_received += view.size;
+                    const data = try view.toView(self.allocator);
+                    defer self.allocator.free(data);
+                    std.debug.print("{s}", .{data});
                     if (self.total_received > 20000) {
                         std.debug.print("SUCCESS: Received expected data from Google!\n", .{});
                         self.ep.close();

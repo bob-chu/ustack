@@ -5,30 +5,24 @@ const header = @import("../../header.zig");
 const buffer = @import("../../buffer.zig");
 const log = @import("../../log.zig").scoped(.af_packet);
 
-/// A LinkEndpoint implementation for Linux AF_PACKET (Raw Sockets).
-/// This allows sending/receiving raw Ethernet frames on a physical interface.
 pub const AfPacket = struct {
     fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
+    cluster_pool: *buffer.ClusterPool,
+    view_pool: buffer.BufferPool,
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
-    if_index: i32,
-
+    if_index: i32 = 0,
+    rx_clusters: [64]?*buffer.Cluster = [_]?*buffer.Cluster{null} ** 64,
     dispatcher: ?*stack.NetworkDispatcher = null,
 
-    /// Initialize an AF_PACKET socket bound to a specific interface.
-    /// dev_name: e.g. "eth0", "lo".
-    /// Requires CAP_NET_RAW.
-    pub fn init(allocator: std.mem.Allocator, dev_name: []const u8) !AfPacket {
-        // ETH_P_ALL (big endian)
+    pub fn init(allocator: std.mem.Allocator, pool: *buffer.ClusterPool, dev_name: []const u8) !AfPacket {
         const protocol = std.mem.nativeToBig(u16, header.ETH_P_ALL);
         const fd = try std.posix.socket(std.posix.AF.PACKET, std.posix.SOCK.RAW | std.posix.SOCK.NONBLOCK, protocol);
         errdefer std.posix.close(fd);
 
-        // Get Interface Index
         const if_index = try getIfIndex(fd, dev_name);
 
-        // Bind to interface
         var addr = std.posix.sockaddr.ll{
             .family = std.posix.AF.PACKET,
             .protocol = protocol,
@@ -40,19 +34,20 @@ pub const AfPacket = struct {
         };
         try std.posix.bind(fd, @as(*const std.posix.sockaddr, @ptrCast(&addr)), @sizeOf(std.posix.sockaddr.ll));
 
-        // Get Interface MAC Address
         const mac = try getIfMac(fd, dev_name);
 
-        // Set large socket buffers to avoid drops during bursts
-        const buf_size: i32 = 10 * 1024 * 1024;
+        const buf_size: i32 = 64 * 1024 * 1024;
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&buf_size));
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&buf_size));
 
         return AfPacket{
             .fd = fd,
             .allocator = allocator,
+            .cluster_pool = pool,
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 1, 1024),
             .if_index = if_index,
             .address = .{ .addr = mac },
+            .rx_clusters = [_]?*buffer.Cluster{null} ** 64,
         };
     }
 
@@ -79,31 +74,51 @@ pub const AfPacket = struct {
     }
 
     pub fn writePackets(self: *AfPacket, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
-        for (packets) |pkt| {
-            var iovecs: [16]std.posix.iovec_const = undefined;
-            const hdr_view = pkt.header.view();
-            iovecs[0] = .{ .base = hdr_view.ptr, .len = hdr_view.len };
-            
-            var iov_cnt: usize = 1;
-            for (pkt.data.views) |v| {
-                if (iov_cnt >= 16) break;
-                iovecs[iov_cnt] = .{ .base = v.ptr, .len = v.len };
-                iov_cnt += 1;
+        const batch_size = 64;
+        var msgvec: [batch_size]std.os.linux.mmsghdr = undefined;
+        var iovecs: [batch_size][header.MaxViewsPerPacket + 1]std.posix.iovec = undefined;
+
+        var i: usize = 0;
+        while (i < packets.len) {
+            const current_batch = @min(packets.len - i, batch_size);
+            for (0..current_batch) |j| {
+                const pkt = packets[i + j];
+                const hdr_view = pkt.header.view();
+                iovecs[j][0] = .{ .base = @constCast(hdr_view.ptr), .len = hdr_view.len };
+
+                var iov_cnt: usize = 1;
+                for (pkt.data.views) |v| {
+                    if (iov_cnt >= iovecs[j].len) break;
+                    iovecs[j][iov_cnt] = .{ .base = @constCast(v.view.ptr), .len = v.view.len };
+                    iov_cnt += 1;
+                }
+
+                msgvec[j] = .{
+                    .msg_hdr = .{
+                        .name = null,
+                        .namelen = 0,
+                        .iov = @as([*]std.posix.iovec, @ptrCast(&iovecs[j])),
+                        .iovlen = @as(i32, @intCast(iov_cnt)),
+                        .control = null,
+                        .controllen = 0,
+                        .flags = 0,
+                    },
+                    .msg_len = 0,
+                };
             }
 
-            const n = std.posix.writev(self.fd, iovecs[0..iov_cnt]) catch |err| {
-                if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
+            const res = std.os.linux.syscall4(.sendmmsg, @as(usize, @intCast(self.fd)), @intFromPtr(&msgvec), current_batch, 0);
+            if (std.posix.errno(res) != .SUCCESS) {
+                if (std.posix.errno(res) == .AGAIN) return tcpip.Error.WouldBlock;
                 return tcpip.Error.UnknownDevice;
-            };
-            log.debug("Tx {} bytes on {}", .{ n, self.fd });
+            }
+            i += current_batch;
         }
     }
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
-        _ = r;
-        _ = protocol;
-
+        _ = r; _ = protocol;
         const p = [_]tcpip.PacketBuffer{pkt};
         return self.writePackets(&p);
     }
@@ -137,15 +152,25 @@ pub const AfPacket = struct {
         const batch_size = 64;
         var msgvec: [batch_size]std.os.linux.mmsghdr = undefined;
         var iovecs: [batch_size]std.posix.iovec = undefined;
-        var bufs: [batch_size][9216]u8 = undefined;
 
-        for (0..batch_size) |j| {
-            iovecs[j] = .{ .base = &bufs[j], .len = bufs[j].len };
-            msgvec[j] = .{
+        var i: usize = 0;
+        while (i < batch_size) : (i += 1) {
+            if (self.rx_clusters[i]) |c| {
+                if (c.ref_count.load(.monotonic) > 1) {
+                    c.release();
+                    self.rx_clusters[i] = null;
+                }
+            }
+            if (self.rx_clusters[i] == null) {
+                self.rx_clusters[i] = try self.cluster_pool.acquire();
+            }
+            const c = self.rx_clusters[i].?;
+            iovecs[i] = .{ .base = &c.data, .len = c.data.len };
+            msgvec[i] = .{
                 .msg_hdr = .{
                     .name = null,
                     .namelen = 0,
-                    .iov = @as([*]std.posix.iovec, @ptrCast(&iovecs[j])),
+                    .iov = @as([*]std.posix.iovec, @ptrCast(&iovecs[i])),
                     .iovlen = 1,
                     .control = null,
                     .controllen = 0,
@@ -170,35 +195,45 @@ pub const AfPacket = struct {
             const len = msgvec[j].msg_len;
             if (len == 0) continue;
 
-            // Pass the FULL frame to the dispatcher (EthernetEndpoint expects it)
-            const frame_buf = try self.allocator.alloc(u8, len);
-            @memcpy(frame_buf, bufs[j][0..len]);
+            const c = self.rx_clusters[j].?;
+            // We increment refcount because we are giving a reference to the stack.
+            // Our reference in rx_clusters[j] remains.
+            c.acquire();
 
-            var views = [1]buffer.View{frame_buf};
+            const view_mem = try self.view_pool.acquire();
+            const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
+            original_views[0] = .{ .cluster = c, .view = c.data[0..len] };
+
             const pkt = tcpip.PacketBuffer{
-                .data = buffer.VectorisedView.init(frame_buf.len, &views),
+                .data = buffer.VectorisedView.init(len, original_views[0..1]),
                 .header = buffer.Prependable.init(&[_]u8{}),
             };
+            var mut_pkt = pkt;
+            mut_pkt.data.original_views = original_views;
+            mut_pkt.data.view_pool = &self.view_pool;
 
             if (self.dispatcher) |d| {
-                // We pass dummy MACs/type because EthernetEndpoint will parse the real ones from the frame
                 const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
-                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, pkt);
+                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, mut_pkt);
             }
 
-            self.allocator.free(frame_buf);
+            mut_pkt.data.deinit(); // This releases the reference we just gave to the stack (or the one stack kept).
+
+            // Now check if stack kept it. If refcount > 1, it means stack kept it.
+            if (c.ref_count.load(.monotonic) > 1) {
+                c.release(); // Release our reference in rx_clusters
+                self.rx_clusters[j] = null;
+            }
         }
 
         return true;
     }
 
-    // Helpers for IOCTL
     fn getIfIndex(fd: std.posix.fd_t, name: []const u8) !i32 {
         var ifr: std.os.linux.ifreq = undefined;
         @memset(std.mem.asBytes(&ifr), 0);
         const copy_len = @min(name.len, 15);
         @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
-
         try ioctl(fd, header.SIOCGIFINDEX, @intFromPtr(&ifr));
         return ifr.ifru.ivalue;
     }
@@ -208,13 +243,10 @@ pub const AfPacket = struct {
         @memset(std.mem.asBytes(&ifr), 0);
         const copy_len = @min(name.len, 15);
         @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
-
         try ioctl(fd, header.SIOCGIFHWADDR, @intFromPtr(&ifr));
         var mac: [6]u8 = undefined;
-        // In libc's ifreq, hwaddr is a sockaddr, and MAC is in sa_data[0..6]
-        // We use a raw pointer to get the data from the sockaddr part.
         const sockaddr_ptr = @as([*]const u8, @ptrCast(&ifr.ifru.hwaddr));
-        @memcpy(&mac, sockaddr_ptr[2..8]); // sockaddr.family is 2 bytes, then data
+        @memcpy(&mac, sockaddr_ptr[2..8]);
         return mac;
     }
 

@@ -230,20 +230,22 @@ fn doHttpClient(s: *stack.Stack) !void {
     // Read response
     var total_received: usize = 0;
     while (true) {
-        const view = ep.read(null) catch |err| {
+        var view = ep.read(null) catch |err| {
             if (err == tcpip.Error.WouldBlock) {
                 std.time.sleep(100 * std.time.ns_per_ms);
                 continue;
             }
             break;
         };
-        defer s.allocator.free(view);
-        if (view.len == 0) {
+        defer view.deinit();
+        if (view.size == 0) {
             std.debug.print("EOF reached (peer closed connection)\n", .{});
             break;
         }
-        total_received += view.len;
-        std.debug.print("{s}", .{view});
+        total_received += view.size;
+        const data = try view.toView(s.allocator);
+        defer s.allocator.free(data);
+        std.debug.print("{s}", .{data});
 
         // Stop after receiving reasonable amount of data
         if (total_received > 20000) break;

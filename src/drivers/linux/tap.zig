@@ -126,7 +126,7 @@ pub const Tap = struct {
         };
         if (len == 0) return false; // EOF
 
-        var views = [1]buffer.View{buf[0..len]};
+        var views = [1]buffer.ClusterView{.{ .cluster = null, .view = buf[0..len] }};
         const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(len, &views),
             .header = buffer.Prependable.init(&[_]u8{}),
