@@ -30,36 +30,26 @@ pub fn info(comptime format: []const u8, args: anytype) void {
 }
 
 pub fn debug(comptime format: []const u8, args: anytype) void {
-    if (@intFromEnum(log_level) != @intFromEnum(Level.none) and @intFromEnum(Level.debug) <= @intFromEnum(log_level)) {
-        std.log.debug(format, args);
-    }
+    std.debug.print("DEBUG: " ++ format ++ "\n", args);
 }
 
 /// Helper for conditional logging based on a scope
 pub fn scoped(comptime scope: @Type(.EnumLiteral)) type {
     return struct {
         pub fn err(comptime format: []const u8, args: anytype) void {
-            if (@intFromEnum(log_level) != @intFromEnum(Level.none) and @intFromEnum(Level.err) <= @intFromEnum(log_level)) {
-                std.log.scoped(scope).err(format, args);
-            }
+            std.debug.print("ERR(" ++ @tagName(scope) ++ "): " ++ format ++ "\n", args);
         }
 
         pub fn warn(comptime format: []const u8, args: anytype) void {
-            if (@intFromEnum(log_level) != @intFromEnum(Level.none) and @intFromEnum(Level.warn) <= @intFromEnum(log_level)) {
-                std.log.scoped(scope).warn(format, args);
-            }
+            std.debug.print("WARN(" ++ @tagName(scope) ++ "): " ++ format ++ "\n", args);
         }
 
         pub fn info(comptime format: []const u8, args: anytype) void {
-            if (@intFromEnum(log_level) != @intFromEnum(Level.none) and @intFromEnum(Level.info) <= @intFromEnum(log_level)) {
-                std.log.scoped(scope).info(format, args);
-            }
+            std.debug.print("INFO(" ++ @tagName(scope) ++ "): " ++ format ++ "\n", args);
         }
 
         pub fn debug(comptime format: []const u8, args: anytype) void {
-            if (@intFromEnum(log_level) != @intFromEnum(Level.none) and @intFromEnum(Level.debug) <= @intFromEnum(log_level)) {
-                std.log.scoped(scope).debug(format, args);
-            }
+            std.debug.print("DEBUG(" ++ @tagName(scope) ++ "): " ++ format ++ "\n", args);
         }
     };
 }

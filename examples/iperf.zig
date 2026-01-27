@@ -8,6 +8,8 @@ const header = ustack.header;
 const AfPacket = ustack.drivers.af_packet.AfPacket;
 const EventMultiplexer = ustack.event_mux.EventMultiplexer;
 
+pub const std_log_level = .debug;
+
 const c = @cImport({
     @cInclude("ev.h");
     @cInclude("stdio.h");
@@ -470,12 +472,18 @@ const IperfClient = struct {
             conn.id = i;
             try self.conns.append(conn);
             
-            wq.notify(waiter.EventOut);
+            if (self.config.protocol == .tcp) {
+                wq.notify(waiter.EventOut);
+            }
             
             try ep.bind(.{ .nic = 0, .addr = .{ .v4 = self.config.local_ip }, .port = 0 });
             _ = ep.connect(.{ .nic = 1, .addr = .{ .v4 = self.config.target_ip.? }, .port = self.config.port }) catch |err| {
                 if (err != tcpip.Error.WouldBlock) return err;
             };
+
+            if (self.config.protocol == .udp) {
+                wq.notify(waiter.EventOut);
+            }
         }
     }
 };

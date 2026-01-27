@@ -178,6 +178,7 @@ pub const TransportEndpoint = struct {
         close: *const fn (ptr: *anyopaque) void,
         incRef: *const fn (ptr: *anyopaque) void,
         decRef: *const fn (ptr: *anyopaque) void,
+        notify: ?*const fn (ptr: *anyopaque, mask: waiter.EventMask) void = null,
     };
 
     pub fn handlePacket(self: TransportEndpoint, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void {
@@ -194,6 +195,12 @@ pub const TransportEndpoint = struct {
 
     pub fn decRef(self: TransportEndpoint) void {
         return self.vtable.decRef(self.ptr);
+    }
+
+    pub fn notify(self: TransportEndpoint, mask: waiter.EventMask) void {
+        if (self.vtable.notify) |f| {
+            return f(self.ptr, mask);
+        }
     }
 };
 
@@ -342,6 +349,7 @@ pub const Route = struct {
     route_entry: ?*const RouteEntry = null,
 
     pub fn writePacket(self: *Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+        // std.debug.print("Route: writePacket protocol={}\n", .{protocol});
         // Determine next hop (gateway if route has one, otherwise destination)
         const next_hop = if (self.route_entry) |entry| entry.gateway else self.remote_address;
 
@@ -353,6 +361,7 @@ pub const Route = struct {
             if (link_addr_opt) |link_addr| {
                 self.remote_link_address = link_addr;
             } else {
+                std.debug.print("Route: Triggering link address request for {any} via {any}\n", .{next_hop, self.local_address});
                 self.nic.stack.mutex.lock();
                 var it = self.nic.stack.network_protocols.valueIterator();
                 while (it.next()) |proto| {
@@ -574,8 +583,19 @@ pub const Stack = struct {
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         try self.link_addr_cache.put(addr, link_addr);
+        self.mutex.unlock();
+
+        // Notify all transport endpoints that they might be writable now (due to ARP resolution)
+        for (&self.endpoints.shards) |*shard| {
+            shard.mutex.lock();
+            var it = shard.endpoints.valueIterator();
+            while (it.next()) |ep| {
+                // We notify EventOut. Endpoints that are blocked on ARP should care.
+                ep.vtable.notify.?(ep.ptr, waiter.EventOut);
+            }
+            shard.mutex.unlock();
+        }
     }
 
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {

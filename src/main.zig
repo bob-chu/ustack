@@ -65,8 +65,7 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     const tcp_proto = transport.tcp.TCPProtocol.init(allocator);
     try s.registerTransportProtocol(tcp_proto.protocol());
 
-    const udp_proto = try allocator.create(transport.udp.UDPProtocol);
-    udp_proto.* = transport.udp.UDPProtocol.init();
+    const udp_proto = transport.udp.UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
 
     const icmpv6_proto = try allocator.create(network.icmpv6.ICMPv6TransportProtocol);

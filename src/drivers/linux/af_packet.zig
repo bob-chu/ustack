@@ -108,11 +108,18 @@ pub const AfPacket = struct {
             }
 
             const res = std.os.linux.syscall4(.sendmmsg, @as(usize, @intCast(self.fd)), @intFromPtr(&msgvec), current_batch, 0);
-            if (std.posix.errno(res) != .SUCCESS) {
-                if (std.posix.errno(res) == .AGAIN) return tcpip.Error.WouldBlock;
+            const signed_res = @as(isize, @bitCast(res));
+            if (signed_res < 0) {
+                const err_num = @as(i32, @intCast(-signed_res));
+                if (err_num == @intFromEnum(std.os.linux.E.AGAIN)) {
+                    return tcpip.Error.WouldBlock;
+                }
                 return tcpip.Error.UnknownDevice;
             }
-            i += current_batch;
+            i += @as(usize, @intCast(signed_res));
+            if (signed_res == 0) {
+                return tcpip.Error.WouldBlock;
+            }
         }
     }
 

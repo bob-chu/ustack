@@ -142,6 +142,13 @@ pub const IPv4Endpoint = struct {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
         const max_payload = self.nic.linkEP.mtu() - header.IPv4MinimumSize;
 
+        if (r.remote_link_address == null) {
+            // log.debug("IPv4: Triggering ARP for {any}", .{r.remote_address});
+            const arp_proto_ptr = self.nic.stack.network_protocols.get(0x0806) orelse return tcpip.Error.NoRoute;
+            arp_proto_ptr.linkAddressRequest(r.remote_address, r.local_address, self.nic) catch {};
+            return tcpip.Error.WouldBlock;
+        }
+
         // Note: This is an optimization. We could allocate a larger buffer for all packets, 
         // but for now we just process each packet individually to add the IP header and then
         // pass the batch down.

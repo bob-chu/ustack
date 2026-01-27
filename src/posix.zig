@@ -510,7 +510,7 @@ test "POSIX upoll basic" {
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
 
-    var udp_proto = @import("transport/udp.zig").UDPProtocol.init();
+    var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
     var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());

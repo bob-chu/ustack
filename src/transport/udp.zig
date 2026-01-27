@@ -8,8 +8,16 @@ const waiter = @import("../waiter.zig");
 pub const ProtocolNumber = 17;
 
 pub const UDPProtocol = struct {
-    pub fn init() UDPProtocol {
-        return .{};
+    view_pool: buffer.BufferPool,
+    header_pool: buffer.BufferPool,
+
+    pub fn init(allocator: std.mem.Allocator) *UDPProtocol {
+        const self = allocator.create(UDPProtocol) catch unreachable;
+        self.* = .{
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 131072),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 131072),
+        };
+        return self;
     }
 
     pub fn protocol(self: *UDPProtocol) stack.TransportProtocol {
@@ -31,10 +39,10 @@ pub const UDPProtocol = struct {
     }
 
     fn newEndpoint(ptr: *anyopaque, s: *stack.Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
-        _ = ptr;
+        const self = @as(*UDPProtocol, @ptrCast(@alignCast(ptr)));
         _ = net_proto;
         const ep = s.allocator.create(UDPEndpoint) catch return tcpip.Error.OutOfMemory;
-        ep.* = UDPEndpoint.init(s, wait_queue);
+        ep.* = UDPEndpoint.init(s, self, wait_queue);
         return ep.endpoint();
     }
 
@@ -53,6 +61,7 @@ pub const UDPEndpoint = struct {
     };
 
     stack: *stack.Stack,
+    proto: *UDPProtocol,
     waiter_queue: *waiter.Queue,
     rcv_list: std.TailQueue(Packet),
     mutex: std.Thread.Mutex = .{},
@@ -61,10 +70,10 @@ pub const UDPEndpoint = struct {
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
 
-    pub fn init(s: *stack.Stack, wq: *waiter.Queue) UDPEndpoint {
-        wq.notify(waiter.EventOut);
+    pub fn init(s: *stack.Stack, proto: *UDPProtocol, wq: *waiter.Queue) UDPEndpoint {
         return .{
             .stack = s,
+            .proto = proto,
             .waiter_queue = wq,
             .rcv_list = .{},
         };
@@ -82,7 +91,13 @@ pub const UDPEndpoint = struct {
         .close = close_external,
         .incRef = incRef_external,
         .decRef = decRef_external,
+        .notify = notify_external,
     };
+
+    fn notify_external(ptr: *anyopaque, mask: waiter.EventMask) void {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.waiter_queue.notify(mask);
+    }
 
     pub fn incRef(self: *UDPEndpoint) void {
         _ = self.ref_count.fetchAdd(1, .monotonic);
@@ -91,11 +106,11 @@ pub const UDPEndpoint = struct {
     pub fn decRef(self: *UDPEndpoint) void {
         if (self.ref_count.fetchSub(1, .release) == 1) {
             self.ref_count.fence(.acquire);
-            self.destroy();
+            self.destroy_internal();
         }
     }
 
-    fn destroy(self: *UDPEndpoint) void {
+    fn destroy_internal(self: *UDPEndpoint) void {
         self.mutex.lock();
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
@@ -137,8 +152,8 @@ pub const UDPEndpoint = struct {
     pub fn write(self: *UDPEndpoint, r: *stack.Route, remote_port: u16, data: buffer.VectorisedView) tcpip.Error!void {
         const local_address = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
 
-        const hdr_buf = self.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
-        defer self.stack.allocator.free(hdr_buf);
+        const hdr_buf = self.proto.header_pool.acquire() catch return tcpip.Error.OutOfMemory;
+        defer self.proto.header_pool.release(hdr_buf);
 
         var pre = buffer.Prependable.init(hdr_buf);
         const udp_hdr = pre.prepend(header.UDPMinimumSize).?;
@@ -184,8 +199,6 @@ pub const UDPEndpoint = struct {
         const h = header.UDP.init(mut_pkt.data.first() orelse return);
         mut_pkt.data.trimFront(header.UDPMinimumSize);
 
-        // We MUST clone the data because the underlying views (from onReadable)
-        // are stack-allocated or temporary and will be invalid after this function returns.
         const cloned_data = mut_pkt.data.clone(self.stack.allocator) catch return;
 
         const node = self.stack.allocator.create(std.TailQueue(Packet).Node) catch {
@@ -254,6 +267,7 @@ pub const UDPEndpoint = struct {
         defer self.mutex.unlock();
 
         const node = self.rcv_list.popFirst() orelse return tcpip.Error.WouldBlock;
+        
         if (self.rcv_list.first == null) {
             self.waiter_queue.clear(waiter.EventIn);
         }
@@ -327,14 +341,14 @@ pub const UDPEndpoint = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var new_addr = addr;
-        if (new_addr.port == 0) {
-            // Assign ephemeral port (simple randomization)
-            new_addr.port = 30000 + @as(u16, @intCast(@mod(std.time.milliTimestamp(), 30000)));
-        }
+        const new_addr = if (addr.port == 0) blk: {
+            var tmp = addr;
+            tmp.port = self.stack.getNextEphemeralPort();
+            break :blk tmp;
+        } else addr;
+        
         self.local_addr = new_addr;
 
-        // Register endpoint for receiving packets
         const id = stack.TransportEndpointID{
             .local_port = new_addr.port,
             .local_address = new_addr.addr,
@@ -346,8 +360,6 @@ pub const UDPEndpoint = struct {
         };
 
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
-
-        return;
     }
 
     fn shutdown(ptr: *anyopaque, flags: u8) tcpip.Error!void {
@@ -384,37 +396,30 @@ test "UDP handlePacket" {
     defer s.deinit();
 
     var wq = waiter.Queue{};
+    const udp_proto = UDPProtocol.init(allocator);
     var ep = try allocator.create(UDPEndpoint);
-    ep.* = UDPEndpoint.init(&s, &wq);
+    ep.* = UDPEndpoint.init(&s, udp_proto, &wq);
     defer ep.transportEndpoint().close();
 
     var fake_ep = struct {
         fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-            _ = ptr;
-            _ = r;
-            _ = protocol;
-            _ = pkt;
+            _ = ptr; _ = r; _ = protocol; _ = pkt;
             return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
-            _ = ptr;
-            _ = dispatcher;
+            _ = ptr; _ = dispatcher;
         }
         fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
-            _ = ptr;
-            return .{ .addr = [_]u8{0} ** 6 };
+            _ = ptr; return .{ .addr = [_]u8{0} ** 6 };
         }
         fn mtu(ptr: *anyopaque) u32 {
-            _ = ptr;
-            return 1500;
+            _ = ptr; return 1500;
         }
         fn setMTU(ptr: *anyopaque, m: u32) void {
-            _ = ptr;
-            _ = m;
+            _ = ptr; _ = m;
         }
         fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities {
-            _ = ptr;
-            return stack.CapabilityNone;
+            _ = ptr; return stack.CapabilityNone;
         }
     }{};
 

@@ -220,11 +220,22 @@ pub const TCPEndpoint = struct {
     }
 
     const TransportVTableImpl = stack.TransportEndpoint.VTable{
-        .handlePacket = handlePacket_wrapper,
-        .close = close_external,
+        .handlePacket = handlePacket_external,
+        .close = close,
         .incRef = incRef_external,
         .decRef = decRef_external,
+        .notify = notify_external,
     };
+
+    fn handlePacket_external(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.handlePacket(r, id, pkt);
+    }
+
+    fn notify_external(ptr: *anyopaque, mask: waiter.EventMask) void {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.waiter_queue.notify(mask);
+    }
 
     fn handlePacket_wrapper(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));

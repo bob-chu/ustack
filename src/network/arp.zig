@@ -138,6 +138,7 @@ pub const ARPEndpoint = struct {
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
             if (self.nic.hasAddress(target_proto_addr)) {
+                // std.debug.print("ARP: Received request for {any} from {any}, sending reply\n", .{target_proto_addr, sender_proto_addr});
                 const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
 
@@ -156,7 +157,17 @@ pub const ARPEndpoint = struct {
                     .header = pre,
                 };
 
-                self.nic.linkEP.writePacket(null, ProtocolNumber, pb) catch {};
+                const remote_link_address = tcpip.LinkAddress{ .addr = sender_hw_addr };
+                var reply_route = stack.Route{
+                    .local_address = target_proto_addr,
+                    .remote_address = sender_proto_addr,
+                    .local_link_address = self.nic.linkEP.linkAddress(),
+                    .remote_link_address = remote_link_address,
+                    .net_proto = ProtocolNumber,
+                    .nic = self.nic,
+                };
+
+                self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, pb) catch {};
             }
         }
     }
