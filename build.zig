@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example_af_packet_libev_mux", .path = "examples/main_af_packet_libev_mux.zig", .lib = "ev" },
         .{ .name = "example_af_xdp_libev", .path = "examples/main_af_xdp_libev.zig", .lib = "ev" },
         .{ .name = "example_unified", .path = "examples/main_unified.zig", .lib = "ev" },
-        .{ .name = "example_iperf_libev", .path = "examples/iperf.zig", .lib = "ev" },
+        .{ .name = "example_uperf_libev", .path = "examples/uperf.zig", .lib = "ev" },
     };
 
     for (examples) |ex| {
@@ -82,7 +82,7 @@ pub fn build(b: *std.Build) void {
             std.mem.eql(u8, ex.name, "example_af_packet_libev") or
             std.mem.eql(u8, ex.name, "example_af_packet_libev_mux") or
             std.mem.eql(u8, ex.name, "example_unified") or
-            std.mem.eql(u8, ex.name, "example_iperf_libev") or
+            std.mem.eql(u8, ex.name, "example_uperf_libev") or
             std.mem.eql(u8, ex.name, "example_af_xdp_libev"))
         {
             exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });

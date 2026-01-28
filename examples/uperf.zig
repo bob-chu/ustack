@@ -35,6 +35,7 @@ const Config = struct {
     local_ip: [4]u8,
     interface: []const u8,
     mtu: u32 = 1500,
+    packet_size: u32 = 0,
 };
 
 const MuxContext = union(enum) {
@@ -136,6 +137,7 @@ fn parseArgs(args: []const []const u8) !Config {
     var streams: usize = 1;
     var time: usize = 10;
     var mtu: u32 = 1500;
+    var packet_size: u32 = 0;
 
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -164,6 +166,10 @@ fn parseArgs(args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingMTU;
             mtu = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "-l")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPacketSize;
+            packet_size = try std.fmt.parseInt(u32, args[i], 10);
         }
     }
 
@@ -180,6 +186,7 @@ fn parseArgs(args: []const []const u8) !Config {
         .target_ip = target_ip,
         .interface = interface,
         .mtu = mtu,
+        .packet_size = packet_size,
     };
 }
 
@@ -258,6 +265,7 @@ const IperfServer = struct {
     conns: std.ArrayList(*IperfConnection),
 
     bytes_received: u64 = 0,
+    packets_received: u64 = 0,
     last_report_time: i64 = 0,
     start_time: i64 = 0, // Added
     udp_start_time: i64 = 0,
@@ -303,6 +311,7 @@ const IperfServer = struct {
         if (elapsed < 1000) return;
 
         var total_bytes_interval: u64 = 0;
+        var total_packets_interval: u64 = 0;
         var active_conns: usize = 0;
 
         var i: usize = 0;
@@ -318,27 +327,32 @@ const IperfServer = struct {
             }
 
             const bytes = conn.bytes_since_last_report;
+            const packets = conn.packets_since_last_report;
             total_bytes_interval += bytes;
+            total_packets_interval += packets;
             active_conns += 1;
 
             const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
             const mbps = (@as(f64, @floatFromInt(bytes)) * 8.0) / seconds / 1000000.0;
+            const pps = @as(f64, @floatFromInt(packets)) / seconds;
             const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
             const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
 
-            std.debug.print("[{d: >3}] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n", .{ conn.id, start_sec, end_sec, @as(f64, @floatFromInt(bytes)) / 1024.0 / 1024.0, mbps });
+            std.debug.print("[{d: >3}] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  {d: >6.0} pps\n", .{ conn.id, start_sec, end_sec, @as(f64, @floatFromInt(bytes)) / 1024.0 / 1024.0, mbps, pps });
 
             conn.bytes_since_last_report = 0;
+            conn.packets_since_last_report = 0;
             i += 1;
         }
 
         if (active_conns > 1) {
             const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
             const mbps = (@as(f64, @floatFromInt(total_bytes_interval)) * 8.0) / seconds / 1000000.0;
+            const pps = @as(f64, @floatFromInt(total_packets_interval)) / seconds;
             const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
             const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
 
-            std.debug.print("[SUM] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n", .{ start_sec, end_sec, @as(f64, @floatFromInt(total_bytes_interval)) / 1024.0 / 1024.0, mbps });
+            std.debug.print("[SUM] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  {d: >6.0} pps\n", .{ start_sec, end_sec, @as(f64, @floatFromInt(total_bytes_interval)) / 1024.0 / 1024.0, mbps, pps });
         }
 
         self.last_report_time = now;
@@ -383,18 +397,21 @@ const IperfServer = struct {
             }
 
             self.bytes_received += buf.size;
+            self.packets_received += 1;
             const elapsed = now - self.last_report_time;
             if (elapsed >= 1000) {
                 const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
                 const bytes = @as(f64, @floatFromInt(self.bytes_received));
                 const mbps = (bytes * 8.0) / seconds / 1000000.0;
+                const pps = @as(f64, @floatFromInt(self.packets_received)) / seconds;
 
                 const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.udp_start_time)) / 1000.0;
                 const end_sec = @as(f64, @floatFromInt(now - self.udp_start_time)) / 1000.0;
 
-                std.debug.print("[  5] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n", .{ start_sec, end_sec, bytes / 1024.0 / 1024.0, mbps });
+                std.debug.print("[  5] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  {d: >6.0} pps\n", .{ start_sec, end_sec, bytes / 1024.0 / 1024.0, mbps, pps });
 
                 self.bytes_received = 0;
+                self.packets_received = 0;
                 self.last_report_time = now;
             }
         }
@@ -432,32 +449,38 @@ const IperfClient = struct {
         if (elapsed < 1000) return;
 
         var total_bytes_interval: u64 = 0;
+        var total_packets_interval: u64 = 0;
         var active_conns: usize = 0;
 
         for (self.conns.items) |conn| {
             if (conn.closed) continue;
 
             const bytes = conn.bytes_since_last_report;
+            const packets = conn.packets_since_last_report;
             total_bytes_interval += bytes;
+            total_packets_interval += packets;
             active_conns += 1;
 
             const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
             const mbps = (@as(f64, @floatFromInt(bytes)) * 8.0) / seconds / 1000000.0;
+            const pps = @as(f64, @floatFromInt(packets)) / seconds;
             const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
             const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
 
-            std.debug.print("[{d: >3}] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n", .{ conn.id, start_sec, end_sec, @as(f64, @floatFromInt(bytes)) / 1024.0 / 1024.0, mbps });
+            std.debug.print("[{d: >3}] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  {d: >6.0} pps\n", .{ conn.id, start_sec, end_sec, @as(f64, @floatFromInt(bytes)) / 1024.0 / 1024.0, mbps, pps });
 
             conn.bytes_since_last_report = 0;
+            conn.packets_since_last_report = 0;
         }
 
         if (active_conns > 1) {
             const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
             const mbps = (@as(f64, @floatFromInt(total_bytes_interval)) * 8.0) / seconds / 1000000.0;
+            const pps = @as(f64, @floatFromInt(total_packets_interval)) / seconds;
             const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.start_time)) / 1000.0;
             const end_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
 
-            std.debug.print("[SUM] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec\n", .{ start_sec, end_sec, @as(f64, @floatFromInt(total_bytes_interval)) / 1024.0 / 1024.0, mbps });
+            std.debug.print("[SUM] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  {d: >6.0} pps\n", .{ start_sec, end_sec, @as(f64, @floatFromInt(total_bytes_interval)) / 1024.0 / 1024.0, mbps, pps });
         }
 
         self.last_report_time = now;
@@ -502,7 +525,9 @@ const IperfConnection = struct {
     closed: bool = false,
 
     bytes_since_last_report: u64 = 0,
+    packets_since_last_report: u64 = 0,
     total_bytes: u64 = 0,
+    total_packets: u64 = 0,
     start_time: i64 = 0,
     last_report_time: i64 = 0,
 
@@ -591,7 +616,9 @@ const IperfConnection = struct {
                 return;
             }
             self.bytes_since_last_report += buf.size;
+            self.packets_since_last_report += 1;
             self.total_bytes += buf.size;
+            self.total_packets += 1;
         }
 
         if (global_mux) |mux| {
@@ -608,7 +635,9 @@ const IperfConnection = struct {
         }
 
         var send_len = self.block_buffer.len;
-        if (self.config.protocol == .udp) {
+        if (self.config.packet_size > 0) {
+            send_len = self.config.packet_size;
+        } else if (self.config.protocol == .udp) {
             send_len = @min(self.config.mtu - 28, self.block_buffer.len);
         }
 
@@ -653,7 +682,9 @@ const IperfConnection = struct {
                 return;
             };
             self.bytes_since_last_report += n;
+            self.packets_since_last_report += 1;
             self.total_bytes += n;
+            self.total_packets += 1;
 
             if (std.time.milliTimestamp() - self.start_time > self.config.time * 1000) {
                 self.close();
