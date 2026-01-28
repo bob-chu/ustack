@@ -196,7 +196,7 @@ pub fn internetChecksum(data: []const u8, initial: u32) u32 {
     var sum: u32 = initial;
     var i: usize = 0;
     while (i + 1 < data.len) : (i += 2) {
-        sum += (@as(u16, data[i]) << 8) | data[i + 1];
+        sum += (@as(u32, data[i]) << 8) | data[i + 1];
     }
     if (i < data.len) {
         sum += @as(u32, data[i]) << 8;

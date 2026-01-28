@@ -132,6 +132,7 @@ pub const Endpoint = struct {
         getLocalAddress: *const fn (ptr: *anyopaque) Error!FullAddress,
         getRemoteAddress: *const fn (ptr: *anyopaque) Error!FullAddress,
         setReceiveWindow: ?*const fn (ptr: *anyopaque, size: u32) void = null,
+        writeBatch: ?*const fn (ptr: *anyopaque, views: []const buffer.VectorisedView, opts: WriteOptions) Error!usize = null,
         setOption: *const fn (ptr: *anyopaque, opt: EndpointOption) Error!void,
         getOption: *const fn (ptr: *anyopaque, opt: EndpointOptionType) EndpointOption,
     };

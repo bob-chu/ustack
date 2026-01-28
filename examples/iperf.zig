@@ -608,26 +608,44 @@ const IperfConnection = struct {
         }
 
         var send_len = self.block_buffer.len;
-        if (self.config.protocol == .udp) send_len = 1400;
+        if (self.config.protocol == .udp) {
+            send_len = @min(self.config.mtu - 28, self.block_buffer.len);
+        }
 
         var count: usize = 0;
-        while (count < 32) : (count += 1) {
-            // Using writev with multiple large iovecs (8KB each) to test regrouping performance with jumbo frames.
-            const chunk_size = 8192;
-            const num_chunks = send_len / chunk_size;
+        while (count < 256) : (count += 1) {
             var iovecs: [128]std.posix.iovec = undefined;
-            const iov_count = @min(num_chunks, iovecs.len);
+            var iov_count: usize = 0;
 
-            for (0..iov_count) |i| {
-                iovecs[i] = .{
-                    .base = self.block_buffer[i * chunk_size ..].ptr,
-                    .len = chunk_size,
+            if (self.config.protocol == .udp) {
+                iovecs[0] = .{
+                    .base = self.block_buffer.ptr,
+                    .len = send_len,
                 };
+                iov_count = 1;
+            } else {
+                // Using writev with multiple large iovecs (8KB each) to test regrouping performance with jumbo frames.
+                const chunk_size = 8192;
+                const num_chunks = send_len / chunk_size;
+                iov_count = @min(num_chunks, iovecs.len);
+
+                for (0..iov_count) |i| {
+                    iovecs[i] = .{
+                        .base = self.block_buffer[i * chunk_size ..].ptr,
+                        .len = chunk_size,
+                    };
+                }
             }
 
             var uio = buffer.Uio.init(@as([]const []u8, @ptrCast(iovecs[0..iov_count])));
             const n = self.ep.writev(&uio, .{}) catch |err| {
                 if (err == tcpip.Error.WouldBlock) {
+                    // Re-queue to retry in the next iteration
+                    if (global_mux) |mux| {
+                        _ = mux.ready_queue.push(&self.wait_entry) catch false;
+                        const val: u64 = 1;
+                        _ = std.posix.write(mux.signal_fd, std.mem.asBytes(&val)) catch {};
+                    }
                     return;
                 }
                 std.debug.print("[{}] Client write error: {}\n", .{ self.id, err });
