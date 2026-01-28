@@ -13,13 +13,49 @@ pub const AfPacket = struct {
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     if_index: i32 = 0,
-    rx_clusters: [64]?*buffer.Cluster = [_]?*buffer.Cluster{null} ** 64,
     dispatcher: ?*stack.NetworkDispatcher = null,
 
+    // Ring configuration
+    rx_ring: []u8,
+    tx_ring: []u8,
+    rx_idx: usize = 0,
+    tx_idx: usize = 0,
+    frame_size: u32,
+    frame_nr: u32,
+
     pub fn init(allocator: std.mem.Allocator, pool: *buffer.ClusterPool, dev_name: []const u8) !AfPacket {
-        const protocol = std.mem.nativeToBig(u16, header.ETH_P_ALL);
+        const protocol = @as(u16, @bitCast(std.mem.nativeToBig(u16, header.ETH_P_ALL)));
         const fd = try std.posix.socket(std.posix.AF.PACKET, std.posix.SOCK.RAW | std.posix.SOCK.NONBLOCK, protocol);
         errdefer std.posix.close(fd);
+
+        const version = @as(i32, header.TPACKET_V2);
+        try std.posix.setsockopt(fd, 263, header.PACKET_VERSION, std.mem.asBytes(&version));
+
+        // Ring settings: 16KB frames, 1024 frames per ring = 16MB per ring
+        const frame_size: u32 = 16384;
+        const frame_nr: u32 = 1024;
+        const block_size: u32 = frame_size * 16; // 256KB block
+        const block_nr: u32 = (frame_size * frame_nr) / block_size;
+
+        const req = header.tpacket_req{
+            .tp_block_size = block_size,
+            .tp_block_nr = block_nr,
+            .tp_frame_size = frame_size,
+            .tp_frame_nr = frame_nr,
+        };
+
+        try std.posix.setsockopt(fd, 263, header.PACKET_RX_RING, std.mem.asBytes(&req));
+        try std.posix.setsockopt(fd, 263, header.PACKET_TX_RING, std.mem.asBytes(&req));
+
+        const rx_ring_size = frame_size * frame_nr;
+        const tx_ring_size = frame_size * frame_nr;
+        const total_ring_size = rx_ring_size + tx_ring_size;
+
+        const ring_ptr = try std.posix.mmap(null, total_ring_size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, fd, 0);
+        errdefer std.posix.munmap(ring_ptr);
+
+        const rx_ring_ptr = ring_ptr[0..rx_ring_size];
+        const tx_ring_ptr = ring_ptr[rx_ring_size..total_ring_size];
 
         const if_index = try getIfIndex(fd, dev_name);
 
@@ -36,10 +72,6 @@ pub const AfPacket = struct {
 
         const mac = try getIfMac(fd, dev_name);
 
-        const buf_size: i32 = 64 * 1024 * 1024;
-        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&buf_size));
-        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&buf_size));
-
         return AfPacket{
             .fd = fd,
             .allocator = allocator,
@@ -47,7 +79,10 @@ pub const AfPacket = struct {
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 1, 1024),
             .if_index = if_index,
             .address = .{ .addr = mac },
-            .rx_clusters = [_]?*buffer.Cluster{null} ** 64,
+            .rx_ring = rx_ring_ptr,
+            .tx_ring = tx_ring_ptr,
+            .frame_size = frame_size,
+            .frame_nr = frame_nr,
         };
     }
 
@@ -62,8 +97,22 @@ pub const AfPacket = struct {
                 .mtu = mtu,
                 .setMTU = setMTU,
                 .capabilities = capabilities,
+                .close = close_external,
             },
         };
+    }
+
+    fn close_external(ptr: *anyopaque) void {
+        const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
+        self.deinit();
+    }
+
+    pub fn deinit(self: *AfPacket) void {
+        const total_ring_size = self.frame_size * self.frame_nr * 2;
+        // The rx_ring.ptr is the start of the original mmap'd area.
+        const mmap_ptr = @as([*]align(std.mem.page_size) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
+        std.posix.munmap(mmap_ptr[0..total_ring_size]);
+        std.posix.close(self.fd);
     }
 
     fn writePackets_wrapper(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
@@ -74,58 +123,46 @@ pub const AfPacket = struct {
     }
 
     pub fn writePackets(self: *AfPacket, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
-        const batch_size = 64;
-        var msgvec: [batch_size]std.os.linux.mmsghdr = undefined;
-        var iovecs: [batch_size][header.MaxViewsPerPacket + 1]std.posix.iovec = undefined;
+        var sent_any = false;
+        for (packets) |pkt| {
+            const slot = self.tx_ring[self.tx_idx * self.frame_size .. (self.tx_idx + 1) * self.frame_size];
+            var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
 
-        var i: usize = 0;
-        while (i < packets.len) {
-            const current_batch = @min(packets.len - i, batch_size);
-            for (0..current_batch) |j| {
-                const pkt = packets[i + j];
-                const hdr_view = pkt.header.view();
-                iovecs[j][0] = .{ .base = @constCast(hdr_view.ptr), .len = hdr_view.len };
-
-                var iov_cnt: usize = 1;
-                for (pkt.data.views) |v| {
-                    if (iov_cnt >= iovecs[j].len) break;
-                    iovecs[j][iov_cnt] = .{ .base = @constCast(v.view.ptr), .len = v.view.len };
-                    iov_cnt += 1;
-                }
-
-                msgvec[j] = .{
-                    .msg_hdr = .{
-                        .name = null,
-                        .namelen = 0,
-                        .iov = @as([*]std.posix.iovec, @ptrCast(&iovecs[j])),
-                        .iovlen = @as(i32, @intCast(iov_cnt)),
-                        .control = null,
-                        .controllen = 0,
-                        .flags = 0,
-                    },
-                    .msg_len = 0,
-                };
-            }
-
-            const res = std.os.linux.syscall4(.sendmmsg, @as(usize, @intCast(self.fd)), @intFromPtr(&msgvec), current_batch, 0);
-            const signed_res = @as(isize, @bitCast(res));
-            if (signed_res < 0) {
-                const err_num = @as(i32, @intCast(-signed_res));
-                if (err_num == @intFromEnum(std.os.linux.E.AGAIN)) {
-                    return tcpip.Error.WouldBlock;
-                }
-                return tcpip.Error.UnknownDevice;
-            }
-            i += @as(usize, @intCast(signed_res));
-            if (signed_res == 0) {
+            if (h.tp_status != header.TP_STATUS_KERNEL) {
+                // Ring full, kick kernel to send
+                _ = std.os.linux.syscall6(.sendto, @as(usize, @intCast(self.fd)), 0, 0, 0, 0, 0);
                 return tcpip.Error.WouldBlock;
             }
+
+            const hdr_view = pkt.header.view();
+            const data_off = @as(usize, std.mem.alignForward(usize, @sizeOf(header.tpacket2_hdr), 16));
+            var current_off = data_off;
+
+            @memcpy(slot[current_off .. current_off + hdr_view.len], hdr_view);
+            current_off += hdr_view.len;
+
+            for (pkt.data.views) |v| {
+                @memcpy(slot[current_off .. current_off + v.view.len], v.view);
+                current_off += v.view.len;
+            }
+
+            h.tp_len = @as(u32, @intCast(pkt.header.usedLength() + pkt.data.size));
+            h.tp_status = header.TP_STATUS_SEND_REQUEST;
+
+            self.tx_idx = (self.tx_idx + 1) % self.frame_nr;
+            sent_any = true;
+        }
+
+        if (sent_any) {
+            // Kick kernel
+            _ = std.os.linux.syscall6(.sendto, @as(usize, @intCast(self.fd)), 0, 0, 0, 0, 0);
         }
     }
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
-        _ = r; _ = protocol;
+        _ = r;
+        _ = protocol;
         const p = [_]tcpip.PacketBuffer{pkt};
         return self.writePackets(&p);
     }
@@ -156,59 +193,26 @@ pub const AfPacket = struct {
     }
 
     pub fn readPacket(self: *AfPacket) !bool {
-        const batch_size = 64;
-        var msgvec: [batch_size]std.os.linux.mmsghdr = undefined;
-        var iovecs: [batch_size]std.posix.iovec = undefined;
+        var num_read: usize = 0;
+        const max_batch = 128;
 
-        var i: usize = 0;
-        while (i < batch_size) : (i += 1) {
-            if (self.rx_clusters[i]) |c| {
-                if (c.ref_count > 1) {
-                    c.release();
-                    self.rx_clusters[i] = null;
-                }
-            }
-            if (self.rx_clusters[i] == null) {
-                self.rx_clusters[i] = try self.cluster_pool.acquire();
-            }
-            const c = self.rx_clusters[i].?;
-            iovecs[i] = .{ .base = &c.data, .len = c.data.len };
-            msgvec[i] = .{
-                .msg_hdr = .{
-                    .name = null,
-                    .namelen = 0,
-                    .iov = @as([*]std.posix.iovec, @ptrCast(&iovecs[i])),
-                    .iovlen = 1,
-                    .control = null,
-                    .controllen = 0,
-                    .flags = 0,
-                },
-                .msg_len = 0,
-            };
-        }
+        while (num_read < max_batch) {
+            const slot = self.rx_ring[self.rx_idx * self.frame_size .. (self.rx_idx + 1) * self.frame_size];
+            var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
 
-        const count_raw = std.os.linux.syscall5(.recvmmsg, @as(usize, @intCast(self.fd)), @intFromPtr(&msgvec), batch_size, std.posix.MSG.DONTWAIT, 0);
-        const signed_count = @as(isize, @bitCast(count_raw));
-        if (signed_count < 0) {
-            const err_num = @as(std.os.linux.E, @enumFromInt(@as(i32, @intCast(-signed_count))));
-            if (err_num == .AGAIN) return false;
-            return error.Unexpected;
-        }
+            const status = h.tp_status;
+            if ((status & header.TP_STATUS_USER) == 0) break;
 
-        const num_received = @as(usize, @intCast(signed_count));
-        if (num_received == 0) return false;
+            const len = h.tp_len;
+            const data_start = h.tp_mac;
+            const data = slot[data_start .. data_start + len];
 
-        //std.debug.print("AfPacket: Received {} packets\n", .{num_received});
+            const c = try self.cluster_pool.acquire();
+            @memcpy(c.data[0..len], data);
 
-        for (0..num_received) |j| {
-            const len = msgvec[j].msg_len;
-            if (len == 0) continue;
-            //std.debug.print("AfPacket: pkt[{}] len={}\n", .{j, len});
-
-            const c = self.rx_clusters[j].?;
-            // We increment refcount because we are giving a reference to the stack.
-            // Our reference in rx_clusters[j] remains.
-            c.acquire();
+            // Release slot back to kernel immediately
+            h.tp_status = header.TP_STATUS_KERNEL;
+            self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
 
             const view_mem = try self.view_pool.acquire();
             const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
@@ -227,16 +231,11 @@ pub const AfPacket = struct {
                 d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, mut_pkt);
             }
 
-            mut_pkt.data.deinit(); // This releases the reference we just gave to the stack (or the one stack kept).
-
-            // Now check if stack kept it. If refcount > 1, it means stack kept it.
-            if (c.ref_count > 1) {
-                c.release(); // Release our reference in rx_clusters
-                self.rx_clusters[j] = null;
-            }
+            mut_pkt.data.deinit();
+            num_read += 1;
         }
 
-        return true;
+        return num_read > 0;
     }
 
     fn getIfIndex(fd: std.posix.fd_t, name: []const u8) !i32 {

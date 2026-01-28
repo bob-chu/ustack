@@ -34,7 +34,11 @@ pub const ClusterPool = struct {
     count: usize = 0,
 
     pub fn init(allocator: Allocator) ClusterPool {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .free_list = null,
+            .count = 0,
+        };
     }
 
     pub fn deinit(self: *ClusterPool) void {

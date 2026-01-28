@@ -268,6 +268,59 @@ pub const SIOCGIFHWADDR = 0x8927;
 
 pub const ETH_P_ALL = 0x0003;
 
+pub const PACKET_RX_RING = 5;
+pub const PACKET_TX_RING = 13;
+pub const PACKET_VERSION = 10;
+pub const PACKET_HDRLEN = 11;
+pub const PACKET_RESERVE = 12;
+
+pub const TPACKET_V1 = 0;
+pub const TPACKET_V2 = 1;
+pub const TPACKET_V3 = 2;
+
+pub const TP_STATUS_KERNEL = 0;
+pub const TP_STATUS_USER = 1;
+pub const TP_STATUS_COPY = (1 << 1);
+pub const TP_STATUS_LOSING = (1 << 2);
+pub const TP_STATUS_CSUMNOTREADY = (1 << 3);
+pub const TP_STATUS_VLAN_VALID = (1 << 4);
+pub const TP_STATUS_BLK_TMO = (1 << 5);
+pub const TP_STATUS_VLAN_TPID_VALID = (1 << 6);
+pub const TP_STATUS_CSUM_VALID = (1 << 7);
+pub const TP_STATUS_SEND_REQUEST = 1;
+pub const TP_STATUS_SENDING = 2;
+pub const TP_STATUS_WRONG_FORMAT = 4;
+
+pub const tpacket_req = extern struct {
+    tp_block_size: u32,
+    tp_block_nr: u32,
+    tp_frame_size: u32,
+    tp_frame_nr: u32,
+};
+
+pub const tpacket_hdr = extern struct {
+    tp_status: usize,
+    tp_len: u32,
+    tp_snaplen: u32,
+    tp_mac: u16,
+    tp_net: u16,
+    tp_sec: u32,
+    tp_usec: u32,
+};
+
+pub const tpacket2_hdr = extern struct {
+    tp_status: u32,
+    tp_len: u32,
+    tp_snaplen: u32,
+    tp_mac: u16,
+    tp_net: u16,
+    tp_sec: u32,
+    tp_nsec: u32,
+    tp_vlan_tci: u16,
+    tp_vlan_tpid: u16,
+    tp_padding: [4]u8,
+};
+
 pub const ARP = struct {
     data: []u8,
 
@@ -832,4 +885,3 @@ test "Checksum SIMD vs Scalar comparison" {
         try std.testing.expectEqual(scalar_sum, simd_sum);
     }
 }
-

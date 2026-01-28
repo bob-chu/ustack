@@ -23,6 +23,7 @@ pub const LinkEndpoint = struct {
         mtu: *const fn (ptr: *anyopaque) u32,
         setMTU: *const fn (ptr: *anyopaque, mtu: u32) void,
         capabilities: *const fn (ptr: *anyopaque) LinkEndpointCapabilities,
+        close: ?*const fn (ptr: *anyopaque) void = null,
     };
 
     pub fn writePacket(self: LinkEndpoint, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
@@ -56,6 +57,9 @@ pub const LinkEndpoint = struct {
 
     pub fn capabilities(self: LinkEndpoint) LinkEndpointCapabilities {
         return self.vtable.capabilities(self.ptr);
+    }
+    pub fn close(self: LinkEndpoint) void {
+        if (self.vtable.close) |f| f(self.ptr);
     }
 };
 
@@ -270,6 +274,7 @@ pub const NIC = struct {
         while (it.next()) |ep| {
             ep.close();
         }
+        self.linkEP.close();
         self.addresses.deinit();
         self.network_endpoints.deinit();
     }
@@ -312,7 +317,7 @@ pub const NIC = struct {
         const proto = proto_opt.?;
 
         const ep_opt = self.network_endpoints.get(protocol);
-        
+
         if (ep_opt == null) return;
         const ep = ep_opt.?;
 
@@ -716,10 +721,9 @@ pub const Stack = struct {
                     ep.decRef();
                 } else {
                     if (protocol == 17) {
-        log.warn("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
-        log.debug("Exact: local={any}:{} remote={any}:{}", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
-        log.debug("Any: local={any}:{} remote={any}:{}", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });
-
+                        log.warn("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
+                        log.debug("Exact: local={any}:{} remote={any}:{}", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
+                        log.debug("Any: local={any}:{} remote={any}:{}", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });
                     }
                 }
             }
