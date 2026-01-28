@@ -163,10 +163,10 @@ pub const TCP = struct {
 
     pub fn calculateChecksum(self: TCP, src: [4]u8, dst: [4]u8, payload: []const u8) u16 {
         var sum: u32 = 0;
-        sum += std.mem.readInt(u16, src[0..2], .big);
-        sum += std.mem.readInt(u16, src[2..4], .big);
-        sum += std.mem.readInt(u16, dst[0..2], .big);
-        sum += std.mem.readInt(u16, dst[2..4], .big);
+        sum += (@as(u16, src[0]) << 8) | src[1];
+        sum += (@as(u16, src[2]) << 8) | src[3];
+        sum += (@as(u16, dst[0]) << 8) | dst[1];
+        sum += (@as(u16, dst[2]) << 8) | dst[3];
         sum += 6; // Protocol TCP
         sum += @as(u16, @intCast(self.data.len + payload.len));
 
@@ -177,10 +177,10 @@ pub const TCP = struct {
 
     pub fn calculateChecksumVectorised(self: TCP, src: [4]u8, dst: [4]u8, payload: buffer.VectorisedView) u16 {
         var sum: u32 = 0;
-        sum += std.mem.readInt(u16, src[0..2], .big);
-        sum += std.mem.readInt(u16, src[2..4], .big);
-        sum += std.mem.readInt(u16, dst[0..2], .big);
-        sum += std.mem.readInt(u16, dst[2..4], .big);
+        sum += (@as(u16, src[0]) << 8) | src[1];
+        sum += (@as(u16, src[2]) << 8) | src[3];
+        sum += (@as(u16, dst[0]) << 8) | dst[1];
+        sum += (@as(u16, dst[2]) << 8) | dst[3];
         sum += 6; // Protocol TCP
         sum += @as(u16, @intCast(self.data.len + payload.size));
 
@@ -196,7 +196,7 @@ pub fn internetChecksum(data: []const u8, initial: u32) u32 {
     var sum: u32 = initial;
     var i: usize = 0;
     while (i + 1 < data.len) : (i += 2) {
-        sum += std.mem.readInt(u16, data[i..][0..2], .big);
+        sum += (@as(u16, data[i]) << 8) | data[i + 1];
     }
     if (i < data.len) {
         sum += @as(u32, data[i]) << 8;

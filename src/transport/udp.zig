@@ -52,6 +52,7 @@ pub const UDPProtocol = struct {
         _ = net_proto;
         const ep = s.allocator.create(UDPEndpoint) catch return tcpip.Error.OutOfMemory;
         ep.* = UDPEndpoint.init(s, self, wait_queue);
+        ep.retry_timer.context = ep;
         return ep.endpoint();
     }
 
@@ -73,8 +74,8 @@ pub const UDPEndpoint = struct {
     proto: *UDPProtocol,
     waiter_queue: *waiter.Queue,
     rcv_list: std.TailQueue(Packet),
-    mutex: std.Thread.Mutex = .{},
-    ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    ref_count: usize = 1,
+    retry_timer: @import("../time.zig").Timer = undefined,
 
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
@@ -85,7 +86,13 @@ pub const UDPEndpoint = struct {
             .proto = proto,
             .waiter_queue = wq,
             .rcv_list = .{},
+            .retry_timer = @import("../time.zig").Timer.init(handleRetryTimer, undefined),
         };
+    }
+
+    fn handleRetryTimer(ptr: *anyopaque) void {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.waiter_queue.notify(waiter.EventOut);
     }
 
     pub fn transportEndpoint(self: *UDPEndpoint) stack.TransportEndpoint {
@@ -109,23 +116,22 @@ pub const UDPEndpoint = struct {
     }
 
     pub fn incRef(self: *UDPEndpoint) void {
-        _ = self.ref_count.fetchAdd(1, .monotonic);
+        self.ref_count += 1;
     }
 
     pub fn decRef(self: *UDPEndpoint) void {
-        if (self.ref_count.fetchSub(1, .release) == 1) {
-            self.ref_count.fence(.acquire);
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
             self.destroy_internal();
         }
     }
 
     fn destroy_internal(self: *UDPEndpoint) void {
-        self.mutex.lock();
+        self.stack.timer_queue.cancel(&self.retry_timer);
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
-        self.mutex.unlock();
         self.stack.allocator.destroy(self);
     }
 
@@ -178,10 +184,10 @@ pub const UDPEndpoint = struct {
             var sum: u32 = 0;
             const src = local_address.addr.v4;
             const dst = r.remote_address.v4;
-            sum += std.mem.readInt(u16, src[0..2], .big);
-            sum += std.mem.readInt(u16, src[2..4], .big);
-            sum += std.mem.readInt(u16, dst[0..2], .big);
-            sum += std.mem.readInt(u16, dst[2..4], .big);
+            sum += std.mem.readInt(u16, src[0..2][0..2][0..2], .big);
+            sum += std.mem.readInt(u16, src[2..4][0..2][0..2], .big);
+            sum += std.mem.readInt(u16, dst[0..2][0..2][0..2], .big);
+            sum += std.mem.readInt(u16, dst[2..4][0..2][0..2], .big);
             sum += 17; // UDP
             sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
 
@@ -227,10 +233,8 @@ pub const UDPEndpoint = struct {
             },
         };
 
-        self.mutex.lock();
         const was_empty = self.rcv_list.first == null;
         self.rcv_list.append(node);
-        self.mutex.unlock();
 
         if (was_empty) {
             self.waiter_queue.notify(waiter.EventIn);
@@ -274,8 +278,6 @@ pub const UDPEndpoint = struct {
 
     fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.VectorisedView {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
-        self.mutex.lock();
-        defer self.mutex.unlock();
 
         const node = self.rcv_list.popFirst() orelse return tcpip.Error.WouldBlock;
         
@@ -292,65 +294,61 @@ pub const UDPEndpoint = struct {
         return res;
     }
 
+    fn writeView_external(ptr: *anyopaque, view: buffer.VectorisedView, opts: tcpip.WriteOptions) tcpip.Error!usize {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        return self.writeInternal(view, opts);
+    }
+
     fn write_external(ptr: *anyopaque, p: tcpip.Payloader, opts: tcpip.WriteOptions) tcpip.Error!usize {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
-        const data_buf = try p.fullPayload();
+        if (p.viewPayload()) |view| {
+            return self.writeInternal(view, opts);
+        } else |_| {
+            const data_buf = try p.fullPayload();
+            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(data_buf) }};
+            const data = buffer.VectorisedView.init(data_buf.len, &views);
+            return self.writeInternal(data, opts);
+        }
+    }
 
-        var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(data_buf) }};
-        const data = buffer.VectorisedView.init(data_buf.len, &views);
-
+    fn writeInternal(self: *UDPEndpoint, data: buffer.VectorisedView, opts: tcpip.WriteOptions) tcpip.Error!usize {
         if (opts.to) |to| {
             const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-
-            const net_proto: u16 = switch (to.addr) {
-                .v4 => 0x0800,
-                .v6 => 0x86dd,
-            };
+            const net_proto: u16 = switch (to.addr) { .v4 => @as(u16, 0x0800), .v6 => @as(u16, 0x86dd) };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
-
-            self.stack.mutex.lock();
             const next_hop = r.next_hop orelse to.addr;
             if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
+            } else {
+                if (!self.retry_timer.active) {
+                    self.stack.timer_queue.schedule(&self.retry_timer, 1000);
+                }
             }
-            self.stack.mutex.unlock();
-
             try self.write(&r, to.port, data);
         } else if (self.remote_addr) |to| {
             const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-
-            const net_proto: u16 = switch (to.addr) {
-                .v4 => 0x0800,
-                .v6 => 0x86dd,
-            };
+            const net_proto: u16 = switch (to.addr) { .v4 => @as(u16, 0x0800), .v6 => @as(u16, 0x86dd) };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
-
-            self.stack.mutex.lock();
             if (self.stack.link_addr_cache.get(to.addr)) |link_addr| {
                 r.remote_link_address = link_addr;
+            } else {
+                if (!self.retry_timer.active) {
+                    self.stack.timer_queue.schedule(&self.retry_timer, 1000);
+                }
             }
-            self.stack.mutex.unlock();
-
             try self.write(&r, to.port, data);
-        } else {
-            return tcpip.Error.DestinationRequired;
-        }
-
-        return data_buf.len;
+        } else return tcpip.Error.DestinationRequired;
+        return data.size;
     }
 
     fn connect(ptr: *anyopaque, addr: tcpip.FullAddress) tcpip.Error!void {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
-        self.mutex.lock();
-        defer self.mutex.unlock();
         self.remote_addr = addr;
         return;
     }
 
     fn bind(ptr: *anyopaque, addr: tcpip.FullAddress) tcpip.Error!void {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
-        self.mutex.lock();
-        defer self.mutex.unlock();
 
         const new_addr = if (addr.port == 0) blk: {
             var tmp = addr;
@@ -462,9 +460,9 @@ test "UDP handlePacket" {
 
     var udp_data = [_]u8{0} ** 12;
     _ = header.UDP.init(&udp_data);
-    std.mem.writeInt(u16, udp_data[0..2], 1234, .big);
-    std.mem.writeInt(u16, udp_data[2..4], 80, .big);
-    std.mem.writeInt(u16, udp_data[4..6], 12, .big);
+    std.mem.writeInt(u16, udp_data[0..2][0..2][0..2], 1234, .big);
+    std.mem.writeInt(u16, udp_data[2..4][0..2][0..2], 80, .big);
+    std.mem.writeInt(u16, udp_data[4..6][0..2][0..2], 12, .big);
 
     var views = [_]buffer.ClusterView{.{ .cluster = null, .view = &udp_data }};
     const pkt = tcpip.PacketBuffer{

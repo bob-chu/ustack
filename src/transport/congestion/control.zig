@@ -13,6 +13,7 @@ pub const CongestionControl = struct {
         onRetransmit: *const fn (ptr: *anyopaque) void,
         getCwnd: *const fn (ptr: *anyopaque) u32,
         getSsthresh: *const fn (ptr: *anyopaque) u32,
+        setMss: ?*const fn (ptr: *anyopaque, mss: u32) void = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -34,6 +35,10 @@ pub const CongestionControl = struct {
 
     pub fn getSsthresh(self: CongestionControl) u32 {
         return self.vtable.getSsthresh(self.ptr);
+    }
+
+    pub fn setMss(self: CongestionControl, mss: u32) void {
+        if (self.vtable.setMss) |f| f(self.ptr, mss);
     }
 
     pub fn deinit(self: CongestionControl) void {
@@ -67,8 +72,16 @@ pub const NewReno = struct {
         .onRetransmit = onRetransmit,
         .getCwnd = getCwnd,
         .getSsthresh = getSsthresh,
+        .setMss = setMss,
         .deinit = deinit,
     };
+
+    fn setMss(ptr: *anyopaque, mss: u32) void {
+        const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));
+        const ratio = @as(f64, @floatFromInt(self.cwnd)) / @as(f64, @floatFromInt(self.mss));
+        self.mss = mss;
+        self.cwnd = @as(u32, @intFromFloat(ratio * @as(f64, @floatFromInt(mss))));
+    }
 
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));

@@ -41,7 +41,7 @@ pub const ICMPv4TransportProtocol = struct {
         _ = ptr;
         const v = pkt.data.first() orelse return .{ .src = 0, .dst = 0 };
         if (v.len >= 8) {
-            const id = std.mem.readInt(u16, v[4..6], .big);
+            const id = std.mem.readInt(u16, v[4..6][0..2][0..2], .big);
             return .{ .src = id, .dst = 0 };
         }
         return .{ .src = 0, .dst = 0 };
@@ -60,7 +60,7 @@ pub const ICMPv4PacketHandler = struct {
         const v = mut_pkt.data.first() orelse return;
         var h = header.ICMPv4.init(v);
 
-        if (h.type() == header.ICMPv4EchoType) {
+        if (h.@"type"() == header.ICMPv4EchoType) {
             const payload = mut_pkt.data.toView(s.allocator) catch return;
             defer s.allocator.free(payload);
 

@@ -306,16 +306,12 @@ pub const NIC = struct {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
 
-        self.stack.mutex.lock();
         const proto_opt = self.stack.network_protocols.get(protocol);
-        self.stack.mutex.unlock();
 
         if (proto_opt == null) return;
         const proto = proto_opt.?;
 
-        self.stack.mutex.lock();
         const ep_opt = self.network_endpoints.get(protocol);
-        self.stack.mutex.unlock();
         
         if (ep_opt == null) return;
         const ep = ep_opt.?;
@@ -353,19 +349,15 @@ pub const Route = struct {
         const next_hop = self.next_hop orelse self.remote_address;
 
         if (self.remote_link_address == null) {
-            self.nic.stack.mutex.lock();
             const link_addr_opt = self.nic.stack.link_addr_cache.get(next_hop);
-            self.nic.stack.mutex.unlock();
 
             if (link_addr_opt) |link_addr| {
                 self.remote_link_address = link_addr;
             } else {
-                self.nic.stack.mutex.lock();
                 var it = self.nic.stack.network_protocols.valueIterator();
                 while (it.next()) |proto| {
                     proto.linkAddressRequest(next_hop, self.local_address, self.nic) catch {};
                 }
-                self.nic.stack.mutex.unlock();
                 return tcpip.Error.WouldBlock;
             }
         }
@@ -386,12 +378,10 @@ pub const RouteEntry = struct {
 // Route table with longest-prefix matching
 const RouteTable = struct {
     routes: std.ArrayList(RouteEntry),
-    mutex: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) RouteTable {
         return .{
             .routes = std.ArrayList(RouteEntry).init(allocator),
-            .mutex = .{},
         };
     }
 
@@ -401,9 +391,6 @@ const RouteTable = struct {
 
     // Add a route to the table (inserted in prefix-length order)
     pub fn addRoute(self: *RouteTable, route: RouteEntry) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         // Find insertion point (sorted by prefix length, longest first)
         var i: usize = 0;
         for (self.routes.items) |r| {
@@ -418,9 +405,6 @@ const RouteTable = struct {
 
     // Remove routes matching a predicate
     pub fn removeRoutes(self: *RouteTable, match: *const fn (route: RouteEntry) bool) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         var count: usize = 0;
         var i: usize = 0;
         while (i < self.routes.items.len) {
@@ -436,9 +420,6 @@ const RouteTable = struct {
 
     // Find best matching route using longest-prefix matching
     pub fn findRoute(self: *RouteTable, dest: tcpip.Address, _: tcpip.NICID) ?*RouteEntry {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         var best_route: ?*RouteEntry = null;
         for (self.routes.items) |*route_entry| {
             // Check if destination matches this route
@@ -456,21 +437,12 @@ const RouteTable = struct {
 
     // Get all routes
     pub fn getRoutes(self: *RouteTable) []const RouteEntry {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.routes.items;
     }
 };
 
 pub const TransportTable = struct {
-    const num_shards = 256;
-
-    shards: [num_shards]Shard,
-
-    const Shard = struct {
-        mutex: std.Thread.Mutex = .{},
-        endpoints: std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
-    };
+    endpoints: std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
 
     const TransportContext = struct {
         pub fn hash(_: TransportContext, key: TransportEndpointID) u64 {
@@ -482,44 +454,25 @@ pub const TransportTable = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) TransportTable {
-        var self: TransportTable = undefined;
-        for (&self.shards) |*shard| {
-            shard.* = .{
-                .endpoints = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator),
-            };
-        }
-        return self;
+        return .{
+            .endpoints = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator),
+        };
     }
 
     pub fn deinit(self: *TransportTable) void {
-        for (&self.shards) |*shard| {
-            shard.endpoints.deinit();
-        }
-    }
-
-    fn getShard(self: *TransportTable, id: TransportEndpointID) *Shard {
-        return &self.shards[id.hash() % num_shards];
+        self.endpoints.deinit();
     }
 
     pub fn put(self: *TransportTable, id: TransportEndpointID, ep: TransportEndpoint) !void {
-        const shard = self.getShard(id);
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-        try shard.endpoints.put(id, ep);
+        try self.endpoints.put(id, ep);
     }
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
-        const shard = self.getShard(id);
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-        return shard.endpoints.remove(id);
+        return self.endpoints.remove(id);
     }
 
     pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
-        const shard = self.getShard(id);
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-        const ep = shard.endpoints.get(id);
+        const ep = self.endpoints.get(id);
         if (ep) |e| e.incRef();
         return ep;
     }
@@ -527,7 +480,6 @@ pub const TransportTable = struct {
 
 pub const Stack = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
     endpoints: TransportTable,
     link_addr_cache: std.AutoHashMap(tcpip.Address, tcpip.LinkAddress),
@@ -536,7 +488,7 @@ pub const Stack = struct {
     route_table: RouteTable,
     timer_queue: time.TimerQueue,
     cluster_pool: buffer.ClusterPool,
-    ephemeral_port: std.atomic.Value(u16),
+    ephemeral_port: u16,
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
         return .{
@@ -549,7 +501,7 @@ pub const Stack = struct {
             .route_table = RouteTable.init(allocator),
             .timer_queue = .{},
             .cluster_pool = buffer.ClusterPool.init(allocator),
-            .ephemeral_port = std.atomic.Value(u16).init(32768),
+            .ephemeral_port = 32768,
         };
     }
 
@@ -569,41 +521,22 @@ pub const Stack = struct {
     }
 
     pub fn registerNetworkProtocol(self: *Stack, proto: NetworkProtocol) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         try self.network_protocols.put(proto.number(), proto);
     }
 
     pub fn registerTransportProtocol(self: *Stack, proto: TransportProtocol) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         try self.transport_protocols.put(proto.number(), proto);
     }
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
-        self.mutex.lock();
         const prev = try self.link_addr_cache.fetchPut(addr, link_addr);
-        self.mutex.unlock();
 
         if (prev != null and prev.?.value.eq(link_addr)) return;
 
         // Notify all transport endpoints that they might be writable now (due to ARP resolution)
-        for (&self.endpoints.shards) |*shard| {
-            shard.mutex.lock();
-            // Collect references to avoid holding shard lock during notify
-            var entries = std.ArrayList(TransportEndpoint).init(self.allocator);
-            var it = shard.endpoints.valueIterator();
-            while (it.next()) |ep| {
-                ep.incRef();
-                entries.append(ep.*) catch {};
-            }
-            shard.mutex.unlock();
-
-            for (entries.items) |ep| {
-                ep.notify(waiter.EventOut);
-                ep.decRef();
-            }
-            entries.deinit();
+        var it = self.endpoints.endpoints.valueIterator();
+        while (it.next()) |ep| {
+            ep.notify(waiter.EventOut);
         }
     }
 
@@ -612,18 +545,15 @@ pub const Stack = struct {
     }
 
     pub fn unregisterTransportEndpoint(self: *Stack, id: TransportEndpointID) void {
-        const shard_idx = id.hash() % 256;
-        const shard = &self.endpoints.shards[shard_idx];
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-        _ = shard.endpoints.remove(id);
+        _ = self.endpoints.remove(id);
     }
 
     pub fn getNextEphemeralPort(self: *Stack) u16 {
-        const port = self.ephemeral_port.fetchAdd(1, .monotonic);
-        if (port < 32768) {
-            self.ephemeral_port.store(32769, .monotonic);
-            return 32768;
+        const port = self.ephemeral_port;
+        if (self.ephemeral_port == 65535) {
+            self.ephemeral_port = 32768;
+        } else {
+            self.ephemeral_port += 1;
         }
         return port;
     }
@@ -631,11 +561,9 @@ pub const Stack = struct {
     // Find route using longest-prefix matching in routing table
     pub fn findRoute(self: *Stack, nic_id: tcpip.NICID, local_addr: tcpip.Address, remote_addr: tcpip.Address, net_proto: tcpip.NetworkProtocolNumber) !Route {
         if (nic_id != 0) {
-            self.mutex.lock();
             const nic_opt = self.nics.get(nic_id);
             const next_hop = remote_addr;
             const link_addr_opt = self.link_addr_cache.get(next_hop);
-            self.mutex.unlock();
 
             const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
@@ -654,11 +582,9 @@ pub const Stack = struct {
         // Find route in routing table (longest-prefix matching)
         const route_entry = self.route_table.findRoute(remote_addr, nic_id) orelse return tcpip.Error.NoRoute;
 
-        self.mutex.lock();
         const nic_opt = self.nics.get(route_entry.nic);
         const next_hop = route_entry.gateway;
         const link_addr_opt = if (next_hop.isAny()) self.link_addr_cache.get(remote_addr) else self.link_addr_cache.get(next_hop);
-        self.mutex.unlock();
 
         const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
@@ -692,12 +618,10 @@ pub const Stack = struct {
 
     // Set entire route table (replaces existing)
     pub fn setRouteTable(self: *Stack, routes: []const RouteEntry) !void {
-        self.route_table.mutex.lock();
         self.route_table.routes.clearRetainingCapacity();
         for (routes) |route| {
             try self.route_table.routes.append(route);
         }
-        self.route_table.mutex.unlock();
     }
 
     // Remove routes matching a predicate
@@ -713,9 +637,7 @@ pub const Stack = struct {
         const nic = try self.allocator.create(NIC);
         nic.* = NIC.init(self, id, "", ep, false);
 
-        self.mutex.lock();
         try self.nics.put(id, nic);
-        self.mutex.unlock();
 
         nic.attach();
     }
@@ -732,9 +654,7 @@ pub const Stack = struct {
     pub fn deliverTransportPacket(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
 
-        self.mutex.lock();
         const proto_opt = self.transport_protocols.get(protocol);
-        self.mutex.unlock();
 
         const proto = proto_opt orelse return;
         const ports = proto.parsePorts(pkt);

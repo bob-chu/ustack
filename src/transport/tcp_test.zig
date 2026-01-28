@@ -1,0 +1,298 @@
+const std = @import("std");
+const tcpip = @import("../tcpip.zig");
+const stack = @import("../stack.zig");
+const header = @import("../header.zig");
+const buffer = @import("../buffer.zig");
+const waiter = @import("../waiter.zig");
+const ipv4 = @import("../network/ipv4.zig");
+const tcp = @import("tcp.zig");
+const TCPEndpoint = tcp.TCPEndpoint;
+const TCPProtocol = tcp.TCPProtocol;
+
+test "TCP Fast Retransmit" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    const tcp_proto = TCPProtocol.init(allocator);
+    defer tcp_proto.deinit();
+    try s.registerTransportProtocol(tcp_proto.protocol());
+    var wq_server = waiter.Queue{};
+    var ep_server = try allocator.create(TCPEndpoint);
+    ep_server.* = try TCPEndpoint.init(&s, tcp_proto, &wq_server, 1460);
+    ep_server.retransmit_timer.context = ep_server;
+    defer ep_server.decRef();
+
+    var fake_ep = struct {
+        last_pkt: ?[]u8 = null,
+        allocator: std.mem.Allocator,
+        fn writePacket(ptr: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            const hdr_view = pkt.header.view();
+            const data_len = pkt.data.size;
+            if (self.last_pkt) |p| self.allocator.free(p);
+            self.last_pkt = self.allocator.alloc(u8, hdr_view.len + data_len) catch return tcpip.Error.NoBufferSpace;
+            @memcpy(self.last_pkt.?[0..hdr_view.len], hdr_view);
+            var offset = hdr_view.len;
+            for (pkt.data.views) |cv| {
+                @memcpy(self.last_pkt.?[offset .. offset + cv.view.len], cv.view);
+                offset += cv.view.len;
+            }
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return stack.CapabilityNone;
+        }
+    }{ .allocator = allocator };
+    defer if (fake_ep.last_pkt) |p| allocator.free(p);
+    const link_ep = stack.LinkEndpoint{ .ptr = &fake_ep, .vtable = &.{ .writePacket = @TypeOf(fake_ep).writePacket, .writePackets = null, .attach = @TypeOf(fake_ep).attach, .linkAddress = @TypeOf(fake_ep).linkAddress, .mtu = @TypeOf(fake_ep).mtu, .setMTU = @TypeOf(fake_ep).setMTU, .capabilities = @TypeOf(fake_ep).capabilities } };
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+    const ca = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const sa = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = ca.addr, .prefix_len = 24 } });
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = sa.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(sa.addr, .{ .addr = [_]u8{0} ** 6 });
+    try s.addLinkAddress(ca.addr, .{ .addr = [_]u8{0} ** 6 });
+    try ep_server.endpoint().bind(sa);
+    try ep_server.endpoint().listen(10);
+    var wq_client = waiter.Queue{};
+    var ep_client = try allocator.create(TCPEndpoint);
+    ep_client.* = try TCPEndpoint.init(&s, tcp_proto, &wq_client, 1460);
+    ep_client.retransmit_timer.context = ep_client;
+    defer ep_client.decRef();
+    try ep_client.endpoint().bind(ca);
+    try ep_client.endpoint().connect(sa);
+    const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_syn = syn_pkt;
+    defer mut_syn.data.deinit();
+    const r_to_server = stack.Route{ .local_address = sa.addr, .remote_address = ca.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
+    const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = sa.addr, .remote_port = 1234, .remote_address = ca.addr };
+    ep_server.handlePacket(&r_to_server, id_to_server, mut_syn);
+    const syn_ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_syn_ack = syn_ack_pkt;
+    defer mut_syn_ack.data.deinit();
+    const r_to_client = stack.Route{ .local_address = ca.addr, .remote_address = sa.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
+    const id_to_client = stack.TransportEndpointID{ .local_port = 1234, .local_address = ca.addr, .remote_port = 80, .remote_address = sa.addr };
+    ep_client.handlePacket(&r_to_client, id_to_client, mut_syn_ack);
+
+    try std.testing.expect(ep_client.state == .established);
+}
+
+test "TCP Retransmission" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    const tcp_proto = TCPProtocol.init(allocator);
+    defer tcp_proto.deinit();
+    try s.registerTransportProtocol(tcp_proto.protocol());
+    var fake_ep = struct {
+        last_pkt: ?[]u8 = null,
+        allocator: std.mem.Allocator,
+        drop_next: bool = false,
+        fn writePacket(ptr: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            if (self.drop_next) {
+                self.drop_next = false;
+                return;
+            }
+            const hdr_view = pkt.header.view();
+            const data_len = pkt.data.size;
+            if (self.last_pkt) |p| self.allocator.free(p);
+            self.last_pkt = self.allocator.alloc(u8, hdr_view.len + data_len) catch return tcpip.Error.NoBufferSpace;
+            @memcpy(self.last_pkt.?[0..hdr_view.len], hdr_view);
+            var offset = hdr_view.len;
+            for (pkt.data.views) |cv| {
+                @memcpy(self.last_pkt.?[offset .. offset + cv.view.len], cv.view);
+                offset += cv.view.len;
+            }
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return stack.CapabilityNone;
+        }
+    }{ .allocator = allocator };
+    defer if (fake_ep.last_pkt) |p| allocator.free(p);
+    const link_ep = stack.LinkEndpoint{ .ptr = &fake_ep, .vtable = &.{ .writePacket = @TypeOf(fake_ep).writePacket, .writePackets = null, .attach = @TypeOf(fake_ep).attach, .linkAddress = @TypeOf(fake_ep).linkAddress, .mtu = @TypeOf(fake_ep).mtu, .setMTU = @TypeOf(fake_ep).setMTU, .capabilities = @TypeOf(fake_ep).capabilities } };
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+    const ca = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    const sa = tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = sa.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(ca.addr, .{ .addr = [_]u8{0} ** 6 });
+    var wq_server = waiter.Queue{};
+    var ep_server = try allocator.create(TCPEndpoint);
+    ep_server.* = try TCPEndpoint.init(&s, tcp_proto, &wq_server, 1460);
+    ep_server.retransmit_timer.context = ep_server;
+    defer ep_server.decRef();
+    try ep_server.endpoint().bind(sa);
+    try ep_server.endpoint().listen(10);
+    const syn_buf = try allocator.alloc(u8, header.TCPMinimumSize);
+    defer allocator.free(syn_buf);
+    @memset(syn_buf, 0);
+    var syn = header.TCP.init(syn_buf);
+    syn.encode(ca.port, sa.port, 1000, 0, header.TCPFlagSyn, 65535);
+    const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(syn_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_syn = syn_pkt;
+    defer mut_syn.data.deinit();
+    const r_to_server = stack.Route{ .local_address = sa.addr, .remote_address = ca.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
+    const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = sa.addr, .remote_port = 1234, .remote_address = ca.addr };
+    ep_server.handlePacket(&r_to_server, id_to_server, mut_syn);
+    const ack_buf = try allocator.alloc(u8, header.TCPMinimumSize);
+    defer allocator.free(ack_buf);
+    @memset(ack_buf, 0);
+    var ack = header.TCP.init(ack_buf);
+    const server_initial_seq = header.TCP.init(fake_ep.last_pkt.?[20..]).sequenceNumber();
+    ack.encode(ca.port, sa.port, 1001, server_initial_seq + 1, header.TCPFlagAck, 65535);
+    const ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(ack_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_ack = ack_pkt;
+    defer mut_ack.data.deinit();
+    ep_server.handlePacket(&r_to_server, id_to_server, mut_ack);
+
+    const accept_res = try ep_server.endpoint().accept();
+    const ep_accepted = @as(*TCPEndpoint, @ptrCast(@alignCast(accept_res.ep.ptr)));
+    defer accept_res.ep.close();
+    const FakePayloader = struct {
+        data: []const u8,
+        pub fn payloader(self: *const @This()) tcpip.Payloader {
+            return .{ .ptr = @constCast(self), .vtable = &.{ .fullPayload = fullPayload } };
+        }
+        fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).data;
+        }
+    };
+    var fp = FakePayloader{ .data = "important data" };
+    fake_ep.drop_next = true;
+    _ = try ep_accepted.endpoint().write(fp.payloader(), .{});
+    try std.testing.expect(fake_ep.drop_next == false);
+}
+
+test "TCP CWND Enforcement" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    const tcp_proto = TCPProtocol.init(allocator);
+    defer tcp_proto.deinit();
+    try s.registerTransportProtocol(tcp_proto.protocol());
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return 0;
+        }
+    }{};
+    const link_ep = stack.LinkEndpoint{ .ptr = &fake_link, .vtable = &.{ .writePacket = @TypeOf(fake_link).writePacket, .writePackets = null, .attach = @TypeOf(fake_link).attach, .linkAddress = @TypeOf(fake_link).linkAddress, .mtu = @TypeOf(fake_link).mtu, .setMTU = @TypeOf(fake_link).setMTU, .capabilities = @TypeOf(fake_link).capabilities } };
+    try s.createNIC(1, link_ep);
+    _ = s.nics.get(1).?;
+    var wq = waiter.Queue{};
+    var ep = try allocator.create(TCPEndpoint);
+    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
+    ep.retransmit_timer.context = ep;
+    defer ep.decRef();
+    ep.state = .established;
+
+    ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
+    ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
+    ep.rcv_nxt = 1000;
+
+    var data1 = [_]u8{'B'} ** 100;
+    const pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_pkt1 = pkt1;
+    defer mut_pkt1.data.deinit();
+    try ep.insertOOO(2000, mut_pkt1.data);
+    try std.testing.expectEqual(@as(usize, 1), ep.ooo_list.len);
+    try std.testing.expectEqual(@as(u32, 2000), ep.ooo_list.first.?.data.seq);
+
+    var data2 = [_]u8{'A'} ** 100;
+    const pkt2 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data2, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_pkt2 = pkt2;
+    const node2 = try tcp_proto.packet_node_pool.acquire();
+    node2.data = .{ .data = try mut_pkt2.data.clone(allocator), .seq = 1000 };
+    ep.rcv_list.append(node2);
+    mut_pkt2.data.deinit();
+    ep.rcv_nxt = 1100;
+    ep.processOOO();
+    try std.testing.expectEqual(@as(usize, 1), ep.rcv_list.len);
+    try std.testing.expectEqual(@as(u32, 1100), ep.rcv_nxt);
+
+    var data3 = [_]u8{'C'} ** 900;
+    const pkt3 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data3, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_pkt3 = pkt3;
+    const node3 = try tcp_proto.packet_node_pool.acquire();
+    node3.data = .{ .data = try mut_pkt3.data.clone(allocator), .seq = 1100 };
+    ep.rcv_list.append(node3);
+    mut_pkt3.data.deinit();
+    ep.rcv_nxt = 2000;
+    ep.processOOO();
+    try std.testing.expectEqual(@as(u32, 2100), ep.rcv_nxt);
+    try std.testing.expectEqual(@as(usize, 3), ep.rcv_list.len);
+    try std.testing.expectEqual(@as(usize, 0), ep.ooo_list.len);
+}
+
+test "TCP SACK Blocks Generation" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    const tcp_proto = TCPProtocol.init(allocator);
+    defer tcp_proto.deinit();
+    try s.registerTransportProtocol(tcp_proto.protocol());
+    var wq = waiter.Queue{};
+    var ep = try allocator.create(TCPEndpoint);
+    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
+    ep.retransmit_timer.context = ep;
+    ep.hint_sack_enabled = true;
+    defer ep.decRef();
+    ep.state = .established;
+    ep.rcv_nxt = 1000;
+
+    var data1 = [_]u8{'B'} ** 100;
+    const pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_pkt1 = pkt1;
+    try ep.insertOOO(2000, mut_pkt1.data);
+    try std.testing.expectEqual(@as(usize, 1), ep.sack_blocks.items.len);
+    try std.testing.expectEqual(@as(u32, 2000), ep.sack_blocks.items[0].start);
+    try std.testing.expectEqual(@as(u32, 2100), ep.sack_blocks.items[0].end);
+
+    try ep.insertOOO(3000, mut_pkt1.data);
+    mut_pkt1.data.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ep.sack_blocks.items.len);
+    try std.testing.expectEqual(@as(u32, 3000), ep.sack_blocks.items[0].start);
+    try std.testing.expectEqual(@as(u32, 3100), ep.sack_blocks.items[0].end);
+    try std.testing.expectEqual(@as(u32, 2000), ep.sack_blocks.items[1].start);
+    try std.testing.expectEqual(@as(u32, 2100), ep.sack_blocks.items[1].end);
+
+    ep.rcv_nxt = 2100;
+    ep.processOOO();
+    try std.testing.expectEqual(@as(usize, 1), ep.sack_blocks.items.len);
+    try std.testing.expectEqual(@as(u32, 3000), ep.sack_blocks.items[0].start);
+}

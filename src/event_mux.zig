@@ -54,9 +54,8 @@ pub const EventMultiplexer = struct {
     }
 };
 
-/// A simple thread-safe queue to track ready sockets.
+/// A simple queue to track ready sockets.
 const ReadyQueue = struct {
-    mutex: std.Thread.Mutex = .{},
     list: std.ArrayList(*waiter.Entry),
     results: std.ArrayList(*waiter.Entry),
 
@@ -73,9 +72,6 @@ const ReadyQueue = struct {
     }
 
     pub fn push(self: *ReadyQueue, entry: *waiter.Entry) !bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         if (entry.is_queued) return false;
 
         try self.list.append(entry);
@@ -84,9 +80,6 @@ const ReadyQueue = struct {
     }
 
     pub fn popAll(self: *ReadyQueue) ![]*waiter.Entry {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         if (self.list.items.len == 0) return &[_]*waiter.Entry{};
 
         self.results.clearRetainingCapacity();

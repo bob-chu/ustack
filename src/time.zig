@@ -22,12 +22,8 @@ pub const Timer = struct {
 
 pub const TimerQueue = struct {
     head: ?*Timer = null,
-    mutex: std.Thread.Mutex = .{},
 
     pub fn schedule(self: *TimerQueue, timer: *Timer, delay_ms: i64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         const now = std.time.milliTimestamp();
         const expiration = now + delay_ms;
 
@@ -42,8 +38,6 @@ pub const TimerQueue = struct {
     }
 
     pub fn cancel(self: *TimerQueue, timer: *Timer) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (timer.active) {
             self.removeInternal(timer);
             timer.active = false;
@@ -55,7 +49,6 @@ pub const TimerQueue = struct {
         const now = std.time.milliTimestamp();
 
         while (true) {
-            self.mutex.lock();
             const head = self.head;
 
             if (head) |timer| {
@@ -64,19 +57,16 @@ pub const TimerQueue = struct {
                     self.head = timer.next;
                     timer.next = null;
                     timer.active = false;
-                    self.mutex.unlock();
 
-                    // Execute callback (outside lock)
+                    // Execute callback
                     timer.callback(timer.context);
                     continue;
                 } else {
                     // Next timer is in future
                     const remaining = timer.expiration - now;
-                    self.mutex.unlock();
                     return remaining;
                 }
             } else {
-                self.mutex.unlock();
                 return null;
             }
         }

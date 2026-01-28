@@ -14,9 +14,6 @@ pub const Socket = struct {
     blocking: bool = true,
     allocator: std.mem.Allocator,
 
-    // Synchronization for blocking mode
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
     wait_entry: waiter.Entry,
 
     pub fn init(allocator: std.mem.Allocator, ep: tcpip.Endpoint, wq: *waiter.Queue) *Socket {
@@ -27,7 +24,7 @@ pub const Socket = struct {
             .allocator = allocator,
             .wait_entry = undefined,
         };
-        // Initialize wait entry with callback that signals condition variable
+        // Initialize wait entry
         self.wait_entry = waiter.Entry.init(self, notifyCallback);
         // Register for all events by default
         self.wait_queue.eventRegister(&self.wait_entry, waiter.EventIn | waiter.EventOut | waiter.EventErr | waiter.EventHUp);
@@ -35,10 +32,8 @@ pub const Socket = struct {
     }
 
     fn notifyCallback(e: *waiter.Entry) void {
-        const self = @as(*Socket, @ptrCast(@alignCast(e.context)));
-        self.mutex.lock();
-        self.cond.signal(); // signalAll or signal? signal is enough for one waiter (us)
-        self.mutex.unlock();
+        _ = e;
+        // In a single-threaded stack, upcalls are handled by the event loop.
     }
 
     pub fn deinit(self: *Socket) void {
@@ -95,39 +90,7 @@ pub fn uconnect(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_
     _ = len;
     const full_addr = fromSockAddr(addr) catch return error.AddressFamilyNotSupported;
 
-    // Non-blocking connect not fully supported by this simple wrapper logic yet,
-    // but underlying stack supports it.
     try sock.endpoint.connect(full_addr);
-
-    // For TCP, connect might return immediately or start handshake.
-    // If blocking, we should wait for ESTABLISHED or Error.
-    if (sock.blocking) {
-        // Poll state?
-        // Note: ustack connect() usually returns void for UDP and starts handshake for TCP.
-        // We need a way to check state.
-        // Currently endpoint interface doesn't expose state generically.
-        // Assuming TCP endpoint:
-        // Wait for EventOut (writable) which usually signifies connected.
-
-        sock.mutex.lock();
-        defer sock.mutex.unlock();
-        while (true) {
-            // Check if connected?
-            // Since we can't check state generically, we rely on Error return from write/read?
-            // Actually, connect() in tcp.zig returns immediately after sending SYN.
-            // We should wait.
-            // Let's assume we wait for writeable.
-
-            // Hack: just wait once? No.
-            // We need 'getOption' to check error?
-            // Or just proceed. Standard connect() blocks.
-            // Let's implement a wait loop here.
-
-            // This is tricky without `getsockopt(SO_ERROR)`.
-            // For now, let's just return. User will find out on read/write.
-            break;
-        }
-    }
 }
 
 pub fn ulisten(sock: *Socket, backlog: i32) !void {
@@ -135,50 +98,25 @@ pub fn ulisten(sock: *Socket, backlog: i32) !void {
 }
 
 pub fn uaccept(sock: *Socket, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !*Socket {
-    while (true) {
-        const res = sock.endpoint.accept() catch |err| {
-            if (err == tcpip.Error.WouldBlock and sock.blocking) {
-                sock.mutex.lock();
-                sock.cond.wait(&sock.mutex);
-                sock.mutex.unlock();
-                continue;
-            }
-            return err;
-        };
+    const res = try sock.endpoint.accept();
 
-        if (addr) |out_addr| {
-            if (res.ep.getRemoteAddress()) |remote| {
-                toSockAddr(remote, out_addr, len);
-            } else |_| {}
-        }
-
-        return Socket.init(sock.allocator, res.ep, res.wq);
+    if (addr) |out_addr| {
+        if (res.ep.getRemoteAddress()) |remote| {
+            toSockAddr(remote, out_addr, len);
+        } else |_| {}
     }
+
+    return Socket.init(sock.allocator, res.ep, res.wq);
 }
 
 pub fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
     _ = flags;
-    while (true) {
-        const view = sock.endpoint.read(null) catch |err| {
-            if (err == tcpip.Error.WouldBlock and sock.blocking) {
-                sock.mutex.lock();
-                sock.cond.wait(&sock.mutex);
-                sock.mutex.unlock();
-                continue;
-            }
-            return err;
-        };
+    const view = try sock.endpoint.read(null);
 
-        const len = @min(buf.len, view.len);
-        @memcpy(buf[0..len], view[0..len]);
-        // Note: 'view' is owned by us (caller of read). We must free it?
-        // ustack read() returns a view that must be freed by allocator?
-        // Yes, based on udp.zig: returns toView(allocator).
-        // We need to know which allocator allocated it.
-        // It's sock.allocator (stack.allocator).
-        sock.allocator.free(view);
-        return len;
-    }
+    const len = @min(buf.len, view.len);
+    @memcpy(buf[0..len], view[0..len]);
+    sock.allocator.free(view);
+    return len;
 }
 
 pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
@@ -194,18 +132,7 @@ pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
     };
     var fp = Payloader{ .data = buf };
 
-    while (true) {
-        const n = sock.endpoint.write(fp.payloader(), .{}) catch |err| {
-            if (err == tcpip.Error.WouldBlock and sock.blocking) {
-                sock.mutex.lock();
-                sock.cond.wait(&sock.mutex);
-                sock.mutex.unlock();
-                continue;
-            }
-            return err;
-        };
-        return n;
-    }
+    return sock.endpoint.write(fp.payloader(), .{});
 }
 
 pub fn uclose(sock: *Socket) void {

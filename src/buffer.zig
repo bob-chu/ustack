@@ -4,18 +4,18 @@ const Allocator = std.mem.Allocator;
 
 /// Cluster is a ref-counted fixed-size buffer.
 pub const Cluster = struct {
-    ref_count: std.atomic.Value(usize),
+    ref_count: usize,
     pool: *ClusterPool,
     next: ?*Cluster = null,
     data: [header.ClusterSize]u8 align(64),
 
     pub fn acquire(self: *Cluster) void {
-        _ = self.ref_count.fetchAdd(1, .monotonic);
+        self.ref_count += 1;
     }
 
     pub fn release(self: *Cluster) void {
-        if (self.ref_count.fetchSub(1, .release) == 1) {
-            self.ref_count.fence(.acquire);
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
             self.pool.returnToPool(self);
         }
     }
@@ -31,7 +31,6 @@ pub const ClusterView = struct {
 pub const ClusterPool = struct {
     allocator: Allocator,
     free_list: ?*Cluster = null,
-    mutex: std.Thread.Mutex = .{},
     count: usize = 0,
 
     pub fn init(allocator: Allocator) ClusterPool {
@@ -39,8 +38,6 @@ pub const ClusterPool = struct {
     }
 
     pub fn deinit(self: *ClusterPool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         var it = self.free_list;
         while (it) |c| {
             const next = c.next;
@@ -51,19 +48,16 @@ pub const ClusterPool = struct {
     }
 
     pub fn acquire(self: *ClusterPool) !*Cluster {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         if (self.free_list) |c| {
             self.free_list = c.next;
             if (self.count > 0) self.count -= 1;
-            c.ref_count.store(1, .monotonic);
+            c.ref_count = 1;
             return c;
         }
 
         const c = try self.allocator.create(Cluster);
         c.* = .{
-            .ref_count = std.atomic.Value(usize).init(1),
+            .ref_count = 1,
             .pool = self,
             .next = null,
             .data = undefined,
@@ -72,8 +66,6 @@ pub const ClusterPool = struct {
     }
 
     pub fn returnToPool(self: *ClusterPool, cluster: *Cluster) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         cluster.next = self.free_list;
         self.free_list = cluster;
         self.count += 1;
@@ -86,7 +78,6 @@ pub fn Pool(comptime T: type) type {
         const Self = @This();
         allocator: Allocator,
         free_list: ?*T = null,
-        mutex: std.Thread.Mutex = .{},
         count: usize = 0,
         capacity: usize,
 
@@ -98,8 +89,6 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
             var it = self.free_list;
             while (it) |node| {
                 const next = node.next;
@@ -110,8 +99,6 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn acquire(self: *Self) !*T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
             if (self.free_list) |node| {
                 self.free_list = node.next;
                 self.count -= 1;
@@ -126,8 +113,6 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn release(self: *Self, node: *T) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
             if (self.count >= self.capacity) {
                 self.allocator.destroy(node);
                 return;
@@ -145,7 +130,6 @@ pub const BufferPool = struct {
     buffer_size: usize,
     capacity: usize,
     free_list: std.ArrayList([]u8),
-    mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: Allocator, buffer_size: usize, capacity: usize) BufferPool {
         return .{
@@ -157,8 +141,6 @@ pub const BufferPool = struct {
     }
 
     pub fn deinit(self: *BufferPool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         for (self.free_list.items) |buf| {
             self.allocator.free(buf);
         }
@@ -166,8 +148,6 @@ pub const BufferPool = struct {
     }
 
     pub fn acquire(self: *BufferPool) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.free_list.popOrNull()) |buf| {
             return buf;
         }
@@ -175,8 +155,6 @@ pub const BufferPool = struct {
     }
 
     pub fn release(self: *BufferPool, buf: []u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.free_list.items.len >= self.capacity) {
             self.allocator.free(buf);
             return;
@@ -207,6 +185,31 @@ pub const VectorisedView = struct {
 
     pub fn empty() VectorisedView {
         return .{ .views = &[_]ClusterView{}, .size = 0 };
+    }
+
+    pub fn fromSlice(data: []const u8, allocator: Allocator, pool: *ClusterPool) !VectorisedView {
+        const num_clusters = (data.len + header.ClusterSize - 1) / header.ClusterSize;
+        const views = try allocator.alloc(ClusterView, num_clusters);
+        errdefer allocator.free(views);
+
+        var remaining = data.len;
+        var offset: usize = 0;
+        var i: usize = 0;
+        while (remaining > 0) : (i += 1) {
+            const cluster = try pool.acquire();
+            const to_copy = @min(remaining, header.ClusterSize);
+            @memcpy(cluster.data[0..to_copy], data[offset .. offset + to_copy]);
+            views[i] = .{ .cluster = cluster, .view = cluster.data[0..to_copy] };
+            remaining -= to_copy;
+            offset += to_copy;
+        }
+
+        return .{
+            .views = views,
+            .original_views = views,
+            .size = data.len,
+            .allocator = allocator,
+        };
     }
 
     pub fn deinit(self: *VectorisedView) void {
@@ -336,3 +339,63 @@ pub const Prependable = struct {
         return self.buf[self.usedIdx .. self.usedIdx + size];
     }
 };
+
+test "Cluster single-threaded refcounting" {
+    const allocator = std.testing.allocator;
+    var pool = ClusterPool.init(allocator);
+    defer pool.deinit();
+
+    const cluster = try pool.acquire();
+    try std.testing.expectEqual(@as(usize, 1), cluster.ref_count);
+
+    cluster.acquire();
+    try std.testing.expectEqual(@as(usize, 2), cluster.ref_count);
+
+    cluster.release();
+    try std.testing.expectEqual(@as(usize, 1), cluster.ref_count);
+
+    cluster.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.count);
+}
+
+test "ClusterPool single-threaded usage" {
+    const allocator = std.testing.allocator;
+    var pool = ClusterPool.init(allocator);
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+    const c2 = try pool.acquire();
+    try std.testing.expectEqual(@as(usize, 0), pool.count);
+
+    c1.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.count);
+
+    c2.release();
+    try std.testing.expectEqual(@as(usize, 2), pool.count);
+
+    const c3 = try pool.acquire();
+    try std.testing.expectEqual(@as(usize, 1), pool.count);
+    c3.release();
+}
+
+test "BufferPool single-threaded usage" {
+    const allocator = std.testing.allocator;
+    var pool = BufferPool.init(allocator, 1024, 2);
+    defer pool.deinit();
+
+    const b1 = try pool.acquire();
+    const b2 = try pool.acquire();
+    const b3 = try pool.acquire();
+
+    try std.testing.expectEqual(@as(usize, 0), pool.free_list.items.len);
+
+    pool.release(b1);
+    try std.testing.expectEqual(@as(usize, 1), pool.free_list.items.len);
+
+    pool.release(b2);
+    try std.testing.expectEqual(@as(usize, 2), pool.free_list.items.len);
+
+    pool.release(b3); // Exceeds capacity, should be freed
+    try std.testing.expectEqual(@as(usize, 2), pool.free_list.items.len);
+}
+

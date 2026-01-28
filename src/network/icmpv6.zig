@@ -90,7 +90,7 @@ pub const ICMPv6TransportProtocol = struct {
         _ = ptr;
         const v = pkt.data.first() orelse return .{ .src = 0, .dst = 0 };
         if (v.len >= 8) {
-            const id = std.mem.readInt(u16, v[4..6], .big);
+            const id = std.mem.readInt(u16, v[4..6][0..2][0..2], .big);
             return .{ .src = id, .dst = 0 };
         }
         return .{ .src = 0, .dst = 0 };
@@ -109,7 +109,7 @@ pub const ICMPv6PacketHandler = struct {
         const v = mut_pkt.data.first() orelse return;
         var h = header.ICMPv6.init(v);
 
-        switch (h.type()) {
+        switch (h.@"type"()) {
             header.ICMPv6EchoRequestType => {
                 const payload = mut_pkt.data.toView(s.allocator) catch return;
                 defer s.allocator.free(payload);
@@ -151,9 +151,9 @@ pub const ICMPv6PacketHandler = struct {
                     if (v[header.ICMPv6MinimumSize + 20] == header.ICMPv6OptionSourceLinkLayerAddress) {
                         var mac: tcpip.LinkAddress = undefined;
                         @memcpy(&mac.addr, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
-                        s.mutex.lock();
+                        
                         s.link_addr_cache.put(r.remote_address, mac) catch {};
-                        s.mutex.unlock();
+                        
                     }
                 }
 
@@ -219,9 +219,9 @@ pub const ICMPv6PacketHandler = struct {
                         var mac: tcpip.LinkAddress = undefined;
                         @memcpy(&mac.addr, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
 
-                        s.mutex.lock();
+                        
                         s.link_addr_cache.put(.{ .v6 = target }, mac) catch {};
-                        s.mutex.unlock();
+                        
                     }
                 }
             },
@@ -240,9 +240,9 @@ pub const ICMPv6PacketHandler = struct {
 
                     // Learn router's MAC
                     if (r.remote_link_address) |mac| {
-                        s.mutex.lock();
+                        
                         s.link_addr_cache.put(r.remote_address, mac) catch {};
-                        s.mutex.unlock();
+                        
                     }
                 }
 
@@ -415,7 +415,7 @@ test "ICMPv6 Neighbor Discovery" {
     const na_pkt_data = fake_link.last_pkt.?;
     try std.testing.expect(na_pkt_data.len >= 40 + 28);
     const na_icmp = header.ICMPv6.init(na_pkt_data[40..]);
-    try std.testing.expectEqual(header.ICMPv6NeighborAdvertisementType, na_icmp.type());
+    try std.testing.expectEqual(header.ICMPv6NeighborAdvertisementType, na_icmp.@"type"());
 
     const na = header.ICMPv6NA.init(na_pkt_data[40 + header.ICMPv6MinimumSize ..]);
     try std.testing.expectEqualStrings(&my_addr, &na.targetAddress());
@@ -512,7 +512,7 @@ test "ICMPv6 Router Advertisement & SLAAC" {
 
     const ra = header.ICMPv6RA.init(ra_buf[header.ICMPv6MinimumSize..]);
     _ = ra;
-    std.mem.writeInt(u16, ra_buf[header.ICMPv6MinimumSize + 2 .. header.ICMPv6MinimumSize + 4], 1800, .big); // router lifetime 1800s
+    std.mem.writeInt(u16, ra_buf[header.ICMPv6MinimumSize + 2 .. header.ICMPv6MinimumSize + 4][0..2][0..2], 1800, .big); // router lifetime 1800s
 
     // Prefix Option
     const opt_idx = header.ICMPv6MinimumSize + 12;

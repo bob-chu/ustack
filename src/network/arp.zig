@@ -3,6 +3,7 @@ const tcpip = @import("../tcpip.zig");
 const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
+const time = @import("../time.zig");
 
 pub const ProtocolNumber = 0x0806;
 pub const ProtocolAddress = "arp";
@@ -46,6 +47,18 @@ pub const ARPProtocol = struct {
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
         _ = ptr;
+        
+        const ep_opt = nic.network_endpoints.get(ProtocolNumber);
+        if (ep_opt) |ep| {
+            const arp_ep = @as(*ARPEndpoint, @ptrCast(@alignCast(ep.ptr)));
+            if (!arp_ep.pending_requests.contains(addr)) {
+                arp_ep.pending_requests.put(addr, std.time.milliTimestamp()) catch {};
+                if (!arp_ep.timer.active) {
+                    nic.stack.timer_queue.schedule(&arp_ep.timer, 1000);
+                }
+            }
+        }
+
         const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
         defer nic.stack.allocator.free(hdr_buf);
 
@@ -83,6 +96,8 @@ pub const ARPProtocol = struct {
         const ep = try nic.stack.allocator.create(ARPEndpoint);
         ep.* = .{
             .nic = nic,
+            .pending_requests = std.AutoHashMap(tcpip.Address, i64).init(nic.stack.allocator),
+            .timer = time.Timer.init(ARPEndpoint.handleTimer, ep),
         };
         return ep.networkEndpoint();
     }
@@ -90,6 +105,8 @@ pub const ARPProtocol = struct {
 
 pub const ARPEndpoint = struct {
     nic: *stack.NIC,
+    pending_requests: std.AutoHashMap(tcpip.Address, i64),
+    timer: time.Timer = undefined,
 
     pub fn networkEndpoint(self: *ARPEndpoint) stack.NetworkEndpoint {
         return .{
@@ -105,6 +122,35 @@ pub const ARPEndpoint = struct {
         .close = close,
     };
 
+    pub fn handleTimer(ptr: *anyopaque) void {
+        const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
+        var it = self.pending_requests.iterator();
+        const now = std.time.milliTimestamp();
+        var has_pending = false;
+
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.* >= 1000) {
+                const proto_opt = self.nic.stack.network_protocols.get(ProtocolNumber);
+                if (proto_opt) |p| {
+                    const proto = @as(*ARPProtocol, @ptrCast(@alignCast(p.ptr)));
+                    var local_addr: ?tcpip.Address = null;
+                    const addrs = self.nic.addresses.items;
+                    if (addrs.len > 0) local_addr = addrs[0].address_with_prefix.address;
+
+                    if (local_addr) |la| {
+                        ARPProtocol.linkAddressRequest(proto, entry.key_ptr.*, la, self.nic) catch {};
+                        entry.value_ptr.* = now;
+                    }
+                }
+            }
+            has_pending = true;
+        }
+
+        if (has_pending) {
+            self.nic.stack.timer_queue.schedule(&self.timer, 1000);
+        }
+    }
+
     fn mtu(ptr: *anyopaque) u32 {
         const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
         return self.nic.linkEP.mtu() - header.ARPSize;
@@ -112,6 +158,8 @@ pub const ARPEndpoint = struct {
 
     fn close(ptr: *anyopaque) void {
         const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.nic.stack.timer_queue.cancel(&self.timer);
+        self.pending_requests.deinit();
         self.nic.stack.allocator.destroy(self);
     }
 
@@ -125,7 +173,6 @@ pub const ARPEndpoint = struct {
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {
         const self = @as(*ARPEndpoint, @ptrCast(@alignCast(ptr)));
-        // std.debug.print("ARP: handlePacket from nic={}\n", .{self.nic.id});
         _ = r;
         const v = pkt.data.first() orelse return;
         const h = header.ARP.init(v);
@@ -134,12 +181,12 @@ pub const ARPEndpoint = struct {
         const sender_proto_addr = tcpip.Address{ .v4 = h.protocolAddressSender() };
         const sender_hw_addr = h.hardwareAddressSender();
 
+        _ = self.pending_requests.remove(sender_proto_addr);
         self.nic.stack.addLinkAddress(sender_proto_addr, .{ .addr = sender_hw_addr }) catch {};
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
             if (self.nic.hasAddress(target_proto_addr)) {
-                // std.debug.print("ARP: Received request for {any} from {any}, sending reply\n", .{target_proto_addr, sender_proto_addr});
                 const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
 
@@ -153,7 +200,7 @@ pub const ARPEndpoint = struct {
                 @memcpy(reply_h.data[18..24], h.data[8..14]);
                 @memcpy(reply_h.data[24..28], h.data[14..18]);
 
-                const pb = tcpip.PacketBuffer{
+                const reply_pkt = tcpip.PacketBuffer{
                     .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
                     .header = pre,
                 };
@@ -168,7 +215,7 @@ pub const ARPEndpoint = struct {
                     .nic = self.nic,
                 };
 
-                self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, pb) catch {};
+                self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
             }
         }
     }

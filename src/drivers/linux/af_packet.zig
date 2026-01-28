@@ -163,7 +163,7 @@ pub const AfPacket = struct {
         var i: usize = 0;
         while (i < batch_size) : (i += 1) {
             if (self.rx_clusters[i]) |c| {
-                if (c.ref_count.load(.monotonic) > 1) {
+                if (c.ref_count > 1) {
                     c.release();
                     self.rx_clusters[i] = null;
                 }
@@ -230,7 +230,7 @@ pub const AfPacket = struct {
             mut_pkt.data.deinit(); // This releases the reference we just gave to the stack (or the one stack kept).
 
             // Now check if stack kept it. If refcount > 1, it means stack kept it.
-            if (c.ref_count.load(.monotonic) > 1) {
+            if (c.ref_count > 1) {
                 c.release(); // Release our reference in rx_clusters
                 self.rx_clusters[j] = null;
             }

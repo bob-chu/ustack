@@ -47,13 +47,9 @@ pub const Entry = struct {
 pub const Queue = struct {
     head: ?*Entry = null,
     tail: ?*Entry = null,
-    mutex: Mutex = .{},
     ready_mask: EventMask = 0,
 
     pub fn eventRegister(self: *Queue, e: *Entry, mask: EventMask) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         e.mask = mask;
         e.next = null;
         e.prev = self.tail;
@@ -67,9 +63,6 @@ pub const Queue = struct {
     }
 
     pub fn eventUnregister(self: *Queue, e: *Entry) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         if (e.prev) |prev| {
             prev.next = e.next;
         } else {
@@ -87,7 +80,6 @@ pub const Queue = struct {
     }
 
     pub fn notify(self: *Queue, mask: EventMask) void {
-        self.mutex.lock();
         self.ready_mask |= mask;
 
         var current = self.head;
@@ -95,26 +87,18 @@ pub const Queue = struct {
             const next = e.next;
             if ((mask & e.mask) != 0) {
                 if (e.callback) |cb| {
-                    self.mutex.unlock();
                     cb(e);
-                    self.mutex.lock();
                 }
             }
             current = next;
         }
-        self.mutex.unlock();
     }
 
     pub fn clear(self: *Queue, mask: EventMask) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         self.ready_mask &= ~mask;
     }
 
     pub fn interests(self: *Queue) EventMask {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         var ret: EventMask = 0;
         var current = self.head;
         while (current) |e| {
@@ -125,14 +109,10 @@ pub const Queue = struct {
     }
 
     pub fn events(self: *Queue) EventMask {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.ready_mask;
     }
 
     pub fn isEmpty(self: *Queue) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.head == null;
     }
 };

@@ -92,10 +92,16 @@ pub const Payloader = struct {
 
     pub const VTable = struct {
         fullPayload: *const fn (ptr: *anyopaque) Error![]const u8,
+        viewPayload: ?*const fn (ptr: *anyopaque) Error!buffer.VectorisedView = null,
     };
 
     pub fn fullPayload(self: Payloader) Error![]const u8 {
         return self.vtable.fullPayload(self.ptr);
+    }
+
+    pub fn viewPayload(self: Payloader) Error!buffer.VectorisedView {
+        if (self.vtable.viewPayload) |f| return f(self.ptr);
+        return Error.NotPermitted;
     }
 };
 
@@ -113,6 +119,8 @@ pub const Endpoint = struct {
         close: *const fn (ptr: *anyopaque) void,
         read: *const fn (ptr: *anyopaque, addr: ?*FullAddress) Error!buffer.VectorisedView,
         write: *const fn (ptr: *anyopaque, p: Payloader, opts: WriteOptions) Error!usize,
+        writeView: ?*const fn (ptr: *anyopaque, view: buffer.VectorisedView, opts: WriteOptions) Error!usize = null,
+        ready: ?*const fn (ptr: *anyopaque, mask: waiter.EventMask) bool = null,
         connect: *const fn (ptr: *anyopaque, addr: FullAddress) Error!void,
         shutdown: *const fn (ptr: *anyopaque, flags: u8) Error!void,
         listen: *const fn (ptr: *anyopaque, backlog: i32) Error!void,
@@ -133,6 +141,14 @@ pub const Endpoint = struct {
     }
     pub fn write(self: Endpoint, p: Payloader, opts: WriteOptions) Error!usize {
         return self.vtable.write(self.ptr, p, opts);
+    }
+    pub fn writeView(self: Endpoint, view: buffer.VectorisedView, opts: WriteOptions) Error!usize {
+        if (self.vtable.writeView) |f| return f(self.ptr, view, opts);
+        return Error.NotPermitted;
+    }
+    pub fn ready(self: Endpoint, mask: waiter.EventMask) bool {
+        if (self.vtable.ready) |f| return f(self.ptr, mask);
+        return false;
     }
     pub fn connect(self: Endpoint, addr: FullAddress) Error!void {
         return self.vtable.connect(self.ptr, addr);

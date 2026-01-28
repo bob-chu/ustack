@@ -144,10 +144,8 @@ pub const IPv4Endpoint = struct {
 
         var remote_link_address = r.remote_link_address;
         if (remote_link_address == null) {
-            self.nic.stack.mutex.lock();
             const next_hop = r.next_hop orelse r.remote_address;
             remote_link_address = self.nic.stack.link_addr_cache.get(next_hop);
-            self.nic.stack.mutex.unlock();
         }
 
         if (remote_link_address == null) {
@@ -174,7 +172,7 @@ pub const IPv4Endpoint = struct {
             @memset(ip_header, 0);
             ip_header[0] = 0x45;
             const total_len = @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size));
-            std.mem.writeInt(u16, ip_header[2..4], total_len, .big);
+            std.mem.writeInt(u16, ip_header[2..4][0..2][0..2], total_len, .big);
             ip_header[8] = 64;
             ip_header[9] = @as(u8, @intCast(protocol));
             @memcpy(ip_header[12..16], &r.local_address.v4);
@@ -405,9 +403,9 @@ test "IPv4 fragmentation and reassembly" {
     var frag1_buf = [_]u8{0} ** (header.IPv4MinimumSize + 16);
     var frag1_h = header.IPv4.init(&frag1_buf);
     frag1_h.data[0] = 0x45;
-    std.mem.writeInt(u16, frag1_h.data[2..4], header.IPv4MinimumSize + 16, .big);
-    std.mem.writeInt(u16, frag1_h.data[4..6], 12345, .big);
-    std.mem.writeInt(u16, frag1_h.data[6..8], 0x2000, .big);
+    std.mem.writeInt(u16, frag1_h.data[2..4][0..2][0..2], header.IPv4MinimumSize + 16, .big);
+    std.mem.writeInt(u16, frag1_h.data[4..6][0..2][0..2], 12345, .big);
+    std.mem.writeInt(u16, frag1_h.data[6..8][0..2][0..2], 0x2000, .big);
     frag1_h.data[9] = 17;
     @memcpy(frag1_h.data[12..16], &[_]u8{ 10, 0, 0, 2 });
     @memcpy(frag1_h.data[16..20], &[_]u8{ 10, 0, 0, 1 });
@@ -420,9 +418,9 @@ test "IPv4 fragmentation and reassembly" {
     @memset(frag2_buf, 0);
     var frag2_h = header.IPv4.init(frag2_buf);
     frag2_h.data[0] = 0x45;
-    std.mem.writeInt(u16, frag2_h.data[2..4], @as(u16, @intCast(header.IPv4MinimumSize + rem_len)), .big);
-    std.mem.writeInt(u16, frag2_h.data[4..6], 12345, .big);
-    std.mem.writeInt(u16, frag2_h.data[6..8], 0x0002, .big);
+    std.mem.writeInt(u16, frag2_h.data[2..4][0..2][0..2], @as(u16, @intCast(header.IPv4MinimumSize + rem_len)), .big);
+    std.mem.writeInt(u16, frag2_h.data[4..6][0..2][0..2], 12345, .big);
+    std.mem.writeInt(u16, frag2_h.data[6..8][0..2][0..2], 0x0002, .big);
     frag2_h.data[9] = 17;
     @memcpy(frag2_h.data[12..16], &[_]u8{ 10, 0, 0, 2 });
     @memcpy(frag2_h.data[16..20], &[_]u8{ 10, 0, 0, 1 });
