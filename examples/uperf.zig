@@ -636,7 +636,7 @@ const IperfConnection = struct {
 
         var send_len = self.block_buffer.len;
         if (self.config.packet_size > 0) {
-            send_len = self.config.packet_size;
+            send_len = @min(self.config.packet_size, self.block_buffer.len);
         } else if (self.config.protocol == .udp) {
             send_len = @min(self.config.mtu - 28, self.block_buffer.len);
         }
@@ -655,13 +655,15 @@ const IperfConnection = struct {
             } else {
                 // Using writev with multiple large iovecs (8KB each) to test regrouping performance with jumbo frames.
                 const chunk_size = 8192;
-                const num_chunks = send_len / chunk_size;
+                const num_chunks = (send_len + chunk_size - 1) / chunk_size;
                 iov_count = @min(num_chunks, iovecs.len);
 
                 for (0..iov_count) |i| {
+                    const offset = i * chunk_size;
+                    const len = @min(chunk_size, send_len - offset);
                     iovecs[i] = .{
-                        .base = self.block_buffer[i * chunk_size ..].ptr,
-                        .len = chunk_size,
+                        .base = self.block_buffer[offset..].ptr,
+                        .len = len,
                     };
                 }
             }
