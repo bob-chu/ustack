@@ -118,8 +118,11 @@ pub const Endpoint = struct {
     pub const VTable = struct {
         close: *const fn (ptr: *anyopaque) void,
         read: *const fn (ptr: *anyopaque, addr: ?*FullAddress) Error!buffer.VectorisedView,
+        readv: ?*const fn (ptr: *anyopaque, uio: *buffer.Uio, addr: ?*FullAddress) Error!usize = null,
         write: *const fn (ptr: *anyopaque, p: Payloader, opts: WriteOptions) Error!usize,
+        writev: ?*const fn (ptr: *anyopaque, uio: *buffer.Uio, opts: WriteOptions) Error!usize = null,
         writeView: ?*const fn (ptr: *anyopaque, view: buffer.VectorisedView, opts: WriteOptions) Error!usize = null,
+        writeZeroCopy: ?*const fn (ptr: *anyopaque, data: []u8, cb: buffer.ConsumptionCallback, opts: WriteOptions) Error!usize = null,
         ready: ?*const fn (ptr: *anyopaque, mask: waiter.EventMask) bool = null,
         connect: *const fn (ptr: *anyopaque, addr: FullAddress) Error!void,
         shutdown: *const fn (ptr: *anyopaque, flags: u8) Error!void,
@@ -139,11 +142,23 @@ pub const Endpoint = struct {
     pub fn read(self: Endpoint, addr: ?*FullAddress) Error!buffer.VectorisedView {
         return self.vtable.read(self.ptr, addr);
     }
+    pub fn readv(self: Endpoint, uio: *buffer.Uio, addr: ?*FullAddress) Error!usize {
+        if (self.vtable.readv) |f| return f(self.ptr, uio, addr);
+        return Error.NotPermitted;
+    }
     pub fn write(self: Endpoint, p: Payloader, opts: WriteOptions) Error!usize {
         return self.vtable.write(self.ptr, p, opts);
     }
+    pub fn writev(self: Endpoint, uio: *buffer.Uio, opts: WriteOptions) Error!usize {
+        if (self.vtable.writev) |f| return f(self.ptr, uio, opts);
+        return Error.NotPermitted;
+    }
     pub fn writeView(self: Endpoint, view: buffer.VectorisedView, opts: WriteOptions) Error!usize {
         if (self.vtable.writeView) |f| return f(self.ptr, view, opts);
+        return Error.NotPermitted;
+    }
+    pub fn writeZeroCopy(self: Endpoint, data: []u8, cb: buffer.ConsumptionCallback, opts: WriteOptions) Error!usize {
+        if (self.vtable.writeZeroCopy) |f| return f(self.ptr, data, cb, opts);
         return Error.NotPermitted;
     }
     pub fn ready(self: Endpoint, mask: waiter.EventMask) bool {

@@ -254,8 +254,11 @@ pub const TCPEndpoint = struct {
     const EndpointVTableImpl = tcpip.Endpoint.VTable{
         .close = close_endpoint_external,
         .read = read,
+        .readv = readv_external,
         .write = write_external,
+        .writev = writev_external,
         .writeView = writeView_external,
+        .writeZeroCopy = writeZeroCopy_external,
         .ready = ready_external,
         .connect = connect,
         .shutdown = shutdown_endpoint_external,
@@ -267,6 +270,15 @@ pub const TCPEndpoint = struct {
         .setOption = setOption,
         .getOption = getOption,
     };
+
+    fn writeZeroCopy_external(ptr: *anyopaque, data: []u8, cb: buffer.ConsumptionCallback, opts: tcpip.WriteOptions) tcpip.Error!usize {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        _ = opts;
+        // Segment the 1M (or whatever) buffer into 2KB chunks internally
+        var view = buffer.VectorisedView.fromExternalZeroCopy(data, self.stack.allocator, 2048) catch return tcpip.Error.OutOfMemory;
+        view.consumption_callback = cb;
+        return self.writeInternal(view);
+    }
 
     fn shutdown_endpoint_external(ptr: *anyopaque, flags: u8) tcpip.Error!void {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
@@ -409,11 +421,12 @@ pub const TCPEndpoint = struct {
                     std.mem.writeInt(u32, opt_ptr[opt_idx_val + 4 .. opt_idx_val + 8][0..4][0..4][0..4], block.end, .big);
                 }
                 var k: usize = sack_len_unpadded;
-                while (k < sack_len) : (k += 1) opt_ptr[k] = 1;
+                while (k < sack_len) : (k += 1)
+                    opt_ptr[k] = 1;
             }
-                        const pkt_buf_inner_val = tcpip.PacketBuffer{ .data = pb_data, .header = pre };
-                        h.setChecksum(h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, pkt_buf_inner_val.data));
-                        const node = self.proto.segment_node_pool.acquire() catch break;
+            const pkt_buf_inner_val = tcpip.PacketBuffer{ .data = pb_data, .header = pre };
+            h.setChecksum(h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, pkt_buf_inner_val.data));
+            const node = self.proto.segment_node_pool.acquire() catch break;
             const snd_view_mem = try self.proto.view_pool.acquire();
             const snd_original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, snd_view_mem))));
             @memcpy(snd_original_views[0..seg_view_cnt], original_views[0..seg_view_cnt]);
@@ -428,7 +441,7 @@ pub const TCPEndpoint = struct {
             self.snd_queue.append(node);
             packet_batch[batch_count] = pkt_buf_inner_val;
             batch_count += 1;
-            self.snd_nxt += payload_len;
+            self.snd_nxt +%= payload_len;
             total_sent += payload_len;
 
             if (batch_count == 64) {
@@ -457,108 +470,14 @@ pub const TCPEndpoint = struct {
     }
 
     fn writeRaw(self: *TCPEndpoint, payload_raw: []const u8) tcpip.Error!usize {
-        const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-        const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
-        const net_proto: u16 = if (ra.addr == .v4) 0x0800 else 0x86dd;
-        if (self.cached_route == null or self.cached_route.?.net_proto != net_proto) {
-            self.cached_route = try self.stack.findRoute(ra.nic, la.addr, ra.addr, net_proto);
-        }
-        var r = self.cached_route.?;
-        const next_hop = r.next_hop orelse ra.addr;
-        if (r.remote_link_address == null) {
-            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
-                r.remote_link_address = link_addr;
-                self.cached_route.?.remote_link_address = link_addr;
-            }
-        }
-        const rcv_used = @as(u32, @intCast(self.rcv_buf_used));
-        self.rcv_wnd = if (rcv_used < self.rcv_wnd_max) self.rcv_wnd_max - rcv_used else 0;
-        var total_sent: usize = 0;
-        var packet_batch: [64]tcpip.PacketBuffer = undefined;
-        var batch_count: usize = 0;
-        while (total_sent < payload_raw.len) {
-            const in_flight = @as(i64, @intCast(self.snd_nxt -% self.last_ack));
-            const effective_wnd = @min(self.snd_wnd, self.cc.getCwnd());
-            var avail = if (effective_wnd > in_flight) @as(u32, @intCast(effective_wnd - in_flight)) else 0;
-            if (avail == 0 and self.snd_wnd == 0 and self.snd_queue.first == null and total_sent == 0) avail = 1;
-            const payload_len = @min(@min(@as(u32, @intCast(payload_raw.len - total_sent)), avail), @as(u32, self.max_segment_size));
-            if (payload_len == 0) break;
-            const payload = payload_raw[total_sent .. total_sent + payload_len];
-            const cluster = try self.stack.cluster_pool.acquire();
-            @memcpy(cluster.data[0..payload_len], payload);
-            const view_mem = try self.proto.view_pool.acquire();
-            const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
-            original_views[0] = .{ .cluster = cluster, .view = cluster.data[0..payload_len] };
-            var pb_data = buffer.VectorisedView.init(payload_len, original_views[0..1]);
-            pb_data.original_views = original_views;
-            pb_data.view_pool = &self.proto.view_pool;
-            const ts_len: u8 = if (self.ts_enabled) 12 else 0;
-            const sack_l_val: u8 = if (self.hint_sack_enabled and self.sack_blocks.items.len > 0) @as(u8, @intCast(2 + self.sack_blocks.items.len * 8)) else 0;
-            const sack_len = (sack_l_val + 3) & ~@as(u8, 3);
-            const options_len = ts_len + sack_len;
-            const hdr_buf = self.proto.header_pool.acquire() catch break;
-            var pre = buffer.Prependable.init(hdr_buf);
-            const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
-            @memset(tcp_hdr, 0);
-            var h = header.TCP.init(tcp_hdr);
-            h.encode(la.port, ra.port, self.snd_nxt, self.rcv_nxt, header.TCPFlagAck | header.TCPFlagPsh, @as(u16, @intCast(@min(self.rcv_wnd >> @as(u5, @intCast(self.rcv_wnd_scale)), 65535))));
-            var opt_ptr = h.data[20..];
-            if (self.ts_enabled) {
-                h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
-                opt_ptr[0] = 1;
-                opt_ptr[1] = 1;
-                opt_ptr[2] = 8;
-                opt_ptr[3] = 10;
-                std.mem.writeInt(u32, opt_ptr[4..8][0..4][0..4][0..4], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
-                std.mem.writeInt(u32, opt_ptr[8..12][0..4][0..4][0..4], self.ts_recent, .big);
-                opt_ptr = opt_ptr[12..];
-            }
-            if (sack_len > 0) {
-                h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
-                opt_ptr[0] = 5;
-                opt_ptr[1] = sack_l_val;
-                for (self.sack_blocks.items, 0..) |block, j_val| {
-                    if (j_val >= 4) break;
-                    const opt_idx = 2 + j_val * 8;
-                    std.mem.writeInt(u32, opt_ptr[opt_idx .. opt_idx + 4][0..4][0..4][0..4], block.start, .big);
-                    std.mem.writeInt(u32, opt_ptr[opt_idx + 4 .. opt_idx + 8][0..4][0..4][0..4], block.end, .big);
-                }
-                var k: usize = sack_l_val;
-                while (k < sack_len) : (k += 1) opt_ptr[k] = 1;
-            }
-            var pb_val = tcpip.PacketBuffer{ .data = pb_data, .header = pre };
-        h.setChecksum(h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, pb_val.data));
-        _ = &h;
-            const node = self.proto.segment_node_pool.acquire() catch break;
-            node.data = .{ .data = try pb_val.data.cloneInPool(&self.proto.view_pool), .seq = self.snd_nxt, .len = payload_len, .flags = header.TCPFlagAck | header.TCPFlagPsh, .timestamp = std.time.milliTimestamp() };
-            self.snd_queue.append(node);
-            packet_batch[batch_count] = pb_val;
-            batch_count += 1;
-            self.snd_nxt += payload_len;
-            total_sent += payload_len;
-            if (batch_count == 64) {
-                const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse return tcpip.Error.NoRoute;
-                net_ep.writePackets(&r, ProtocolNumber, packet_batch[0..batch_count]) catch |err| return err;
-                for (packet_batch[0..batch_count]) |pkt| {
-                    self.proto.header_pool.release(pkt.header.buf);
-                    var m = pkt;
-                    m.data.deinit();
-                }
-                batch_count = 0;
-            }
-        }
-        if (batch_count > 0) {
-            const net_ep_final = r.nic.network_endpoints.get(r.net_proto) orelse return tcpip.Error.NoRoute;
-            net_ep_final.writePackets(&r, ProtocolNumber, packet_batch[0..batch_count]) catch |err| return err;
-            for (packet_batch[0..batch_count]) |pkt_to_release| {
-                self.proto.header_pool.release(pkt_to_release.header.buf);
-                var m_inner = pkt_to_release;
-                m_inner.data.deinit();
-            }
-        }
-        if (total_sent == 0) return tcpip.Error.WouldBlock;
-        if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, 200);
-        return total_sent;
+        var iov = [_][]u8{@constCast(payload_raw)};
+        var uio = buffer.Uio.init(&iov);
+        // We use toClusters for writeRaw to ensure the data is safely copied
+        // since the caller might free payload_raw immediately.
+        const view = try buffer.Uio.toClusters(&uio, &self.stack.cluster_pool, self.stack.allocator);
+        var mut_view = view;
+        defer mut_view.deinit();
+        return self.writeInternal(mut_view);
     }
 
     fn getLocalAddress(ptr: *anyopaque) tcpip.Error!tcpip.FullAddress {
@@ -648,13 +567,9 @@ pub const TCPEndpoint = struct {
                 opt_ptr[2] = 1;
                 opt_ptr[3] = 1;
             }
-            const payload_view = node.data.data.toView(self.stack.allocator) catch {
-                self.proto.header_pool.release(hdr_buf);
-                break;
-            };
-            defer self.stack.allocator.free(payload_view);
-        _ = &h; // Force update syn - mark 4.5 final v2
+            h.setChecksum(h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, node.data.data));
             packet_batch[batch_count] = .{ .data = node.data.data, .header = pre };
+
             batch_count += 1;
             if (batch_count == 64) {
                 const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse break;
@@ -698,7 +613,7 @@ pub const TCPEndpoint = struct {
             var sacked = false;
             for (self.peer_sack_blocks.items) |block| {
                 const flag_len: u32 = if ((node.data.flags & (header.TCPFlagSyn | header.TCPFlagFin)) != 0) 1 else 0;
-                const seg_end = node.data.seq + node.data.len + flag_len;
+                const seg_end = node.data.seq +% node.data.len +% flag_len;
                 if (seqAfterEq(node.data.seq, block.start) and seqBeforeEq(seg_end, block.end)) {
                     sacked = true;
                     break;
@@ -755,10 +670,8 @@ pub const TCPEndpoint = struct {
                     dst.* = src;
                     if (src.cluster) |c| c.acquire();
                 }
-                const payload_view = node.data.data.toView(self.stack.allocator) catch return;
-                defer self.stack.allocator.free(payload_view);
-                retransmit_h.setChecksum(retransmit_h.calculateChecksum(la.addr.v4, ra.addr.v4, payload_view));
                 const pb = tcpip.PacketBuffer{ .data = buffer.VectorisedView.init(node.data.data.size, views[0..node.data.data.views.len]), .header = pre };
+                retransmit_h.setChecksum(retransmit_h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, pb.data));
                 var mut_pb = pb;
                 mut_pb.data.original_views = views;
                 mut_pb.data.view_pool = &self.proto.view_pool;
@@ -789,43 +702,145 @@ pub const TCPEndpoint = struct {
     }
 
     fn destroy(self: *TCPEndpoint) void {
+        if (self.local_addr) |la| {
+            const ra = self.remote_addr orelse tcpip.FullAddress{
+                .nic = 0,
+                .addr = switch (la.addr) {
+                    .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                },
+                .port = 0,
+            };
+            const id = stack.TransportEndpointID{
+                .local_port = la.port,
+                .local_address = la.addr,
+                .remote_port = ra.port,
+                .remote_address = ra.addr,
+            };
+            self.stack.unregisterTransportEndpoint(id);
+        }
+
         self.syncache.deinit();
         self.sack_blocks.deinit();
         self.peer_sack_blocks.deinit();
+
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
+
         while (self.ooo_list.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
+
         while (self.accepted_queue.popFirst()) |node| {
             node.data.ep.close();
             self.proto.accept_node_pool.release(node);
         }
+
         if (self.owns_waiter_queue) self.stack.allocator.destroy(self.waiter_queue);
+
         self.stack.timer_queue.cancel(&self.retransmit_timer);
         self.cc.deinit();
+
         while (self.snd_queue.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.segment_node_pool.release(node);
         }
+
         self.stack.allocator.destroy(self);
+    }
+
+    fn onConsumed(ptr: *anyopaque, size: usize) void {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+
+        const old_rcv_wnd = self.rcv_wnd;
+
+        self.rcv_buf_used -= size;
+
+        self.rcv_wnd = self.rcv_wnd_max - @as(u32, @intCast(self.rcv_buf_used));
+
+        // Only notify if window significantly opened (e.g. 1/4 of total) or was closed
+
+        if ((old_rcv_wnd == 0) or (self.rcv_wnd -% old_rcv_wnd >= self.rcv_wnd_max / 4)) {
+            self.sendControl(header.TCPFlagAck) catch {};
+        }
+    }
+
+    fn writev_external(ptr: *anyopaque, uio: *buffer.Uio, opts: tcpip.WriteOptions) tcpip.Error!usize {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        _ = opts;
+        // BSD-style zero-copy writev: regroup addresses into the stack's view chain.
+        // We break large iovec elements into chunk-sized views.
+        const view = try buffer.Uio.toViews(uio, self.stack.allocator, header.ClusterSize);
+        var mut_view = view;
+        defer mut_view.deinit();
+        return self.writeInternal(mut_view);
+    }
+
+    fn readv_external(ptr: *anyopaque, uio: *buffer.Uio, addr: ?*tcpip.FullAddress) tcpip.Error!usize {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        return self.readv(uio, addr);
+    }
+
+    fn readv(self: *TCPEndpoint, uio: *buffer.Uio, addr: ?*tcpip.FullAddress) tcpip.Error!usize {
+        if (self.rcv_list.first == null) return if (self.state == .closed or self.state == .close_wait) 0 else tcpip.Error.WouldBlock;
+        if (addr) |a| a.* = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
+
+        const old_rcv_wnd = self.rcv_wnd;
+        var total_moved: usize = 0;
+        while (self.rcv_list.first) |node| {
+            const moved = node.data.data.moveToUio(uio);
+            total_moved += moved;
+            self.rcv_buf_used -= moved;
+
+            if (node.data.data.size == 0) {
+                _ = self.rcv_list.popFirst();
+                node.data.data.deinit();
+                self.proto.packet_node_pool.release(node);
+            }
+
+            if (uio.resid == 0) break;
+        }
+
+        // Recalculate rcv_view_count
+        var it = self.rcv_list.first;
+        self.rcv_view_count = 0;
+        while (it) |node| {
+            self.rcv_view_count += node.data.data.views.len;
+            it = node.next;
+        }
+
+        if (total_moved > 0) {
+            const rcv_used = @as(u32, @intCast(self.rcv_buf_used));
+            self.rcv_wnd = if (rcv_used < self.rcv_wnd_max) self.rcv_wnd_max - rcv_used else 0;
+            if ((old_rcv_wnd == 0) or (self.rcv_wnd -% old_rcv_wnd >= self.rcv_wnd_max / 4)) {
+                self.sendControl(header.TCPFlagAck) catch {};
+            }
+        }
+
+        return total_moved;
     }
 
     fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.VectorisedView {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+
         if (self.rcv_list.first == null) return if (self.state == .closed or self.state == .close_wait) buffer.VectorisedView.empty() else tcpip.Error.WouldBlock;
+
         if (addr) |a| a.* = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
+
         const num_views = self.rcv_view_count;
         const total_size = self.rcv_buf_used;
         var v_idx: usize = 0;
+
         var views: []buffer.ClusterView = undefined;
         var original_views: []buffer.ClusterView = &[_]buffer.ClusterView{};
         var view_pool_used: ?*buffer.BufferPool = null;
+
         if (num_views <= header.MaxViewsPerPacket) {
             const view_mem = self.proto.view_pool.acquire() catch return tcpip.Error.OutOfMemory;
+
             original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
             views = original_views[0..num_views];
             view_pool_used = &self.proto.view_pool;
@@ -833,22 +848,29 @@ pub const TCPEndpoint = struct {
             views = self.stack.allocator.alloc(buffer.ClusterView, num_views) catch return tcpip.Error.OutOfMemory;
             original_views = views;
         }
+
         while (self.rcv_list.popFirst()) |node| {
             for (node.data.data.views) |cv| {
                 views[v_idx] = cv;
                 v_idx += 1;
             }
+
             if (node.data.data.view_pool) |pool| pool.release(std.mem.sliceAsBytes(node.data.data.original_views)) else if (node.data.data.allocator) |alloc| alloc.free(node.data.data.original_views);
+
             self.proto.packet_node_pool.release(node);
         }
-        const old_rcv_wnd = self.rcv_wnd;
-        self.rcv_buf_used = 0;
+
         self.rcv_view_count = 0;
-        self.rcv_wnd = self.rcv_wnd_max;
-        if ((old_rcv_wnd == 0) or (self.rcv_wnd -% old_rcv_wnd >= self.rcv_wnd_max / 4)) self.sendControl(header.TCPFlagAck) catch {};
+
         var res = buffer.VectorisedView.init(total_size, views);
         res.original_views = original_views;
+
         if (view_pool_used) |pool| res.view_pool = pool else res.allocator = self.stack.allocator;
+
+        // Attach the consumption callback so we know when to open the window
+
+        res.consumption_callback = .{ .ptr = self, .run = onConsumed };
+
         return res;
     }
 
@@ -861,7 +883,8 @@ pub const TCPEndpoint = struct {
         self.snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF)));
         self.last_ack = self.snd_nxt;
         const initial_seq = self.snd_nxt;
-        self.snd_nxt += 1;
+        self.snd_nxt +%= 1;
+
         const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = addr.port, .remote_address = addr.addr };
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
         const net_proto: u16 = if (addr.addr == .v4) 0x0800 else 0x86dd;
@@ -974,15 +997,16 @@ pub const TCPEndpoint = struct {
         if (hlen > header.TCPMinimumSize) {
             var opt_idx: usize = 20;
             while (opt_idx < hlen) {
-                                const kind = v[opt_idx];
-                                if (kind == 0) break;
-                                if (kind == 1) {
-                                    opt_idx += 1;
-                                    continue;
-                                }
-                                if (opt_idx + 1 >= hlen) break;
-                                const len = v[opt_idx + 1];
-                                if (len < 2 or opt_idx + len > hlen) break;                if (kind == 8 and len == 10) {
+                const kind = v[opt_idx];
+                if (kind == 0) break;
+                if (kind == 1) {
+                    opt_idx += 1;
+                    continue;
+                }
+                if (opt_idx + 1 >= hlen) break;
+                const len = v[opt_idx + 1];
+                if (len < 2 or opt_idx + len > hlen) break;
+                if (kind == 8 and len == 10) {
                     self.ts_recent = std.mem.readInt(u32, v[opt_idx + 2 .. opt_idx + 6][0..4][0..4][0..4], .big);
                     if (fl & header.TCPFlagSyn != 0) self.ts_enabled = true;
                 } else if (kind == 4 and len == 2) {
@@ -1003,18 +1027,19 @@ pub const TCPEndpoint = struct {
             .listen => {
                 if (fl & header.TCPFlagSyn != 0) {
                     if (self.syncache.items.len + self.accepted_queue.len >= self.backlog) return;
-                    var entry = SyncacheEntry{ .remote_addr = .{ .nic = r.nic.id, .addr = id.remote_address, .port = h.sourcePort() }, .rcv_nxt = h.sequenceNumber() + 1, .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))), .ts_recent = self.ts_recent, .ts_enabled = self.ts_enabled, .sack_enabled = false, .ws_negotiated = false, .snd_wnd_scale = 0, .mss = self.max_segment_size };
+                    var entry = SyncacheEntry{ .remote_addr = .{ .nic = r.nic.id, .addr = id.remote_address, .port = h.sourcePort() }, .rcv_nxt = h.sequenceNumber() +% 1, .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))), .ts_recent = self.ts_recent, .ts_enabled = self.ts_enabled, .sack_enabled = false, .ws_negotiated = false, .snd_wnd_scale = 0, .mss = self.max_segment_size };
                     var opt_idx: usize = 20;
                     while (opt_idx < hlen) {
-                                        const kind = v[opt_idx];
-                                        if (kind == 0) break;
-                                        if (kind == 1) {
-                                            opt_idx += 1;
-                                            continue;
-                                        }
-                                        if (opt_idx + 1 >= hlen) break;
-                                        const len = v[opt_idx + 1];
-                                        if (len < 2 or opt_idx + len > hlen) break;                        if (kind == 2 and len == 4) entry.mss = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2][0..2][0..2], .big) else if (kind == 3 and len == 3) {
+                        const kind = v[opt_idx];
+                        if (kind == 0) break;
+                        if (kind == 1) {
+                            opt_idx += 1;
+                            continue;
+                        }
+                        if (opt_idx + 1 >= hlen) break;
+                        const len = v[opt_idx + 1];
+                        if (len < 2 or opt_idx + len > hlen) break;
+                        if (kind == 2 and len == 4) entry.mss = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2][0..2][0..2], .big) else if (kind == 3 and len == 3) {
                             entry.snd_wnd_scale = v[opt_idx + 2];
                             entry.ws_negotiated = true;
                         } else if (kind == 4 and len == 2) entry.sack_enabled = true;
@@ -1065,7 +1090,7 @@ pub const TCPEndpoint = struct {
                 } else if (fl & header.TCPFlagAck != 0) {
                     var found_idx: ?usize = null;
                     for (self.syncache.items, 0..) |entry, i| {
-                        if (entry.remote_addr.addr.eq(id.remote_address) and entry.remote_addr.port == h.sourcePort() and h.ackNumber() == entry.snd_nxt + 1) {
+                        if (entry.remote_addr.addr.eq(id.remote_address) and entry.remote_addr.port == h.sourcePort() and h.ackNumber() == entry.snd_nxt +% 1) {
                             found_idx = i;
                             break;
                         }
@@ -1087,7 +1112,7 @@ pub const TCPEndpoint = struct {
                         new_ep.owns_waiter_queue = true;
                         new_ep.state = .established;
                         new_ep.rcv_nxt = entry.rcv_nxt;
-                        new_ep.snd_nxt = entry.snd_nxt + 1;
+                        new_ep.snd_nxt = entry.snd_nxt +% 1;
                         new_ep.last_ack = new_ep.snd_nxt;
                         new_ep.local_addr = .{ .nic = r.nic.id, .addr = id.local_address, .port = id.local_port };
                         new_ep.remote_addr = entry.remote_addr;
@@ -1117,7 +1142,7 @@ pub const TCPEndpoint = struct {
                 if ((fl & header.TCPFlagSyn != 0) and (fl & header.TCPFlagAck != 0)) {
                     if (h.ackNumber() == self.snd_nxt) {
                         self.state = .established;
-                        self.rcv_nxt = h.sequenceNumber() + 1;
+                        self.rcv_nxt = h.sequenceNumber() +% 1;
                         self.snd_nxt = h.ackNumber();
                         self.last_ack = self.snd_nxt;
                         if (self.snd_queue.popFirst()) |node| {
@@ -1128,29 +1153,31 @@ pub const TCPEndpoint = struct {
                         var opt_idx: usize = 20;
                         var ws_negotiated = false;
                         while (opt_idx < hlen) {
-                                            const kind = v[opt_idx];
-                                            if (kind == 0) break;
-                                            if (kind == 1) {
-                                                opt_idx += 1;
-                                                continue;
-                                            }
-                                            if (opt_idx + 1 >= hlen) break;
-                                            const len = v[opt_idx + 1];
-                                            if (len < 2 or opt_idx + len > hlen) break;                            if (kind == 2 and len == 4) self.max_segment_size = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2][0..2][0..2], .big) else if (kind == 3 and len == 3) {
+                            const kind = v[opt_idx];
+                            if (kind == 0) break;
+                            if (kind == 1) {
+                                opt_idx += 1;
+                                continue;
+                            }
+                            if (opt_idx + 1 >= hlen) break;
+                            const len = v[opt_idx + 1];
+                            if (len < 2 or opt_idx + len > hlen) break;
+                            if (kind == 2 and len == 4) self.max_segment_size = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2][0..2][0..2], .big) else if (kind == 3 and len == 3) {
                                 self.snd_wnd_scale = v[opt_idx + 2];
                                 ws_negotiated = true;
                             } else if (kind == 4 and len == 2) self.hint_sack_enabled = true;
                             opt_idx += len;
                         }
                         if (!ws_negotiated) self.rcv_wnd_scale = 0;
-                        self.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(self.snd_wnd_scale));
+                        const scale_val = if (self.snd_wnd_scale > 30) @as(u5, 30) else @as(u5, @intCast(self.snd_wnd_scale));
+                        self.snd_wnd = @as(u32, h.windowSize()) << scale_val;
                         self.sendControl(header.TCPFlagAck) catch {};
                         notify_mask |= waiter.EventOut;
                     }
                 }
             },
             .established => {
-                const data_len = pkt.data.size - h.dataOffset();
+                const data_len = if (pkt.data.size > h.dataOffset()) pkt.data.size - h.dataOffset() else 0;
                 if (h.sequenceNumber() == self.rcv_nxt) {
                     if (data_len > 0) {
                         var mut_pkt = pkt;
@@ -1166,14 +1193,14 @@ pub const TCPEndpoint = struct {
                         self.rcv_list.append(node);
                         self.rcv_buf_used += data_len;
                         self.rcv_view_count += node.data.data.views.len;
-                        self.rcv_nxt += @as(u32, @intCast(data_len));
+                        self.rcv_nxt +%= @as(u32, @intCast(data_len));
                         self.rcv_packets_since_ack += 1;
                         self.processOOO();
                         if (self.rcv_packets_since_ack >= 2) self.sendControl(header.TCPFlagAck) catch {};
                         notify_mask |= waiter.EventIn;
                     }
                     if (fl & header.TCPFlagFin != 0) {
-                        self.rcv_nxt += 1;
+                        self.rcv_nxt +%= 1;
                         self.state = .close_wait;
                         self.sendControl(header.TCPFlagAck) catch {};
                         self.rcv_packets_since_ack = 0;
@@ -1190,7 +1217,8 @@ pub const TCPEndpoint = struct {
                 if (fl & header.TCPFlagAck != 0) {
                     const ack = h.ackNumber();
                     if (seqBeforeEq(ack, self.snd_nxt) and seqAfterEq(ack, self.last_ack)) {
-                        self.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(self.snd_wnd_scale));
+                        const scale_val = if (self.snd_wnd_scale > 30) @as(u5, 30) else @as(u5, @intCast(self.snd_wnd_scale));
+                        self.snd_wnd = @as(u32, h.windowSize()) << scale_val;
                         if (ack == self.last_ack) {
                             self.dup_ack_count += 1;
                             if (self.dup_ack_count == 3) {
@@ -1200,7 +1228,7 @@ pub const TCPEndpoint = struct {
                                     var sacked = false;
                                     for (self.peer_sack_blocks.items) |block| {
                                         const flag_len: u32 = if ((node.data.flags & (header.TCPFlagSyn | header.TCPFlagFin)) != 0) 1 else 0;
-                                        const seg_end = node.data.seq + node.data.len + flag_len;
+                                        const seg_end = node.data.seq +% node.data.len +% flag_len;
                                         if (seqAfterEq(node.data.seq, block.start) and seqBeforeEq(seg_end, block.end)) {
                                             sacked = true;
                                             break;
@@ -1245,12 +1273,8 @@ pub const TCPEndpoint = struct {
                                         dst.* = src;
                                         if (src.cluster) |c| c.acquire();
                                     }
-                                    const payload_view = node.data.data.toView(self.stack.allocator) catch return;
-                                    defer self.stack.allocator.free(payload_view);
-        _ = &h; // Force checksum update final v2
-        _ = &h; // Force update syn - final v2
-        _ = &h; // Force update syn - mark final 2.5 v2
                                     const pb = tcpip.PacketBuffer{ .data = buffer.VectorisedView.init(node.data.data.size, views[0..node.data.data.views.len]), .header = pre };
+                                    retransmit_h.setChecksum(retransmit_h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, pb.data));
                                     var mut_pb = pb;
                                     mut_pb.data.original_views = views;
                                     mut_pb.data.view_pool = &self.proto.view_pool;
@@ -1264,14 +1288,14 @@ pub const TCPEndpoint = struct {
                                 }
                             }
                         } else {
-                            const diff = ack - self.last_ack;
+                            const diff: u32 = @as(u32, ack) -% @as(u32, self.last_ack);
                             self.last_ack = ack;
                             self.dup_ack_count = 0;
                             self.retransmit_count = 0;
                             var it_node = self.snd_queue.first;
                             while (it_node) |node| {
                                 const flag_len: u32 = if ((node.data.flags & (header.TCPFlagSyn | header.TCPFlagFin)) != 0) 1 else 0;
-                                const seg_end = node.data.seq + node.data.len + flag_len;
+                                const seg_end = node.data.seq +% node.data.len +% flag_len;
                                 if (seqBeforeEq(seg_end, ack)) {
                                     const next = node.next;
                                     self.snd_queue.remove(node);
@@ -1290,7 +1314,7 @@ pub const TCPEndpoint = struct {
             .fin_wait1 => {
                 if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) self.state = .fin_wait2;
                 if (fl & header.TCPFlagFin != 0) {
-                    self.rcv_nxt += 1;
+                    self.rcv_nxt +%= 1;
                     self.state = .close_wait;
                     self.sendControl(header.TCPFlagAck) catch {};
                     self.rcv_packets_since_ack = 0;
@@ -1299,7 +1323,7 @@ pub const TCPEndpoint = struct {
             },
             .fin_wait2 => {
                 if (fl & header.TCPFlagFin != 0) {
-                    self.rcv_nxt += 1;
+                    self.rcv_nxt +%= 1;
                     self.state = .closed;
                     self.sendControl(header.TCPFlagAck) catch {};
                     notify_mask |= waiter.EventHUp;
@@ -1350,12 +1374,13 @@ pub const TCPEndpoint = struct {
                 std.mem.writeInt(u32, opt_ptr[opt_idx_val + 4 .. opt_idx_val + 8][0..4][0..4][0..4], block.end, .big);
             }
             var k_final: usize = sack_l_val;
-            while (k_final < sack_len) : (k_final += 1) opt_ptr[k_final] = 1;
+            while (k_final < sack_len) : (k_final += 1)
+                opt_ptr[k_final] = 1;
         }
         h.setChecksum(h.calculateChecksum(la.addr.v4, ra.addr.v4, &[_]u8{}));
         _ = &h;
         self.rcv_packets_since_ack = 0;
-        if ((fl & header.TCPFlagSyn != 0) or (fl & header.TCPFlagFin != 0)) self.snd_nxt += 1;
+        if ((fl & header.TCPFlagSyn != 0) or (fl & header.TCPFlagFin != 0)) self.snd_nxt +%= 1;
         const pb = tcpip.PacketBuffer{ .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 }, .header = pre };
         var mut_r = r;
         try mut_r.writePacket(6, pb);
@@ -1373,7 +1398,7 @@ pub const TCPEndpoint = struct {
         const node = try self.proto.packet_node_pool.acquire();
         node.data = .{ .data = try pkt_data.cloneInPool(&self.proto.view_pool), .seq = seq };
         if (prev) |p| self.ooo_list.insertAfter(p, node) else self.ooo_list.prepend(node);
-        try self.updateSackBlocks(seq, seq + @as(u32, @intCast(pkt_data.size)));
+        try self.updateSackBlocks(seq, seq +% @as(u32, @intCast(pkt_data.size)));
     }
 
     fn updateSackBlocks(self: *TCPEndpoint, start: u32, end: u32) !void {
@@ -1399,10 +1424,10 @@ pub const TCPEndpoint = struct {
                 self.rcv_list.append(node);
                 self.rcv_buf_used += data_len;
                 self.rcv_view_count += node.data.data.views.len;
-                self.rcv_nxt += @as(u32, @intCast(data_len));
+                self.rcv_nxt +%= @as(u32, @intCast(data_len));
                 self.rcv_packets_since_ack += 1;
             } else if (seqBefore(node.data.seq, self.rcv_nxt)) {
-                const end = node.data.seq + @as(u32, @intCast(node.data.data.size));
+                const end = node.data.seq +% @as(u32, @intCast(node.data.data.size));
                 if (seqBeforeEq(end, self.rcv_nxt)) {
                     self.ooo_list.remove(node);
                     node.data.data.deinit();

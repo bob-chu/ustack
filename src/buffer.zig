@@ -168,6 +168,170 @@ pub const BufferPool = struct {
 /// View is a slice of a buffer.
 pub const View = []u8;
 
+/// ConsumptionCallback allows the stack to be notified when the application
+/// has finished processing zero-copy data.
+pub const ConsumptionCallback = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque, size: usize) void,
+};
+
+/// Uio represents a user-space I/O vector (iovec).
+pub const Uio = struct {
+    iov: []const []u8,
+    iov_idx: usize = 0,
+    offset: usize = 0,
+    resid: usize,
+
+    pub fn init(iov: []const []u8) Uio {
+        var total: usize = 0;
+        for (iov) |v| total += v.len;
+        return .{
+            .iov = iov,
+            .resid = total,
+        };
+    }
+
+    pub fn moveFrom(self: *Uio, src: []const u8) usize {
+        const to_move = @min(src.len, self.resid);
+        var moved: usize = 0;
+        while (moved < to_move and self.iov_idx < self.iov.len) {
+            const current_iov = self.iov[self.iov_idx][self.offset..];
+            const chunk = @min(to_move - moved, current_iov.len);
+            // In a real BSD-style uio_move, this would perform the copy between
+            // the kernel/stack and user space. Since we are in the same address space
+            // here, this is the final copy into the application's buffer.
+            @memcpy(current_iov[0..chunk], src[moved .. moved + chunk]);
+            moved += chunk;
+            self.offset += chunk;
+            self.resid -= chunk;
+            if (self.offset == self.iov[self.iov_idx].len) {
+                self.iov_idx += 1;
+                self.offset = 0;
+            }
+        }
+        return moved;
+    }
+
+    pub fn skip(self: *Uio, count: usize) void {
+        var remaining = count;
+        while (remaining > 0 and self.iov_idx < self.iov.len) {
+            const current_iov_len = self.iov[self.iov_idx].len - self.offset;
+            const to_skip = @min(remaining, current_iov_len);
+            remaining -= to_skip;
+            self.offset += to_skip;
+            self.resid -= to_skip;
+            if (self.offset == self.iov[self.iov_idx].len) {
+                self.iov_idx += 1;
+                self.offset = 0;
+            }
+        }
+    }
+
+    /// uio_memove copies data between a buffer and a Uio.
+    /// If direction is .FromUio, it copies from Uio to buf.
+    /// If direction is .ToUio, it copies from buf to Uio.
+    pub fn uio_memove(uio: *Uio, buf: []u8, direction: enum { FromUio, ToUio }) usize {
+        const to_move = @min(buf.len, uio.resid);
+        var moved: usize = 0;
+        while (moved < to_move and uio.iov_idx < uio.iov.len) {
+            const current_iov = uio.iov[uio.iov_idx][uio.offset..];
+            const chunk = @min(to_move - moved, current_iov.len);
+            switch (direction) {
+                .FromUio => @memcpy(buf[moved .. moved + chunk], current_iov[0..chunk]),
+                .ToUio => @memcpy(current_iov[0..chunk], buf[moved .. moved + chunk]),
+            }
+            moved += chunk;
+            uio.offset += chunk;
+            uio.resid -= chunk;
+            if (uio.offset == uio.iov[uio.iov_idx].len) {
+                uio.iov_idx += 1;
+                uio.offset = 0;
+            }
+        }
+        return moved;
+    }
+
+    /// toClusters copies data from Uio into a VectorisedView backed by Clusters.
+    /// It packs data efficiently into the stack's buffer chain (Clusters).
+    pub fn toClusters(uio: *Uio, pool: *ClusterPool, allocator: Allocator) !VectorisedView {
+        const num_views = (uio.resid + header.ClusterSize - 1) / header.ClusterSize;
+        const views = try allocator.alloc(ClusterView, num_views);
+        errdefer allocator.free(views);
+
+        var total_copied: usize = 0;
+        var view_idx: usize = 0;
+
+        while (uio.resid > 0) {
+            const cluster = try pool.acquire();
+            const to_copy = @min(uio.resid, header.ClusterSize);
+            _ = uio.uio_memove(cluster.data[0..to_copy], .FromUio);
+            views[view_idx] = .{ .cluster = cluster, .view = cluster.data[0..to_copy] };
+            view_idx += 1;
+            total_copied += to_copy;
+        }
+
+        return .{
+            .views = views[0..view_idx],
+            .original_views = views[0..view_idx],
+            .size = total_copied,
+            .allocator = allocator,
+        };
+    }
+
+    /// toViews constructs a VectorisedView by referencing the memory in Uio.
+    /// This is BSD-style zero-copy where we "copy the source address" instead of data.
+    /// If an iovec element is larger than chunk_size, it is broken into multiple views.
+    pub fn toViews(uio: *Uio, allocator: Allocator, chunk_size: usize) !VectorisedView {
+        // Calculate required views
+        var num_views: usize = 0;
+        var i: usize = uio.iov_idx;
+        var off = uio.offset;
+        var rem = uio.resid;
+        while (rem > 0 and i < uio.iov.len) {
+            const current_len = uio.iov[i].len - off;
+            const to_take = @min(rem, current_len);
+            num_views += (to_take + chunk_size - 1) / chunk_size;
+            rem -= to_take;
+            i += 1;
+            off = 0;
+        }
+
+        const views = try allocator.alloc(ClusterView, num_views);
+        errdefer allocator.free(views);
+
+        var view_idx: usize = 0;
+        const initial_resid = uio.resid;
+        while (uio.resid > 0 and uio.iov_idx < uio.iov.len) {
+            const current_iov = uio.iov[uio.iov_idx][uio.offset..];
+            const to_take_from_iov = @min(uio.resid, current_iov.len);
+
+            var iov_rem = to_take_from_iov;
+            var iov_off: usize = 0;
+            while (iov_rem > 0) {
+                const chunk = @min(iov_rem, chunk_size);
+                views[view_idx] = .{ .cluster = null, .view = current_iov[iov_off .. iov_off + chunk] };
+                view_idx += 1;
+                iov_rem -= chunk;
+                iov_off += chunk;
+            }
+
+            uio.offset += to_take_from_iov;
+            uio.resid -= to_take_from_iov;
+            if (uio.offset == uio.iov[uio.iov_idx].len) {
+                uio.iov_idx += 1;
+                uio.offset = 0;
+            }
+        }
+
+        return .{
+            .views = views,
+            .original_views = views,
+            .size = initial_resid,
+            .allocator = allocator,
+        };
+    }
+};
+
 /// VectorisedView is a vectorised version of View using non contiguous memory.
 pub const VectorisedView = struct {
     views: []ClusterView,
@@ -175,6 +339,7 @@ pub const VectorisedView = struct {
     allocator: ?Allocator = null,
     view_pool: ?*BufferPool = null,
     original_views: []ClusterView = &[_]ClusterView{},
+    consumption_callback: ?ConsumptionCallback = null,
 
     pub fn init(size: usize, views: []ClusterView) VectorisedView {
         return .{
@@ -183,36 +348,91 @@ pub const VectorisedView = struct {
         };
     }
 
-    pub fn empty() VectorisedView {
-        return .{ .views = &[_]ClusterView{}, .size = 0 };
-    }
-
-    pub fn fromSlice(data: []const u8, allocator: Allocator, pool: *ClusterPool) !VectorisedView {
-        const num_clusters = (data.len + header.ClusterSize - 1) / header.ClusterSize;
-        const views = try allocator.alloc(ClusterView, num_clusters);
-        errdefer allocator.free(views);
-
-        var remaining = data.len;
-        var offset: usize = 0;
-        var i: usize = 0;
-        while (remaining > 0) : (i += 1) {
-            const cluster = try pool.acquire();
-            const to_copy = @min(remaining, header.ClusterSize);
-            @memcpy(cluster.data[0..to_copy], data[offset .. offset + to_copy]);
-            views[i] = .{ .cluster = cluster, .view = cluster.data[0..to_copy] };
-            remaining -= to_copy;
-            offset += to_copy;
-        }
-
+    pub fn initFromViews(views: []ClusterView) VectorisedView {
+        var total: usize = 0;
+        for (views) |v| total += v.view.len;
         return .{
             .views = views,
             .original_views = views,
-            .size = data.len,
+            .size = total,
+        };
+    }
+
+    pub fn fromSlice(data: []const u8, allocator: Allocator, pool: *ClusterPool) !VectorisedView {
+        const cluster = try pool.acquire();
+        const to_copy = @min(data.len, header.ClusterSize);
+        @memcpy(cluster.data[0..to_copy], data[0..to_copy]);
+        const views = try allocator.alloc(ClusterView, 1);
+        views[0] = .{ .cluster = cluster, .view = cluster.data[0..to_copy] };
+        return .{
+            .views = views,
+            .original_views = views,
+            .size = to_copy,
             .allocator = allocator,
         };
     }
 
+    pub fn fromExternal(data: []u8, views_buffer: []ClusterView) VectorisedView {
+        views_buffer[0] = .{ .cluster = null, .view = data };
+        return .{
+            .views = views_buffer[0..1],
+            .original_views = views_buffer[0..1],
+            .size = data.len,
+        };
+    }
+
+    pub fn fromExternals(data: []const []u8, views_buffer: []ClusterView) VectorisedView {
+        for (data, 0..) |slice, i| {
+            views_buffer[i] = .{ .cluster = null, .view = slice };
+        }
+        return initFromViews(views_buffer[0..data.len]);
+    }
+
+    pub fn fromExternalSlicing(data: []u8, views_buffer: []ClusterView, chunk_size: usize) VectorisedView {
+        var remaining = data.len;
+        var offset: usize = 0;
+        var i: usize = 0;
+        while (remaining > 0 and i < views_buffer.len) : (i += 1) {
+            const to_take = @min(remaining, chunk_size);
+            views_buffer[i] = .{ .cluster = null, .view = data[offset .. offset + to_take] };
+            remaining -= to_take;
+            offset += to_take;
+        }
+        return initFromViews(views_buffer[0..i]);
+    }
+
+    pub fn fromExternalZeroCopy(data: []u8, allocator: Allocator, chunk_size: usize) !VectorisedView {
+        const num_views = (data.len + chunk_size - 1) / chunk_size;
+        const views = try allocator.alloc(ClusterView, num_views);
+        var res = fromExternalSlicing(data, views, chunk_size);
+        res.allocator = allocator;
+        return res;
+    }
+
+    pub fn fromUio(uio: Uio, views_buffer: []ClusterView) VectorisedView {
+        var count: usize = 0;
+        var total: usize = 0;
+        var i: usize = uio.iov_idx;
+        while (i < uio.iov.len and count < views_buffer.len) : (i += 1) {
+            const data = if (i == uio.iov_idx) uio.iov[i][uio.offset..] else uio.iov[i];
+            if (data.len == 0) continue;
+            views_buffer[count] = .{ .cluster = null, .view = data };
+            total += data.len;
+            count += 1;
+        }
+        return .{
+            .views = views_buffer[0..count],
+            .original_views = views_buffer[0..count],
+            .size = total,
+        };
+    }
+
+    pub fn empty() VectorisedView {
+        return .{ .views = &[_]ClusterView{}, .size = 0 };
+    }
+
     pub fn deinit(self: *VectorisedView) void {
+        const total_size = self.size;
         for (self.views) |cv| {
             if (cv.cluster) |c| c.release();
         }
@@ -221,6 +441,10 @@ pub const VectorisedView = struct {
             pool.release(std.mem.sliceAsBytes(ov));
         } else if (self.allocator) |alloc| {
             if (ov.len > 0) alloc.free(ov);
+        }
+
+        if (self.consumption_callback) |cb| {
+            cb.run(cb.ptr, total_size);
         }
         self.* = undefined;
     }
@@ -266,6 +490,26 @@ pub const VectorisedView = struct {
         if (self.views[0].cluster) |c| c.release();
         self.size -= self.views[0].view.len;
         self.views = self.views[1..];
+    }
+
+    pub fn moveToUio(self: *VectorisedView, uio: *Uio) usize {
+        var total_moved: usize = 0;
+        while (self.views.len > 0 and uio.resid > 0) {
+            const v = self.views[0].view;
+            const to_move = @min(v.len, uio.resid);
+            const moved = uio.moveFrom(v[0..to_move]);
+            total_moved += moved;
+            if (moved < v.len) {
+                // Partial move from this view
+                self.views[0].view = v[moved..];
+                self.size -= moved;
+                break;
+            } else {
+                // Entire view moved
+                self.removeFirst();
+            }
+        }
+        return total_moved;
     }
 
     pub fn toView(self: VectorisedView, allocator: Allocator) ![]u8 {
@@ -398,4 +642,3 @@ test "BufferPool single-threaded usage" {
     pool.release(b3); // Exceeds capacity, should be freed
     try std.testing.expectEqual(@as(usize, 2), pool.free_list.items.len);
 }
-

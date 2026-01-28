@@ -127,6 +127,24 @@ pub const UDPEndpoint = struct {
     }
 
     fn destroy_internal(self: *UDPEndpoint) void {
+        if (self.local_addr) |la| {
+            const ra = self.remote_addr orelse tcpip.FullAddress{
+                .nic = 0,
+                .addr = switch (la.addr) {
+                    .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                },
+                .port = 0,
+            };
+            const id = stack.TransportEndpointID{
+                .local_port = la.port,
+                .local_address = la.addr,
+                .remote_port = ra.port,
+                .remote_address = ra.addr,
+            };
+            self.stack.unregisterTransportEndpoint(id);
+        }
+
         self.stack.timer_queue.cancel(&self.retry_timer);
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
@@ -251,7 +269,11 @@ pub const UDPEndpoint = struct {
     const EndpointVTableImpl = tcpip.Endpoint.VTable{
         .close = close_external,
         .read = read,
+        .readv = readv_external,
         .write = write_external,
+        .writev = writev_external,
+        .writeView = writeView_external,
+        .writeZeroCopy = writeZeroCopy_external,
         .connect = connect,
         .shutdown = shutdown,
         .listen = listen,
@@ -262,6 +284,13 @@ pub const UDPEndpoint = struct {
         .setOption = setOption,
         .getOption = getOption,
     };
+
+    fn writeZeroCopy_external(ptr: *anyopaque, data: []u8, cb: buffer.ConsumptionCallback, opts: tcpip.WriteOptions) tcpip.Error!usize {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        var view = buffer.VectorisedView.fromExternalZeroCopy(data, self.stack.allocator, 2048) catch return tcpip.Error.OutOfMemory;
+        view.consumption_callback = cb;
+        return self.writeInternal(view, opts);
+    }
 
     fn setOption(ptr: *anyopaque, opt: tcpip.EndpointOption) tcpip.Error!void {
         _ = ptr;
@@ -276,11 +305,40 @@ pub const UDPEndpoint = struct {
         };
     }
 
+    fn writev_external(ptr: *anyopaque, uio: *buffer.Uio, opts: tcpip.WriteOptions) tcpip.Error!usize {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        // BSD-style zero-copy writev: regroup addresses into the stack's view chain.
+        // We break large iovec elements into chunk-sized views.
+        const view = try buffer.Uio.toViews(uio, self.stack.allocator, header.ClusterSize);
+        var mut_view = view;
+        defer mut_view.deinit();
+        return self.writeInternal(mut_view, opts);
+    }
+
+    fn readv_external(ptr: *anyopaque, uio: *buffer.Uio, addr: ?*tcpip.FullAddress) tcpip.Error!usize {
+        const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+        const node = self.rcv_list.popFirst() orelse return tcpip.Error.WouldBlock;
+        defer {
+            var mut_node = node;
+            mut_node.data.data.deinit();
+            self.proto.packet_node_pool.release(node);
+            if (self.rcv_list.first == null) {
+                self.waiter_queue.clear(waiter.EventIn);
+            }
+        }
+
+        if (addr) |a| {
+            a.* = node.data.sender_addr;
+        }
+
+        return node.data.data.moveToUio(uio);
+    }
+
     fn read(ptr: *anyopaque, addr: ?*tcpip.FullAddress) tcpip.Error!buffer.VectorisedView {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
 
         const node = self.rcv_list.popFirst() orelse return tcpip.Error.WouldBlock;
-        
+
         if (self.rcv_list.first == null) {
             self.waiter_queue.clear(waiter.EventIn);
         }
@@ -314,7 +372,10 @@ pub const UDPEndpoint = struct {
     fn writeInternal(self: *UDPEndpoint, data: buffer.VectorisedView, opts: tcpip.WriteOptions) tcpip.Error!usize {
         if (opts.to) |to| {
             const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-            const net_proto: u16 = switch (to.addr) { .v4 => @as(u16, 0x0800), .v6 => @as(u16, 0x86dd) };
+            const net_proto: u16 = switch (to.addr) {
+                .v4 => @as(u16, 0x0800),
+                .v6 => @as(u16, 0x86dd),
+            };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
             const next_hop = r.next_hop orelse to.addr;
             if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
@@ -327,7 +388,10 @@ pub const UDPEndpoint = struct {
             try self.write(&r, to.port, data);
         } else if (self.remote_addr) |to| {
             const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-            const net_proto: u16 = switch (to.addr) { .v4 => @as(u16, 0x0800), .v6 => @as(u16, 0x86dd) };
+            const net_proto: u16 = switch (to.addr) {
+                .v4 => @as(u16, 0x0800),
+                .v6 => @as(u16, 0x86dd),
+            };
             var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
             if (self.stack.link_addr_cache.get(to.addr)) |link_addr| {
                 r.remote_link_address = link_addr;
@@ -355,7 +419,7 @@ pub const UDPEndpoint = struct {
             tmp.port = self.stack.getNextEphemeralPort();
             break :blk tmp;
         } else addr;
-        
+
         self.local_addr = new_addr;
 
         const id = stack.TransportEndpointID{
@@ -413,23 +477,31 @@ test "UDP handlePacket" {
 
     var fake_ep = struct {
         fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-            _ = ptr; _ = r; _ = protocol; _ = pkt;
+            _ = ptr;
+            _ = r;
+            _ = protocol;
+            _ = pkt;
             return;
         }
         fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
-            _ = ptr; _ = dispatcher;
+            _ = ptr;
+            _ = dispatcher;
         }
         fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
-            _ = ptr; return .{ .addr = [_]u8{0} ** 6 };
+            _ = ptr;
+            return .{ .addr = [_]u8{0} ** 6 };
         }
         fn mtu(ptr: *anyopaque) u32 {
-            _ = ptr; return 1500;
+            _ = ptr;
+            return 1500;
         }
         fn setMTU(ptr: *anyopaque, m: u32) void {
-            _ = ptr; _ = m;
+            _ = ptr;
+            _ = m;
         }
         fn capabilities(ptr: *anyopaque) stack.LinkEndpointCapabilities {
-            _ = ptr; return stack.CapabilityNone;
+            _ = ptr;
+            return stack.CapabilityNone;
         }
     }{};
 

@@ -160,7 +160,7 @@ test "TCP Retransmission" {
     @memset(ack_buf, 0);
     var ack = header.TCP.init(ack_buf);
     const server_initial_seq = header.TCP.init(fake_ep.last_pkt.?[20..]).sequenceNumber();
-    ack.encode(ca.port, sa.port, 1001, server_initial_seq + 1, header.TCPFlagAck, 65535);
+    ack.encode(ca.port, sa.port, 1001, server_initial_seq +% 1, header.TCPFlagAck, 65535);
     const ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(ack_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_ack = ack_pkt;
     defer mut_ack.data.deinit();
@@ -295,4 +295,86 @@ test "TCP SACK Blocks Generation" {
     ep.processOOO();
     try std.testing.expectEqual(@as(usize, 1), ep.sack_blocks.items.len);
     try std.testing.expectEqual(@as(u32, 3000), ep.sack_blocks.items[0].start);
+}
+
+test "TCP readv/writev zero-copy" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    const tcp_proto = TCPProtocol.init(allocator);
+    defer tcp_proto.deinit();
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var wq = waiter.Queue{};
+    var ep = try allocator.create(TCPEndpoint);
+    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
+    ep.retransmit_timer.context = ep;
+    defer ep.decRef();
+    ep.state = .established;
+    ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
+    ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
+
+    // Test writev
+    const data1 = "hello ";
+    const data2 = "world";
+    var iov_write = [_][]u8{ @constCast(data1), @constCast(data2) };
+    var uio_write = buffer.Uio.init(&iov_write);
+
+    // We need a mock NIC/Link to capture the packets
+    var fake_link = struct {
+        captured: std.ArrayList(u8),
+        fn writePacket(ptr: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            const hdr = pkt.header.view();
+            self.captured.appendSlice(hdr) catch return tcpip.Error.OutOfMemory;
+            for (pkt.data.views) |v| {
+                self.captured.appendSlice(v.view) catch return tcpip.Error.OutOfMemory;
+            }
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return 0;
+        }
+    }{ .captured = std.ArrayList(u8).init(allocator) };
+    defer fake_link.captured.deinit();
+
+    const link_ep = stack.LinkEndpoint{ .ptr = &fake_link, .vtable = &.{ .writePacket = @TypeOf(fake_link).writePacket, .attach = @TypeOf(fake_link).attach, .linkAddress = @TypeOf(fake_link).linkAddress, .mtu = @TypeOf(fake_link).mtu, .setMTU = @TypeOf(fake_link).setMTU, .capabilities = @TypeOf(fake_link).capabilities } };
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = ep.local_addr.?.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(ep.remote_addr.?.addr, .{ .addr = [_]u8{0} ** 6 });
+
+    _ = try ep.endpoint().writev(&uio_write, .{});
+
+    // Check if "hello world" is in captured data (after headers)
+    const captured = fake_link.captured.items;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "hello world") != null);
+
+    // Test readv
+    var rcv_buf1: [3]u8 = undefined;
+    var rcv_buf2: [10]u8 = undefined;
+    var iov_read = [_][]u8{ &rcv_buf1, &rcv_buf2 };
+    var uio_read = buffer.Uio.init(&iov_read);
+
+    // Inject data into rcv_list
+    const inject_data = "readv test";
+    const node = try tcp_proto.packet_node_pool.acquire();
+    node.data = .{ .data = try buffer.VectorisedView.fromSlice(inject_data, allocator, &s.cluster_pool), .seq = 1000 };
+    ep.rcv_list.append(node);
+    ep.rcv_buf_used = inject_data.len;
+    ep.rcv_view_count = 1;
+
+    const n = try ep.endpoint().readv(&uio_read, null);
+    try std.testing.expectEqual(@as(usize, 10), n);
+    try std.testing.expectEqualStrings("rea", &rcv_buf1);
+    try std.testing.expectEqualStrings("dv test", rcv_buf2[0..7]);
 }

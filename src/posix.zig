@@ -111,28 +111,70 @@ pub fn uaccept(sock: *Socket, addr: ?*std.posix.sockaddr, len: ?*std.posix.sockl
 
 pub fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
     _ = flags;
-    const view = try sock.endpoint.read(null);
-
-    const len = @min(buf.len, view.len);
-    @memcpy(buf[0..len], view[0..len]);
-    sock.allocator.free(view);
-    return len;
+    var iov = [_][]u8{buf};
+    var uio = buffer.Uio.init(&iov);
+    return sock.endpoint.readv(&uio, null) catch |err| {
+        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        return err;
+    };
 }
 
 pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
     _ = flags;
-    const Payloader = struct {
-        data: []const u8,
-        pub fn payloader(ctx: *@This()) tcpip.Payloader {
-            return .{ .ptr = ctx, .vtable = &.{ .fullPayload = fullPayload } };
-        }
-        fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
-            return @as(*@This(), @ptrCast(@alignCast(ptr))).data;
-        }
+    var iov = [_][]u8{@constCast(buf)};
+    var uio = buffer.Uio.init(&iov);
+    return sock.endpoint.writev(&uio, .{}) catch |err| {
+        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        return err;
     };
-    var fp = Payloader{ .data = buf };
+}
 
-    return sock.endpoint.write(fp.payloader(), .{});
+pub fn ureadv(sock: *Socket, iov: []const []u8) !usize {
+    var uio = buffer.Uio.init(iov);
+    return sock.endpoint.readv(&uio, null) catch |err| {
+        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        return err;
+    };
+}
+
+pub fn uwritev(sock: *Socket, iov: []const []u8) !usize {
+    var uio = buffer.Uio.init(iov);
+    return sock.endpoint.writev(&uio, .{}) catch |err| {
+        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        return err;
+    };
+}
+
+pub fn urecvfrom(sock: *Socket, buf: []u8, flags: u32, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !usize {
+    _ = flags;
+    var iov = [_][]u8{buf};
+    var uio = buffer.Uio.init(&iov);
+    var full_addr: tcpip.FullAddress = undefined;
+    const n = sock.endpoint.readv(&uio, &full_addr) catch |err| {
+        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        return err;
+    };
+    if (addr) |out_addr| {
+        toSockAddr(full_addr, out_addr, len);
+    }
+    return n;
+}
+
+pub fn usendto(sock: *Socket, buf: []const u8, flags: u32, addr: ?*const std.posix.sockaddr, len: std.posix.socklen_t) !usize {
+    _ = flags;
+    _ = len;
+    var iov = [_][]u8{@constCast(buf)};
+    var uio = buffer.Uio.init(&iov);
+    var opts = tcpip.WriteOptions{};
+    var full_addr: tcpip.FullAddress = undefined;
+    if (addr) |in_addr| {
+        full_addr = fromSockAddr(in_addr.*) catch return error.AddressFamilyNotSupported;
+        opts.to = &full_addr;
+    }
+    return sock.endpoint.writev(&uio, opts) catch |err| {
+        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        return err;
+    };
 }
 
 pub fn uclose(sock: *Socket) void {
