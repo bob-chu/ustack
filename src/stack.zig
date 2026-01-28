@@ -323,7 +323,13 @@ pub const NIC = struct {
 
         const addrs = proto.parseAddresses(pkt);
         if (!addrs.src.isAny()) {
-            self.stack.addLinkAddress(addrs.src, remote.*) catch {};
+            if (self.stack.link_addr_cache.get(addrs.src)) |prev| {
+                if (!prev.eq(remote.*)) {
+                    self.stack.addLinkAddress(addrs.src, remote.*) catch {};
+                }
+            } else {
+                self.stack.addLinkAddress(addrs.src, remote.*) catch {};
+            }
         }
 
         const r = Route{
@@ -487,7 +493,7 @@ pub const Stack = struct {
     allocator: std.mem.Allocator,
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
     endpoints: TransportTable,
-    link_addr_cache: std.AutoHashMap(tcpip.Address, tcpip.LinkAddress),
+    link_addr_cache: std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80),
     transport_protocols: std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol),
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
@@ -495,12 +501,21 @@ pub const Stack = struct {
     cluster_pool: buffer.ClusterPool,
     ephemeral_port: u16,
 
+    pub const AddressContext = struct {
+        pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
+            return key.hash();
+        }
+        pub fn eql(_: AddressContext, a: tcpip.Address, b: tcpip.Address) bool {
+            return a.eq(b);
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator) !Stack {
         return .{
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
             .endpoints = TransportTable.init(allocator),
-            .link_addr_cache = std.AutoHashMap(tcpip.Address, tcpip.LinkAddress).init(allocator),
+            .link_addr_cache = std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80).init(allocator),
             .transport_protocols = std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol).init(allocator),
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
@@ -534,9 +549,10 @@ pub const Stack = struct {
     }
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
-        const prev = try self.link_addr_cache.fetchPut(addr, link_addr);
-
-        if (prev != null and prev.?.value.eq(link_addr)) return;
+        if (self.link_addr_cache.get(addr)) |prev| {
+            if (prev.eq(link_addr)) return;
+        }
+        try self.link_addr_cache.put(addr, link_addr);
 
         // Notify all transport endpoints that they might be writable now (due to ARP resolution)
         var it = self.endpoints.endpoints.valueIterator();

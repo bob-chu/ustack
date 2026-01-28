@@ -47,7 +47,7 @@ pub const ARPProtocol = struct {
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
         _ = ptr;
-        
+
         const ep_opt = nic.network_endpoints.get(ProtocolNumber);
         if (ep_opt) |ep| {
             const arp_ep = @as(*ARPEndpoint, @ptrCast(@alignCast(ep.ptr)));
@@ -56,37 +56,39 @@ pub const ARPProtocol = struct {
                 if (!arp_ep.timer.active) {
                     nic.stack.timer_queue.schedule(&arp_ep.timer, 1000);
                 }
+
+                const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
+                defer nic.stack.allocator.free(hdr_buf);
+
+                var pre = buffer.Prependable.init(hdr_buf);
+                const arp_hdr = pre.prepend(header.ARPSize).?;
+                var h = header.ARP.init(arp_hdr);
+                h.setIPv4OverEthernet();
+                h.setOp(1); // Request
+                @memcpy(h.data[8..14], &nic.linkEP.linkAddress().addr);
+                @memcpy(h.data[14..18], &local_addr.v4);
+                @memcpy(h.data[24..28], &addr.v4);
+
+                const pb = tcpip.PacketBuffer{
+                    .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
+                    .header = pre,
+                };
+
+                const broadcast_hw = tcpip.LinkAddress{ .addr = [_]u8{0xff} ** 6 };
+                var r = stack.Route{
+                    .local_address = local_addr,
+                    .remote_address = addr,
+                    .local_link_address = nic.linkEP.linkAddress(),
+                    .remote_link_address = broadcast_hw,
+                    .net_proto = ProtocolNumber,
+                    .nic = nic,
+                };
+
+                return nic.linkEP.writePacket(&r, ProtocolNumber, pb);
             }
         }
 
-        const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
-        defer nic.stack.allocator.free(hdr_buf);
-
-        var pre = buffer.Prependable.init(hdr_buf);
-        const arp_hdr = pre.prepend(header.ARPSize).?;
-        var h = header.ARP.init(arp_hdr);
-        h.setIPv4OverEthernet();
-        h.setOp(1); // Request
-        @memcpy(h.data[8..14], &nic.linkEP.linkAddress().addr);
-        @memcpy(h.data[14..18], &local_addr.v4);
-        @memcpy(h.data[24..28], &addr.v4);
-
-        const pb = tcpip.PacketBuffer{
-            .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
-            .header = pre,
-        };
-
-        const broadcast_hw = tcpip.LinkAddress{ .addr = [_]u8{0xff} ** 6 };
-        var r = stack.Route{
-            .local_address = local_addr,
-            .remote_address = addr,
-            .local_link_address = nic.linkEP.linkAddress(),
-            .remote_link_address = broadcast_hw,
-            .net_proto = ProtocolNumber,
-            .nic = nic,
-        };
-
-        return nic.linkEP.writePacket(&r, ProtocolNumber, pb);
+        return;
     }
 
     fn newEndpoint(ptr: *anyopaque, nic: *stack.NIC, addr: tcpip.AddressWithPrefix, dispatcher: stack.TransportDispatcher) tcpip.Error!stack.NetworkEndpoint {
@@ -96,7 +98,7 @@ pub const ARPProtocol = struct {
         const ep = try nic.stack.allocator.create(ARPEndpoint);
         ep.* = .{
             .nic = nic,
-            .pending_requests = std.AutoHashMap(tcpip.Address, i64).init(nic.stack.allocator),
+            .pending_requests = std.HashMap(tcpip.Address, i64, stack.Stack.AddressContext, 80).init(nic.stack.allocator),
             .timer = time.Timer.init(ARPEndpoint.handleTimer, ep),
         };
         return ep.networkEndpoint();
@@ -105,7 +107,7 @@ pub const ARPProtocol = struct {
 
 pub const ARPEndpoint = struct {
     nic: *stack.NIC,
-    pending_requests: std.AutoHashMap(tcpip.Address, i64),
+    pending_requests: std.HashMap(tcpip.Address, i64, stack.Stack.AddressContext, 80),
     timer: time.Timer = undefined,
 
     pub fn networkEndpoint(self: *ARPEndpoint) stack.NetworkEndpoint {

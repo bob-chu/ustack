@@ -195,6 +195,31 @@ pub const TCP = struct {
 pub fn internetChecksum(data: []const u8, initial: u32) u32 {
     var sum: u32 = initial;
     var i: usize = 0;
+
+    const VectorSize = 32;
+    // SIMD Optimization for Little Endian (x86 AVX2 etc)
+    // Only engage for sufficient length
+    if (@import("builtin").cpu.arch.endian() == .little and data.len >= VectorSize) {
+        const VecU16 = @Vector(VectorSize / 2, u16);
+        const VecU32 = @Vector(VectorSize / 2, u32);
+        var acc: VecU32 = @splat(0);
+
+        while (i + VectorSize <= data.len) : (i += VectorSize) {
+            const ptr = data[i..].ptr;
+            // Load 32 bytes unaligned (usually safe on x86)
+            const chunk_u8: @Vector(VectorSize, u8) = @as(*const [VectorSize]u8, @ptrCast(ptr)).*;
+            const chunk_u16: VecU16 = @bitCast(chunk_u8);
+            // Algorithm uses Big Endian (network order) 16-bit words.
+            // On Little Endian hosts, we must swap the loaded words to match.
+            acc += @as(VecU32, @byteSwap(chunk_u16));
+        }
+
+        const arr: [VectorSize / 2]u32 = @bitCast(acc);
+        for (arr) |val| {
+            sum += val;
+        }
+    }
+
     while (i + 1 < data.len) : (i += 2) {
         sum += (@as(u32, data[i]) << 8) | data[i + 1];
     }

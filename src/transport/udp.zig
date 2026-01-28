@@ -391,13 +391,12 @@ pub const UDPEndpoint = struct {
             self.cached_route = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
         }
 
-        var r = self.cached_route.?;
+        var r = &self.cached_route.?;
         const next_hop = r.next_hop orelse to.addr;
 
         if (r.remote_link_address == null) {
             if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
-                self.cached_route.?.remote_link_address = link_addr;
             } else {
                 if (!self.retry_timer.active) {
                     self.stack.timer_queue.schedule(&self.retry_timer, 1000);
@@ -405,7 +404,7 @@ pub const UDPEndpoint = struct {
             }
         }
 
-        self.write(&r, to.port, data) catch |err| {
+        self.write(r, to.port, data) catch |err| {
             if (err == tcpip.Error.WouldBlock) {
                 if (!self.retry_timer.active) {
                     self.stack.timer_queue.schedule(&self.retry_timer, 1000);

@@ -16,6 +16,17 @@ pub const Address = union(enum) {
         };
     }
 
+    pub fn hash(self: Address) u64 {
+        var h = std.hash.Wyhash.init(0);
+        const tag = std.meta.activeTag(self);
+        h.update(std.mem.asBytes(&tag));
+        switch (self) {
+            .v4 => |v| h.update(&v),
+            .v6 => |v| h.update(&v),
+        }
+        return h.final();
+    }
+
     pub fn isAny(self: Address) bool {
         return switch (self) {
             .v4 => |v| std.mem.eql(u8, &v, &[_]u8{ 0, 0, 0, 0 }),
