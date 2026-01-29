@@ -38,8 +38,23 @@ pub const Cubic = struct {
         .onRetransmit = onRetransmit,
         .getCwnd = getCwnd,
         .getSsthresh = getSsthresh,
+        .reset = reset,
         .deinit = deinit,
     };
+
+    fn reset(ptr: *anyopaque, mss: u32) void {
+        const self = @as(*Cubic, @ptrCast(@alignCast(ptr)));
+        self.* = .{
+            .cwnd = 32 * mss,
+            .ssthresh = 1024 * 1024 * 4,
+            .mss = mss,
+            .w_max = 0,
+            .k = 0,
+            .epoch_start = 0,
+            .origin_point = 0,
+            .allocator = self.allocator,
+        };
+    }
 
     fn cubicUpdate(self: *Cubic) void {
         const now = std.time.milliTimestamp();

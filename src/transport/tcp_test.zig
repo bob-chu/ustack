@@ -11,12 +11,12 @@ const TCPProtocol = tcp.TCPProtocol;
 
 test "TCP Fast Retransmit" {
     const allocator = std.testing.allocator;
-    var s = try stack.Stack.init(allocator);
-    defer s.deinit();
     var ipv4_proto = ipv4.IPv4Protocol.init();
-    try s.registerNetworkProtocol(ipv4_proto.protocol());
     const tcp_proto = TCPProtocol.init(allocator);
     defer tcp_proto.deinit();
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
     try s.registerTransportProtocol(tcp_proto.protocol());
     var wq_server = waiter.Queue{};
     var ep_server = try allocator.create(TCPEndpoint);
@@ -89,12 +89,12 @@ test "TCP Fast Retransmit" {
 
 test "TCP Retransmission" {
     const allocator = std.testing.allocator;
-    var s = try stack.Stack.init(allocator);
-    defer s.deinit();
     var ipv4_proto = ipv4.IPv4Protocol.init();
-    try s.registerNetworkProtocol(ipv4_proto.protocol());
     const tcp_proto = TCPProtocol.init(allocator);
     defer tcp_proto.deinit();
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
     try s.registerTransportProtocol(tcp_proto.protocol());
     var fake_ep = struct {
         last_pkt: ?[]u8 = null,
@@ -168,6 +168,7 @@ test "TCP Retransmission" {
 
     const accept_res = try ep_server.endpoint().accept();
     const ep_accepted = @as(*TCPEndpoint, @ptrCast(@alignCast(accept_res.ep.ptr)));
+    defer ep_accepted.decRef();
     defer accept_res.ep.close();
     const FakePayloader = struct {
         data: []const u8,
@@ -186,13 +187,14 @@ test "TCP Retransmission" {
 
 test "TCP CWND Enforcement" {
     const allocator = std.testing.allocator;
-    var s = try stack.Stack.init(allocator);
-    defer s.deinit();
     var ipv4_proto = ipv4.IPv4Protocol.init();
-    try s.registerNetworkProtocol(ipv4_proto.protocol());
     const tcp_proto = TCPProtocol.init(allocator);
     defer tcp_proto.deinit();
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
     try s.registerTransportProtocol(tcp_proto.protocol());
+
     var fake_link = struct {
         fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
             return;
@@ -259,13 +261,14 @@ test "TCP CWND Enforcement" {
 
 test "TCP SACK Blocks Generation" {
     const allocator = std.testing.allocator;
-    var s = try stack.Stack.init(allocator);
-    defer s.deinit();
     var ipv4_proto = ipv4.IPv4Protocol.init();
-    try s.registerNetworkProtocol(ipv4_proto.protocol());
     const tcp_proto = TCPProtocol.init(allocator);
     defer tcp_proto.deinit();
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
     try s.registerTransportProtocol(tcp_proto.protocol());
+
     var wq = waiter.Queue{};
     var ep = try allocator.create(TCPEndpoint);
     ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
@@ -299,12 +302,12 @@ test "TCP SACK Blocks Generation" {
 
 test "TCP readv/writev zero-copy" {
     const allocator = std.testing.allocator;
-    var s = try stack.Stack.init(allocator);
-    defer s.deinit();
     var ipv4_proto = ipv4.IPv4Protocol.init();
-    try s.registerNetworkProtocol(ipv4_proto.protocol());
     const tcp_proto = TCPProtocol.init(allocator);
     defer tcp_proto.deinit();
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
     try s.registerTransportProtocol(tcp_proto.protocol());
 
     var wq = waiter.Queue{};

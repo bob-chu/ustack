@@ -82,15 +82,29 @@ pub const Queue = struct {
     pub fn notify(self: *Queue, mask: EventMask) void {
         self.ready_mask |= mask;
 
+        // Use a snapshot of entries to avoid issues with entries being
+        // added or removed during the notification loop.
+        var snapshot: [128]*Entry = undefined;
+        var count: usize = 0;
+
         var current = self.head;
         while (current) |e| {
-            const next = e.next;
+            if (count >= 128) break;
+            snapshot[count] = e;
+            count += 1;
+            current = e.next;
+        }
+
+        for (snapshot[0..count]) |e| {
+            // Re-verify if the entry is still "active" in ustack terms.
+            // In this stack, unregistered entries have null next/prev.
+            if (e.prev == null and self.head != e) continue;
+
             if ((mask & e.mask) != 0) {
                 if (e.callback) |cb| {
                     cb(e);
                 }
             }
-            current = next;
         }
     }
 

@@ -109,7 +109,7 @@ pub const ICMPv6PacketHandler = struct {
         const v = mut_pkt.data.first() orelse return;
         var h = header.ICMPv6.init(v);
 
-        switch (h.@"type"()) {
+        switch (h.type()) {
             header.ICMPv6EchoRequestType => {
                 const payload = mut_pkt.data.toView(s.allocator) catch return;
                 defer s.allocator.free(payload);
@@ -151,9 +151,8 @@ pub const ICMPv6PacketHandler = struct {
                     if (v[header.ICMPv6MinimumSize + 20] == header.ICMPv6OptionSourceLinkLayerAddress) {
                         var mac: tcpip.LinkAddress = undefined;
                         @memcpy(&mac.addr, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
-                        
-                        s.link_addr_cache.put(r.remote_address, mac) catch {};
-                        
+
+                        s.addLinkAddress(r.remote_address, mac) catch {};
                     }
                 }
 
@@ -219,9 +218,7 @@ pub const ICMPv6PacketHandler = struct {
                         var mac: tcpip.LinkAddress = undefined;
                         @memcpy(&mac.addr, v[header.ICMPv6MinimumSize + 22 .. header.ICMPv6MinimumSize + 28]);
 
-                        
-                        s.link_addr_cache.put(.{ .v6 = target }, mac) catch {};
-                        
+                        s.addLinkAddress(.{ .v6 = target }, mac) catch {};
                     }
                 }
             },
@@ -240,9 +237,7 @@ pub const ICMPv6PacketHandler = struct {
 
                     // Learn router's MAC
                     if (r.remote_link_address) |mac| {
-                        
-                        s.link_addr_cache.put(r.remote_address, mac) catch {};
-                        
+                        s.addLinkAddress(r.remote_address, mac) catch {};
                     }
                 }
 
@@ -407,7 +402,7 @@ test "ICMPv6 Neighbor Discovery" {
 
     ICMPv6PacketHandler.handlePacket(&s, &r, ns_pkt);
 
-    const learned_mac = s.link_addr_cache.get(.{ .v6 = sender_addr });
+    const learned_mac = s.getLinkAddress(.{ .v6 = sender_addr });
     try std.testing.expect(learned_mac != null);
     try std.testing.expectEqualStrings(&sender_mac, &learned_mac.?.addr);
 
@@ -415,7 +410,7 @@ test "ICMPv6 Neighbor Discovery" {
     const na_pkt_data = fake_link.last_pkt.?;
     try std.testing.expect(na_pkt_data.len >= 40 + 28);
     const na_icmp = header.ICMPv6.init(na_pkt_data[40..]);
-    try std.testing.expectEqual(header.ICMPv6NeighborAdvertisementType, na_icmp.@"type"());
+    try std.testing.expectEqual(header.ICMPv6NeighborAdvertisementType, na_icmp.type());
 
     const na = header.ICMPv6NA.init(na_pkt_data[40 + header.ICMPv6MinimumSize ..]);
     try std.testing.expectEqualStrings(&my_addr, &na.targetAddress());

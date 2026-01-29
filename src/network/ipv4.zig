@@ -114,6 +114,7 @@ pub const IPv4Endpoint = struct {
         .writePacket = writePacket,
         .writePackets = writePackets,
         .handlePacket = handlePacket,
+        .handlePackets = handlePackets,
         .mtu = mtu,
         .close = close,
     };
@@ -145,7 +146,7 @@ pub const IPv4Endpoint = struct {
         var remote_link_address = r.remote_link_address;
         if (remote_link_address == null) {
             const next_hop = r.next_hop orelse r.remote_address;
-            remote_link_address = self.nic.stack.link_addr_cache.get(next_hop);
+            remote_link_address = self.nic.stack.getLinkAddress(next_hop);
         }
 
         if (remote_link_address == null) {
@@ -161,10 +162,10 @@ pub const IPv4Endpoint = struct {
         var mut_packets_storage: [64]tcpip.PacketBuffer = undefined;
         if (packets.len > 64) return tcpip.Error.MessageTooLong;
         const mut_packets = mut_packets_storage[0..packets.len];
-        
+
         for (packets, 0..) |pkt, i| {
             if (pkt.data.size > max_payload) return tcpip.Error.MessageTooLong;
-            
+
             var mut_pkt = pkt;
             const ip_header = mut_pkt.header.prepend(header.IPv4MinimumSize) orelse return tcpip.Error.NoBufferSpace;
             const h = header.IPv4.init(ip_header);
@@ -172,17 +173,84 @@ pub const IPv4Endpoint = struct {
             @memset(ip_header, 0);
             ip_header[0] = 0x45;
             const total_len = @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size));
-            std.mem.writeInt(u16, ip_header[2..4][0..2][0..2], total_len, .big);
+            std.mem.writeInt(u16, ip_header[2..4][0..2], total_len, .big);
             ip_header[8] = 64;
             ip_header[9] = @as(u8, @intCast(protocol));
             @memcpy(ip_header[12..16], &r.local_address.v4);
             @memcpy(ip_header[16..20], &r.remote_address.v4);
             h.setChecksum(h.calculateChecksum());
-            
+
             mut_packets[i] = mut_pkt;
         }
 
         return self.nic.linkEP.writePackets(&mut_r, ProtocolNumber, mut_packets);
+    }
+
+    fn handlePackets(ptr: *anyopaque, r: *const stack.Route, packets: []tcpip.PacketBuffer) void {
+        const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
+
+        var current_proto: ?u8 = null;
+        var current_src: tcpip.Address = undefined;
+        var current_dst: tcpip.Address = undefined;
+        var batch_start: usize = 0;
+
+        for (0..packets.len) |i| {
+            var mut_pkt = &packets[i];
+            const headerView = mut_pkt.data.first() orelse continue;
+            const h = header.IPv4.init(headerView);
+
+            if (!h.isValid(mut_pkt.data.size)) continue;
+
+            if (h.moreFragments() or h.fragmentOffset() > 0) {
+                // Fall back to slow path for fragments
+                handlePacket(ptr, r, mut_pkt.*);
+                continue;
+            }
+
+            const hlen = h.headerLength();
+            mut_pkt.network_header = headerView[0..hlen];
+            const tlen = h.totalLength();
+            mut_pkt.data.trimFront(hlen);
+            mut_pkt.data.capLength(tlen - hlen);
+
+            const p = h.protocol();
+            const src = tcpip.Address{ .v4 = h.sourceAddress() };
+            const dst = tcpip.Address{ .v4 = h.destinationAddress() };
+
+            if (current_proto == null) {
+                current_proto = p;
+                current_src = src;
+                current_dst = dst;
+            } else if (p != current_proto.? or !src.eq(current_src) or !dst.eq(current_dst)) {
+                // Flush batch to transport dispatcher
+                const mut_r = stack.Route{
+                    .local_address = current_dst,
+                    .remote_address = current_src,
+                    .local_link_address = r.local_link_address,
+                    .remote_link_address = r.remote_link_address,
+                    .net_proto = ProtocolNumber,
+                    .nic = self.nic,
+                };
+                self.dispatcher.deliverTransportPackets(&mut_r, current_proto.?, packets[batch_start..i]);
+
+                current_proto = p;
+                current_src = src;
+                current_dst = dst;
+                batch_start = i;
+            }
+        }
+
+        if (current_proto != null) {
+            const mut_r = stack.Route{
+                .local_address = current_dst,
+                .remote_address = current_src,
+                .local_link_address = r.local_link_address,
+                .remote_link_address = r.remote_link_address,
+                .net_proto = ProtocolNumber,
+                .nic = self.nic,
+            };
+            self.dispatcher.deliverTransportPackets(&mut_r, current_proto.?, packets[batch_start..]);
+        }
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {

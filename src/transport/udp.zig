@@ -395,7 +395,7 @@ pub const UDPEndpoint = struct {
         const next_hop = r.next_hop orelse to.addr;
 
         if (r.remote_link_address == null) {
-            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
+            if (self.stack.getLinkAddress(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
             } else {
                 if (!self.retry_timer.active) {

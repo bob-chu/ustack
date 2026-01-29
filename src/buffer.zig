@@ -125,6 +125,16 @@ pub fn Pool(comptime T: type) type {
             self.free_list = node;
             self.count += 1;
         }
+
+        pub fn tryRelease(self: *Self, node: *T) bool {
+            if (self.count >= self.capacity) {
+                return false;
+            }
+            node.next = self.free_list;
+            self.free_list = node;
+            self.count += 1;
+            return true;
+        }
     };
 }
 

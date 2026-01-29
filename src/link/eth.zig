@@ -36,7 +36,7 @@ pub const EthernetEndpoint = struct {
 
     fn writePackets(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
-        
+
         const dst = if (r) |route| (if (route.remote_link_address) |la| la.addr else [_]u8{0xff} ** 6) else [_]u8{0xff} ** 6;
         const src = if (r) |route| route.local_link_address.addr else self.addr.addr;
 
@@ -78,29 +78,64 @@ pub const EthernetEndpoint = struct {
             .ptr = self,
             .vtable = &.{
                 .deliverNetworkPacket = deliverNetworkPacket,
+                .deliverNetworkPackets = deliverNetworkPackets,
             },
         };
         self.lower.attach(&self.wrapped_dispatcher);
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+        const packets = [_]tcpip.PacketBuffer{pkt};
+        deliverNetworkPackets(ptr, remote, local, protocol, &packets);
+    }
+
+    fn deliverNetworkPackets(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
         _ = remote;
         _ = local;
         _ = protocol;
-        var mut_pkt = pkt;
-        const v = mut_pkt.data.first() orelse return;
-        if (v.len < header.EthernetMinimumSize) return;
-
-        const eth = header.Ethernet.init(v);
-        const p = eth.etherType();
-        mut_pkt.link_header = v[0..header.EthernetMinimumSize];
-        mut_pkt.data.trimFront(header.EthernetMinimumSize);
 
         if (self.dispatcher) |d| {
-            const src = tcpip.LinkAddress{ .addr = eth.sourceAddress() };
-            const dst = tcpip.LinkAddress{ .addr = eth.destinationAddress() };
-            d.deliverNetworkPacket(&src, &dst, p, mut_pkt);
+            var mut_packets_storage: [128]tcpip.PacketBuffer = undefined;
+            const count = @min(packets.len, mut_packets_storage.len);
+            const mut_packets = mut_packets_storage[0..count];
+
+            var current_proto: ?tcpip.NetworkProtocolNumber = null;
+            var current_src: tcpip.LinkAddress = undefined;
+            var current_dst: tcpip.LinkAddress = undefined;
+            var batch_start: usize = 0;
+
+            for (0..count) |i| {
+                var mut_pkt = packets[i];
+                const v = mut_pkt.data.first() orelse continue;
+                if (v.len < header.EthernetMinimumSize) continue;
+
+                const eth = header.Ethernet.init(v);
+                const p = eth.etherType();
+                const src = tcpip.LinkAddress{ .addr = eth.sourceAddress() };
+                const dst = tcpip.LinkAddress{ .addr = eth.destinationAddress() };
+
+                mut_pkt.link_header = v[0..header.EthernetMinimumSize];
+                mut_pkt.data.trimFront(header.EthernetMinimumSize);
+                mut_packets[i] = mut_pkt;
+
+                if (current_proto == null) {
+                    current_proto = p;
+                    current_src = src;
+                    current_dst = dst;
+                } else if (p != current_proto.? or !src.eq(current_src) or !dst.eq(current_dst)) {
+                    // Flush existing batch
+                    d.deliverNetworkPackets(&current_src, &current_dst, current_proto.?, mut_packets[batch_start..i]);
+                    current_proto = p;
+                    current_src = src;
+                    current_dst = dst;
+                    batch_start = i;
+                }
+            }
+
+            if (current_proto != null) {
+                d.deliverNetworkPackets(&current_src, &current_dst, current_proto.?, mut_packets[batch_start..count]);
+            }
         }
     }
 

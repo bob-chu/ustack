@@ -10,6 +10,7 @@ pub const AfPacket = struct {
     allocator: std.mem.Allocator,
     cluster_pool: *buffer.ClusterPool,
     view_pool: buffer.BufferPool,
+    slot_pool: buffer.Pool(SlotContext),
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     if_index: i32 = 0,
@@ -22,6 +23,13 @@ pub const AfPacket = struct {
     tx_idx: usize = 0,
     frame_size: u32,
     frame_nr: u32,
+
+    const SlotContext = struct {
+        driver: *AfPacket,
+        slot_hdr: *volatile header.tpacket2_hdr,
+        next: ?*SlotContext = null,
+        prev: ?*SlotContext = null,
+    };
 
     pub fn init(allocator: std.mem.Allocator, pool: *buffer.ClusterPool, dev_name: []const u8) !AfPacket {
         const protocol = @as(u16, @bitCast(std.mem.nativeToBig(u16, header.ETH_P_ALL)));
@@ -77,6 +85,7 @@ pub const AfPacket = struct {
             .allocator = allocator,
             .cluster_pool = pool,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 1, 1024),
+            .slot_pool = buffer.Pool(SlotContext).init(allocator, 1024),
             .if_index = if_index,
             .address = .{ .addr = mac },
             .rx_ring = rx_ring_ptr,
@@ -195,10 +204,11 @@ pub const AfPacket = struct {
     pub fn readPacket(self: *AfPacket) !bool {
         var num_read: usize = 0;
         const max_batch = 128;
+        var packet_batch: [max_batch]tcpip.PacketBuffer = undefined;
 
         while (num_read < max_batch) {
             const slot = self.rx_ring[self.rx_idx * self.frame_size .. (self.rx_idx + 1) * self.frame_size];
-            var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
+            const h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
 
             const status = h.tp_status;
             if ((status & header.TP_STATUS_USER) == 0) break;
@@ -207,35 +217,54 @@ pub const AfPacket = struct {
             const data_start = h.tp_mac;
             const data = slot[data_start .. data_start + len];
 
-            const c = try self.cluster_pool.acquire();
-            @memcpy(c.data[0..len], data);
-
-            // Release slot back to kernel immediately
-            h.tp_status = header.TP_STATUS_KERNEL;
-            self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
-
+            // ZERO-COPY RX: Point directly to the ring slot memory
             const view_mem = try self.view_pool.acquire();
             const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
-            original_views[0] = .{ .cluster = c, .view = c.data[0..len] };
+            original_views[0] = .{ .cluster = null, .view = data };
+
+            const ctx = try self.slot_pool.acquire();
+            ctx.driver = self;
+            ctx.slot_hdr = h;
+
+            var vec_view = buffer.VectorisedView.init(len, original_views[0..1]);
+            vec_view.original_views = original_views;
+            vec_view.view_pool = &self.view_pool;
+            vec_view.consumption_callback = .{
+                .ptr = ctx,
+                .run = slotConsumptionCallback,
+            };
 
             const pkt = tcpip.PacketBuffer{
-                .data = buffer.VectorisedView.init(len, original_views[0..1]),
+                .data = vec_view,
                 .header = buffer.Prependable.init(&[_]u8{}),
             };
-            var mut_pkt = pkt;
-            mut_pkt.data.original_views = original_views;
-            mut_pkt.data.view_pool = &self.view_pool;
 
+            packet_batch[num_read] = pkt;
+            num_read += 1;
+
+            // Move to next slot but DON'T release it yet
+            self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
+        }
+
+        if (num_read > 0) {
             if (self.dispatcher) |d| {
                 const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
-                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, mut_pkt);
+                d.deliverNetworkPackets(&dummy_mac, &dummy_mac, 0, packet_batch[0..num_read]);
             }
 
-            mut_pkt.data.deinit();
-            num_read += 1;
+            for (0..num_read) |i| {
+                packet_batch[i].data.deinit();
+            }
         }
 
         return num_read > 0;
+    }
+
+    fn slotConsumptionCallback(ptr: *anyopaque, size: usize) void {
+        _ = size;
+        const ctx = @as(*SlotContext, @ptrCast(@alignCast(ptr)));
+        ctx.slot_hdr.tp_status = header.TP_STATUS_KERNEL;
+        ctx.driver.slot_pool.release(ctx);
     }
 
     fn getIfIndex(fd: std.posix.fd_t, name: []const u8) !i32 {

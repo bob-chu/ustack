@@ -20,6 +20,7 @@ pub const TCPProtocol = struct {
     segment_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node),
     packet_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node),
     accept_node_pool: buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node),
+    endpoint_pool: buffer.Pool(TCPEndpoint),
 
     pub fn init(allocator: std.mem.Allocator) *TCPProtocol {
         const self = allocator.create(TCPProtocol) catch unreachable;
@@ -30,6 +31,7 @@ pub const TCPProtocol = struct {
             .segment_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node).init(allocator, 131072),
             .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 131072),
             .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 4096),
+            .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 16384),
         };
         return self;
     }
@@ -40,6 +42,16 @@ pub const TCPProtocol = struct {
         self.segment_node_pool.deinit();
         self.packet_node_pool.deinit();
         self.accept_node_pool.deinit();
+
+        // Properly destroy pooled endpoints
+        var current = self.endpoint_pool.free_list;
+        while (current) |ep| {
+            // std.debug.print("Cleaning up pooled endpoint {p}\n", .{ep});
+            ep.deinit_resources();
+            current = ep.next;
+        }
+        self.endpoint_pool.deinit();
+
         self.allocator.destroy(self);
     }
 
@@ -62,8 +74,16 @@ pub const TCPProtocol = struct {
     fn newEndpoint(ptr: *anyopaque, s: *stack.Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
         const self = @as(*TCPProtocol, @ptrCast(@alignCast(ptr)));
         _ = net_proto;
-        const ep = s.allocator.create(TCPEndpoint) catch return tcpip.Error.OutOfMemory;
-        ep.* = try TCPEndpoint.init(s, self, wait_queue, 1460);
+        const ep = try self.endpoint_pool.acquire();
+        errdefer self.endpoint_pool.release(ep);
+
+        if (!ep.is_pooled) {
+            ep.* = TCPEndpoint.init(s, self, wait_queue, 1460) catch return tcpip.Error.OutOfMemory;
+            ep.is_pooled = true;
+        } else {
+            try ep.reset(s, self, wait_queue, 1460);
+        }
+        ep.ref_count = 1;
         ep.retransmit_timer.context = ep;
         return ep.endpoint();
     }
@@ -73,7 +93,9 @@ pub const TCPProtocol = struct {
         const ep_opt = r.nic.stack.endpoints.get(id);
         if (ep_opt) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
+            tcp_ep.ref_count += 1;
             tcp_ep.handlePacket(r, id, pkt);
+            tcp_ep.decRef();
             ep.decRef();
             return;
         }
@@ -89,7 +111,9 @@ pub const TCPProtocol = struct {
         };
         if (r.nic.stack.endpoints.get(listener_id)) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
+            tcp_ep.ref_count += 1;
             tcp_ep.handlePacket(r, id, pkt);
+            tcp_ep.decRef();
             ep.decRef();
             return;
         }
@@ -108,7 +132,9 @@ pub const TCPProtocol = struct {
         };
         if (r.nic.stack.endpoints.get(any_id)) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
+            tcp_ep.ref_count += 1;
             tcp_ep.handlePacket(r, id, pkt);
+            tcp_ep.decRef();
             ep.decRef();
             return;
         }
@@ -174,7 +200,12 @@ pub const TCPEndpoint = struct {
 
     cc: congestion.CongestionControl,
     ref_count: usize = 1,
+    is_destroying: bool = false,
     cached_route: ?stack.Route = null,
+
+    is_pooled: bool = false,
+    next: ?*TCPEndpoint = null,
+    prev: ?*TCPEndpoint = null,
 
     accepted_queue: std.TailQueue(tcpip.AcceptReturn) = .{},
     rcv_list: std.TailQueue(Packet) = .{},
@@ -328,7 +359,7 @@ pub const TCPEndpoint = struct {
         var r = self.cached_route.?;
         const next_hop = r.next_hop orelse ra.addr;
         if (r.remote_link_address == null) {
-            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
+            if (self.stack.getLinkAddress(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
                 self.cached_route.?.remote_link_address = link_addr;
             }
@@ -534,7 +565,7 @@ pub const TCPEndpoint = struct {
         var r = self.cached_route.?;
         const next_hop = r.next_hop orelse ra.addr;
         if (r.remote_link_address == null) {
-            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
+            if (self.stack.getLinkAddress(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
                 self.cached_route.?.remote_link_address = link_addr;
             }
@@ -634,7 +665,7 @@ pub const TCPEndpoint = struct {
                 var r = self.cached_route.?;
                 const next_hop = r.next_hop orelse ra.addr;
                 if (r.remote_link_address == null) {
-                    if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
+                    if (self.stack.getLinkAddress(next_hop)) |link_addr| {
                         r.remote_link_address = link_addr;
                         self.cached_route.?.remote_link_address = link_addr;
                     }
@@ -697,11 +728,20 @@ pub const TCPEndpoint = struct {
         self.ref_count += 1;
     }
     pub fn decRef(self: *TCPEndpoint) void {
+        if (self.ref_count == 0) return;
         self.ref_count -= 1;
-        if (self.ref_count == 0) self.destroy();
+        if (self.ref_count == 0) {
+            if (self.is_destroying) return;
+            self.is_destroying = true;
+            self.cleanup_internal();
+            if (!self.proto.endpoint_pool.tryRelease(self)) {
+                self.deinit_resources();
+                self.stack.allocator.destroy(self);
+            }
+        }
     }
 
-    fn destroy(self: *TCPEndpoint) void {
+    fn cleanup_internal(self: *TCPEndpoint) void {
         if (self.local_addr) |la| {
             const ra = self.remote_addr orelse tcpip.FullAddress{
                 .nic = 0,
@@ -717,38 +757,77 @@ pub const TCPEndpoint = struct {
                 .remote_port = ra.port,
                 .remote_address = ra.addr,
             };
-            self.stack.unregisterTransportEndpoint(id);
+            self.local_addr = null;
+            // Unregister without decRef because we are already destroying (ref count reached 0)
+            _ = self.stack.unregisterTransportEndpointNoDecRef(id);
         }
-
-        self.syncache.deinit();
-        self.sack_blocks.deinit();
-        self.peer_sack_blocks.deinit();
 
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
-
         while (self.ooo_list.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
-
         while (self.accepted_queue.popFirst()) |node| {
             node.data.ep.close();
             self.proto.accept_node_pool.release(node);
         }
-
-        if (self.owns_waiter_queue) self.stack.allocator.destroy(self.waiter_queue);
-
-        self.stack.timer_queue.cancel(&self.retransmit_timer);
-        self.cc.deinit();
-
         while (self.snd_queue.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.segment_node_pool.release(node);
         }
+        self.stack.timer_queue.cancel(&self.retransmit_timer);
 
+        if (self.owns_waiter_queue) {
+            self.stack.allocator.destroy(self.waiter_queue);
+            self.owns_waiter_queue = false;
+        }
+    }
+
+    fn deinit_resources(self: *TCPEndpoint) void {
+        self.cleanup_internal();
+        self.syncache.deinit();
+        self.sack_blocks.deinit();
+        self.peer_sack_blocks.deinit();
+        self.cc.deinit();
+    }
+
+    pub fn reset(self: *TCPEndpoint, s: *stack.Stack, proto: *TCPProtocol, wq: *waiter.Queue, mss: u16) !void {
+        self.cleanup_internal();
+
+        self.stack = s;
+        self.proto = proto;
+        self.waiter_queue = wq;
+        self.state = .initial;
+        self.is_destroying = false;
+        self.local_addr = null;
+        self.remote_addr = null;
+        self.snd_nxt = 1000;
+        self.rcv_nxt = 0;
+        self.rcv_buf_used = 0;
+        self.rcv_view_count = 0;
+        self.rcv_wnd = self.rcv_wnd_max;
+        self.snd_wnd = 65535;
+        self.cached_route = null;
+        self.dup_ack_count = 0;
+        self.last_ack = 0;
+        self.rcv_packets_since_ack = 0;
+        self.retransmit_count = 0;
+        self.ts_enabled = false;
+        self.ts_recent = 0;
+        self.max_segment_size = mss;
+
+        self.syncache.clearRetainingCapacity();
+        self.sack_blocks.clearRetainingCapacity();
+        self.peer_sack_blocks.clearRetainingCapacity();
+
+        try self.cc.reset(mss);
+    }
+
+    fn destroy(self: *TCPEndpoint) void {
+        self.deinit_resources();
         self.stack.allocator.destroy(self);
     }
 
@@ -892,7 +971,7 @@ pub const TCPEndpoint = struct {
             self.cached_route = try self.stack.findRoute(addr.nic, la.addr, addr.addr, net_proto);
         }
         var r = self.cached_route.?;
-        if (self.stack.link_addr_cache.get(addr.addr)) |link_addr| r.remote_link_address = link_addr;
+        if (self.stack.getLinkAddress(addr.addr)) |link_addr| r.remote_link_address = link_addr;
         const options_len: u8 = if (self.ts_enabled) 24 else 12;
         const hdr_buf = self.proto.header_pool.acquire() catch return tcpip.Error.OutOfMemory;
         errdefer self.proto.header_pool.release(hdr_buf);
@@ -1097,20 +1176,30 @@ pub const TCPEndpoint = struct {
                     }
                     if (found_idx) |idx| {
                         const entry = self.syncache.swapRemove(idx);
-                        const new_ep = self.stack.allocator.create(TCPEndpoint) catch return;
+                        const new_ep = self.proto.endpoint_pool.acquire() catch return;
+                        errdefer self.proto.endpoint_pool.release(new_ep);
+
                         const new_wq = self.stack.allocator.create(waiter.Queue) catch {
-                            self.stack.allocator.destroy(new_ep);
                             return;
                         };
                         new_wq.* = .{};
-                        new_ep.* = TCPEndpoint.init(self.stack, self.proto, new_wq, entry.mss) catch {
-                            self.stack.allocator.destroy(new_wq);
-                            self.stack.allocator.destroy(new_ep);
-                            return;
-                        };
+                        errdefer self.stack.allocator.destroy(new_wq);
+
+                        if (!new_ep.is_pooled) {
+                            new_ep.* = TCPEndpoint.init(self.stack, self.proto, new_wq, entry.mss) catch {
+                                return;
+                            };
+                            new_ep.is_pooled = true;
+                        } else {
+                            new_ep.reset(self.stack, self.proto, new_wq, entry.mss) catch {
+                                return;
+                            };
+                        }
+
                         new_ep.retransmit_timer.context = new_ep;
                         new_ep.owns_waiter_queue = true;
                         new_ep.state = .established;
+                        new_ep.ref_count = 1;
                         new_ep.rcv_nxt = entry.rcv_nxt;
                         new_ep.snd_nxt = entry.snd_nxt +% 1;
                         new_ep.last_ack = new_ep.snd_nxt;
@@ -1128,7 +1217,7 @@ pub const TCPEndpoint = struct {
                             new_ep.decRef();
                             return;
                         };
-                        const node = self.stack.allocator.create(std.TailQueue(tcpip.AcceptReturn).Node) catch {
+                        const node = self.proto.accept_node_pool.acquire() catch {
                             new_ep.decRef();
                             return;
                         };
