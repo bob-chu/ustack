@@ -30,6 +30,7 @@ pub const link = struct {
 pub const dns = @import("dns.zig");
 pub const posix = @import("posix.zig");
 pub const event_mux = @import("event_mux.zig");
+pub const stats = @import("stats.zig");
 
 pub const drivers = struct {
     pub const loopback = @import("drivers/loopback.zig");

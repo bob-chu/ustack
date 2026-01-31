@@ -3,6 +3,7 @@ const tcpip = @import("../tcpip.zig");
 const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const log = @import("../log.zig").scoped(.ipv4);
+const stats = @import("../stats.zig");
 
 const buffer = @import("../buffer.zig");
 
@@ -114,7 +115,6 @@ pub const IPv4Endpoint = struct {
         .writePacket = writePacket,
         .writePackets = writePackets,
         .handlePacket = handlePacket,
-        .handlePackets = handlePackets,
         .mtu = mtu,
         .close = close,
     };
@@ -146,7 +146,7 @@ pub const IPv4Endpoint = struct {
         var remote_link_address = r.remote_link_address;
         if (remote_link_address == null) {
             const next_hop = r.next_hop orelse r.remote_address;
-            remote_link_address = self.nic.stack.getLinkAddress(next_hop);
+            remote_link_address = self.nic.stack.link_addr_cache.get(next_hop);
         }
 
         if (remote_link_address == null) {
@@ -173,7 +173,7 @@ pub const IPv4Endpoint = struct {
             @memset(ip_header, 0);
             ip_header[0] = 0x45;
             const total_len = @as(u16, @intCast(mut_pkt.header.usedLength() + mut_pkt.data.size));
-            std.mem.writeInt(u16, ip_header[2..4][0..2], total_len, .big);
+            std.mem.writeInt(u16, ip_header[2..4][0..2][0..2], total_len, .big);
             ip_header[8] = 64;
             ip_header[9] = @as(u8, @intCast(protocol));
             @memcpy(ip_header[12..16], &r.local_address.v4);
@@ -183,74 +183,10 @@ pub const IPv4Endpoint = struct {
             mut_packets[i] = mut_pkt;
         }
 
+        // Increment IP TX stats
+        stats.global_stats.ip.tx_packets += mut_packets.len;
+
         return self.nic.linkEP.writePackets(&mut_r, ProtocolNumber, mut_packets);
-    }
-
-    fn handlePackets(ptr: *anyopaque, r: *const stack.Route, packets: []tcpip.PacketBuffer) void {
-        const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
-
-        var current_proto: ?u8 = null;
-        var current_src: tcpip.Address = undefined;
-        var current_dst: tcpip.Address = undefined;
-        var batch_start: usize = 0;
-
-        for (0..packets.len) |i| {
-            var mut_pkt = &packets[i];
-            const headerView = mut_pkt.data.first() orelse continue;
-            const h = header.IPv4.init(headerView);
-
-            if (!h.isValid(mut_pkt.data.size)) continue;
-
-            if (h.moreFragments() or h.fragmentOffset() > 0) {
-                // Fall back to slow path for fragments
-                handlePacket(ptr, r, mut_pkt.*);
-                continue;
-            }
-
-            const hlen = h.headerLength();
-            mut_pkt.network_header = headerView[0..hlen];
-            const tlen = h.totalLength();
-            mut_pkt.data.trimFront(hlen);
-            mut_pkt.data.capLength(tlen - hlen);
-
-            const p = h.protocol();
-            const src = tcpip.Address{ .v4 = h.sourceAddress() };
-            const dst = tcpip.Address{ .v4 = h.destinationAddress() };
-
-            if (current_proto == null) {
-                current_proto = p;
-                current_src = src;
-                current_dst = dst;
-            } else if (p != current_proto.? or !src.eq(current_src) or !dst.eq(current_dst)) {
-                // Flush batch to transport dispatcher
-                const mut_r = stack.Route{
-                    .local_address = current_dst,
-                    .remote_address = current_src,
-                    .local_link_address = r.local_link_address,
-                    .remote_link_address = r.remote_link_address,
-                    .net_proto = ProtocolNumber,
-                    .nic = self.nic,
-                };
-                self.dispatcher.deliverTransportPackets(&mut_r, current_proto.?, packets[batch_start..i]);
-
-                current_proto = p;
-                current_src = src;
-                current_dst = dst;
-                batch_start = i;
-            }
-        }
-
-        if (current_proto != null) {
-            const mut_r = stack.Route{
-                .local_address = current_dst,
-                .remote_address = current_src,
-                .local_link_address = r.local_link_address,
-                .remote_link_address = r.remote_link_address,
-                .net_proto = ProtocolNumber,
-                .nic = self.nic,
-            };
-            self.dispatcher.deliverTransportPackets(&mut_r, current_proto.?, packets[batch_start..]);
-        }
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, pkt: tcpip.PacketBuffer) void {
@@ -266,8 +202,12 @@ pub const IPv4Endpoint = struct {
         const csum_calc = header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0));
         if (csum_calc != 0) {
             log.warn("IPv4: Checksum failure from {any} (Calculated: 0x{x}, Header: 0x{x})", .{ h.sourceAddress(), csum_calc, h.checksum() });
+            stats.global_stats.ip.dropped_packets += 1;
             return;
         }
+
+        // Increment IP RX stats
+        stats.global_stats.ip.rx_packets += 1;
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {
             // log.debug("IPv4: Fragment received. offset={}, more={}", .{ h.fragmentOffset(), h.moreFragments() });

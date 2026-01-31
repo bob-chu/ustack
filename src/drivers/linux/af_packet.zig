@@ -4,13 +4,13 @@ const tcpip = @import("../../tcpip.zig");
 const header = @import("../../header.zig");
 const buffer = @import("../../buffer.zig");
 const log = @import("../../log.zig").scoped(.af_packet);
+const stats = @import("../../stats.zig");
 
 pub const AfPacket = struct {
     fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
     cluster_pool: *buffer.ClusterPool,
     view_pool: buffer.BufferPool,
-    slot_pool: buffer.Pool(SlotContext),
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     if_index: i32 = 0,
@@ -23,13 +23,6 @@ pub const AfPacket = struct {
     tx_idx: usize = 0,
     frame_size: u32,
     frame_nr: u32,
-
-    const SlotContext = struct {
-        driver: *AfPacket,
-        slot_hdr: *volatile header.tpacket2_hdr,
-        next: ?*SlotContext = null,
-        prev: ?*SlotContext = null,
-    };
 
     pub fn init(allocator: std.mem.Allocator, pool: *buffer.ClusterPool, dev_name: []const u8) !AfPacket {
         const protocol = @as(u16, @bitCast(std.mem.nativeToBig(u16, header.ETH_P_ALL)));
@@ -54,6 +47,9 @@ pub const AfPacket = struct {
 
         try std.posix.setsockopt(fd, 263, header.PACKET_RX_RING, std.mem.asBytes(&req));
         try std.posix.setsockopt(fd, 263, header.PACKET_TX_RING, std.mem.asBytes(&req));
+
+        const ignore_outgoing: i32 = 1;
+        try std.posix.setsockopt(fd, 263, 23, std.mem.asBytes(&ignore_outgoing)); // PACKET_IGNORE_OUTGOING
 
         const rx_ring_size = frame_size * frame_nr;
         const tx_ring_size = frame_size * frame_nr;
@@ -85,7 +81,6 @@ pub const AfPacket = struct {
             .allocator = allocator,
             .cluster_pool = pool,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 1, 1024),
-            .slot_pool = buffer.Pool(SlotContext).init(allocator, 1024),
             .if_index = if_index,
             .address = .{ .addr = mac },
             .rx_ring = rx_ring_ptr,
@@ -133,6 +128,7 @@ pub const AfPacket = struct {
 
     pub fn writePackets(self: *AfPacket, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
         var sent_any = false;
+        var total_bytes: usize = 0;
         for (packets) |pkt| {
             const slot = self.tx_ring[self.tx_idx * self.frame_size .. (self.tx_idx + 1) * self.frame_size];
             var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
@@ -144,7 +140,8 @@ pub const AfPacket = struct {
             }
 
             const hdr_view = pkt.header.view();
-            const data_off = @as(usize, std.mem.alignForward(usize, @sizeOf(header.tpacket2_hdr), 16));
+            const eth_off = @sizeOf(header.tpacket2_hdr);
+            const data_off = @as(usize, std.mem.alignForward(usize, eth_off, 16)); // eth_off, aligned to 16. Packet already has Ethernet header
             var current_off = data_off;
 
             @memcpy(slot[current_off .. current_off + hdr_view.len], hdr_view);
@@ -155,14 +152,22 @@ pub const AfPacket = struct {
                 current_off += v.view.len;
             }
 
-            h.tp_len = @as(u32, @intCast(pkt.header.usedLength() + pkt.data.size));
+            const total_len = current_off - data_off;
+            h.tp_mac = @as(u16, @intCast(data_off)); // Link layer header offset
+            h.tp_net = @as(u16, @intCast(data_off + 14)); // IP header is 14 bytes after Ethernet
+            h.tp_len = @as(u32, @intCast(total_len));
             h.tp_status = header.TP_STATUS_SEND_REQUEST;
 
+            total_bytes += total_len;
             self.tx_idx = (self.tx_idx + 1) % self.frame_nr;
             sent_any = true;
         }
 
         if (sent_any) {
+            // Increment link TX stats
+            stats.global_link_stats.tx_packets += packets.len;
+            stats.global_link_stats.tx_bytes += total_bytes;
+
             // Kick kernel
             _ = std.os.linux.syscall6(.sendto, @as(usize, @intCast(self.fd)), 0, 0, 0, 0, 0);
         }
@@ -204,11 +209,10 @@ pub const AfPacket = struct {
     pub fn readPacket(self: *AfPacket) !bool {
         var num_read: usize = 0;
         const max_batch = 128;
-        var packet_batch: [max_batch]tcpip.PacketBuffer = undefined;
 
         while (num_read < max_batch) {
             const slot = self.rx_ring[self.rx_idx * self.frame_size .. (self.rx_idx + 1) * self.frame_size];
-            const h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
+            var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
 
             const status = h.tp_status;
             if ((status & header.TP_STATUS_USER) == 0) break;
@@ -217,54 +221,48 @@ pub const AfPacket = struct {
             const data_start = h.tp_mac;
             const data = slot[data_start .. data_start + len];
 
-            // ZERO-COPY RX: Point directly to the ring slot memory
-            const view_mem = try self.view_pool.acquire();
-            const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
-            original_views[0] = .{ .cluster = null, .view = data };
-
-            const ctx = try self.slot_pool.acquire();
-            ctx.driver = self;
-            ctx.slot_hdr = h;
-
-            var vec_view = buffer.VectorisedView.init(len, original_views[0..1]);
-            vec_view.original_views = original_views;
-            vec_view.view_pool = &self.view_pool;
-            vec_view.consumption_callback = .{
-                .ptr = ctx,
-                .run = slotConsumptionCallback,
+            const c = self.cluster_pool.acquire() catch {
+                // Release slot back to kernel and skip packet
+                h.tp_status = header.TP_STATUS_KERNEL;
+                self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
+                stats.global_stats.tcp.pool_exhausted += 1;
+                continue;
             };
+            @memcpy(c.data[0..len], data);
+
+            // Increment link RX stats
+            stats.global_link_stats.rx_packets += 1;
+            stats.global_link_stats.rx_bytes += len;
+
+            // Release slot back to kernel immediately
+            h.tp_status = header.TP_STATUS_KERNEL;
+            self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
+
+            const view_mem = self.view_pool.acquire() catch {
+                stats.global_stats.tcp.pool_exhausted += 1;
+                continue;
+            };
+            const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
+            original_views[0] = .{ .cluster = c, .view = c.data[0..len] };
 
             const pkt = tcpip.PacketBuffer{
-                .data = vec_view,
+                .data = buffer.VectorisedView.init(len, original_views[0..1]),
                 .header = buffer.Prependable.init(&[_]u8{}),
             };
+            var mut_pkt = pkt;
+            mut_pkt.data.original_views = original_views;
+            mut_pkt.data.view_pool = &self.view_pool;
 
-            packet_batch[num_read] = pkt;
-            num_read += 1;
-
-            // Move to next slot but DON'T release it yet
-            self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
-        }
-
-        if (num_read > 0) {
             if (self.dispatcher) |d| {
                 const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
-                d.deliverNetworkPackets(&dummy_mac, &dummy_mac, 0, packet_batch[0..num_read]);
+                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, mut_pkt);
             }
 
-            for (0..num_read) |i| {
-                packet_batch[i].data.deinit();
-            }
+            mut_pkt.data.deinit();
+            num_read += 1;
         }
 
         return num_read > 0;
-    }
-
-    fn slotConsumptionCallback(ptr: *anyopaque, size: usize) void {
-        _ = size;
-        const ctx = @as(*SlotContext, @ptrCast(@alignCast(ptr)));
-        ctx.slot_hdr.tp_status = header.TP_STATUS_KERNEL;
-        ctx.driver.slot_pool.release(ctx);
     }
 
     fn getIfIndex(fd: std.posix.fd_t, name: []const u8) !i32 {

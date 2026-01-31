@@ -69,20 +69,10 @@ pub const NetworkDispatcher = struct {
 
     pub const VTable = struct {
         deliverNetworkPacket: *const fn (ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void,
-        deliverNetworkPackets: ?*const fn (ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, packets: []tcpip.PacketBuffer) void = null,
     };
 
     pub fn deliverNetworkPacket(self: NetworkDispatcher, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
         return self.vtable.deliverNetworkPacket(self.ptr, remote, local, protocol, pkt);
-    }
-
-    pub fn deliverNetworkPackets(self: NetworkDispatcher, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, packets: []tcpip.PacketBuffer) void {
-        if (self.vtable.deliverNetworkPackets) |f| {
-            return f(self.ptr, remote, local, protocol, packets);
-        }
-        for (packets) |p| {
-            self.vtable.deliverNetworkPacket(self.ptr, remote, local, protocol, p);
-        }
     }
 };
 
@@ -94,7 +84,6 @@ pub const NetworkEndpoint = struct {
         writePacket: *const fn (ptr: *anyopaque, r: *const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void,
         writePackets: ?*const fn (ptr: *anyopaque, r: *const Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void = null,
         handlePacket: *const fn (ptr: *anyopaque, r: *const Route, pkt: tcpip.PacketBuffer) void,
-        handlePackets: ?*const fn (ptr: *anyopaque, r: *const Route, packets: []tcpip.PacketBuffer) void = null,
         mtu: *const fn (ptr: *anyopaque) u32,
         close: ?*const fn (ptr: *anyopaque) void = null,
     };
@@ -114,15 +103,6 @@ pub const NetworkEndpoint = struct {
 
     pub fn handlePacket(self: NetworkEndpoint, r: *const Route, pkt: tcpip.PacketBuffer) void {
         return self.vtable.handlePacket(self.ptr, r, pkt);
-    }
-
-    pub fn handlePackets(self: NetworkEndpoint, r: *const Route, packets: []tcpip.PacketBuffer) void {
-        if (self.vtable.handlePackets) |f| {
-            return f(self.ptr, r, packets);
-        }
-        for (packets) |p| {
-            self.vtable.handlePacket(self.ptr, r, p);
-        }
     }
 
     pub fn mtu(self: NetworkEndpoint) u32 {
@@ -173,11 +153,15 @@ pub const TransportEndpointID = struct {
     pub fn hash(self: TransportEndpointID) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.asBytes(&self.local_port));
-        const la_h = self.local_address.hash();
-        h.update(std.mem.asBytes(&la_h));
+        switch (self.local_address) {
+            .v4 => |v| h.update(&v),
+            .v6 => |v| h.update(&v),
+        }
         h.update(std.mem.asBytes(&self.remote_port));
-        const ra_h = self.remote_address.hash();
-        h.update(std.mem.asBytes(&ra_h));
+        switch (self.remote_address) {
+            .v4 => |v| h.update(&v),
+            .v6 => |v| h.update(&v),
+        }
         return h.final();
     }
 
@@ -256,20 +240,10 @@ pub const TransportDispatcher = struct {
 
     pub const VTable = struct {
         deliverTransportPacket: *const fn (ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void,
-        deliverTransportPackets: ?*const fn (ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, packets: []tcpip.PacketBuffer) void = null,
     };
 
     pub fn deliverTransportPacket(self: TransportDispatcher, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
         return self.vtable.deliverTransportPacket(self.ptr, r, protocol, pkt);
-    }
-
-    pub fn deliverTransportPackets(self: TransportDispatcher, r: *const Route, protocol: tcpip.TransportProtocolNumber, packets: []tcpip.PacketBuffer) void {
-        if (self.vtable.deliverTransportPackets) |f| {
-            return f(self.ptr, r, protocol, packets);
-        }
-        for (packets) |p| {
-            self.vtable.deliverTransportPacket(self.ptr, r, protocol, p);
-        }
     }
 };
 
@@ -328,52 +302,46 @@ pub const NIC = struct {
             .ptr = self,
             .vtable = &.{
                 .deliverNetworkPacket = deliverNetworkPacket,
-                .deliverNetworkPackets = deliverNetworkPackets,
             },
         };
         self.linkEP.attach(&self.dispatcher);
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
-        var packets = [_]tcpip.PacketBuffer{pkt};
-        deliverNetworkPackets(ptr, remote, local, protocol, &packets);
-    }
-
-    fn deliverNetworkPackets(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, packets: []tcpip.PacketBuffer) void {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
+        // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
 
         const proto_opt = self.stack.network_protocols.get(protocol);
+
         if (proto_opt == null) return;
         const proto = proto_opt.?;
 
         const ep_opt = self.network_endpoints.get(protocol);
+
         if (ep_opt == null) return;
         const ep = ep_opt.?;
 
-        var last_src: ?tcpip.Address = null;
-
-        for (packets) |pkt| {
-            const addrs = proto.parseAddresses(pkt);
-            if (!addrs.src.isAny()) {
-                if (last_src == null or !addrs.src.eq(last_src.?)) {
-                    last_src = addrs.src;
+        const addrs = proto.parseAddresses(pkt);
+        if (!addrs.src.isAny()) {
+            if (self.stack.link_addr_cache.get(addrs.src)) |prev| {
+                if (!prev.eq(remote.*)) {
                     self.stack.addLinkAddress(addrs.src, remote.*) catch {};
                 }
+            } else {
+                self.stack.addLinkAddress(addrs.src, remote.*) catch {};
             }
         }
 
-        // Use a representative route for the batch
-        const addrs_first = proto.parseAddresses(packets[0]);
         const r = Route{
-            .local_address = addrs_first.dst,
-            .remote_address = addrs_first.src,
+            .local_address = addrs.dst,
+            .remote_address = addrs.src,
             .local_link_address = local.*,
             .remote_link_address = remote.*,
             .net_proto = protocol,
             .nic = self,
         };
 
-        ep.handlePackets(&r, packets);
+        ep.handlePacket(&r, pkt);
     }
 };
 
@@ -392,7 +360,7 @@ pub const Route = struct {
         const next_hop = self.next_hop orelse self.remote_address;
 
         if (self.remote_link_address == null) {
-            const link_addr_opt = self.nic.stack.getLinkAddress(next_hop);
+            const link_addr_opt = self.nic.stack.link_addr_cache.get(next_hop);
 
             if (link_addr_opt) |link_addr| {
                 self.remote_link_address = link_addr;
@@ -503,38 +471,19 @@ pub const TransportTable = struct {
     }
 
     pub fn deinit(self: *TransportTable) void {
-        while (self.endpoints.count() > 0) {
-            var it = self.endpoints.iterator();
-            const entry = it.next().?;
-            const id = entry.key_ptr.*;
-            _ = self.remove(id);
-        }
         self.endpoints.deinit();
     }
 
     pub fn put(self: *TransportTable, id: TransportEndpointID, ep: TransportEndpoint) !void {
-        const result = try self.endpoints.fetchPut(id, ep);
-        if (result) |kv| {
-            kv.value.decRef();
-        }
-        ep.incRef();
+        try self.endpoints.put(id, ep);
+    }
+
+    pub fn fetchRemove(self: *TransportTable, id: TransportEndpointID) ?std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).KV {
+        return self.endpoints.fetchRemove(id);
     }
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
-        const kv = self.endpoints.fetchRemove(id);
-        if (kv) |entry| {
-            entry.value.decRef();
-            return true;
-        }
-        return false;
-    }
-
-    pub fn removeReturningEndpoint(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
-        const kv = self.endpoints.fetchRemove(id);
-        if (kv) |entry| {
-            return entry.value;
-        }
-        return null;
+        return self.endpoints.remove(id);
     }
 
     pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
@@ -548,18 +497,13 @@ pub const Stack = struct {
     allocator: std.mem.Allocator,
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
     endpoints: TransportTable,
-    link_addr_cache: std.HashMap(tcpip.Address, CachedLinkAddress, AddressContext, 80),
+    link_addr_cache: std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80),
     transport_protocols: std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol),
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
     timer_queue: time.TimerQueue,
     cluster_pool: buffer.ClusterPool,
     ephemeral_port: u16,
-
-    pub const CachedLinkAddress = struct {
-        addr: tcpip.LinkAddress,
-        timestamp: i64,
-    };
 
     pub const AddressContext = struct {
         pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
@@ -575,7 +519,7 @@ pub const Stack = struct {
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
             .endpoints = TransportTable.init(allocator),
-            .link_addr_cache = std.HashMap(tcpip.Address, CachedLinkAddress, AddressContext, 80).init(allocator),
+            .link_addr_cache = std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80).init(allocator),
             .transport_protocols = std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol).init(allocator),
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
@@ -609,14 +553,10 @@ pub const Stack = struct {
     }
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
-        const now = std.time.milliTimestamp();
-        if (self.link_addr_cache.getPtr(addr)) |entry| {
-            if (entry.addr.eq(link_addr)) {
-                entry.timestamp = now;
-                return;
-            }
+        if (self.link_addr_cache.get(addr)) |prev| {
+            if (prev.eq(link_addr)) return;
         }
-        try self.link_addr_cache.put(addr, .{ .addr = link_addr, .timestamp = now });
+        try self.link_addr_cache.put(addr, link_addr);
 
         // Notify all transport endpoints that they might be writable now (due to ARP resolution)
         var it = self.endpoints.endpoints.valueIterator();
@@ -625,22 +565,16 @@ pub const Stack = struct {
         }
     }
 
-    pub fn getLinkAddress(self: *Stack, addr: tcpip.Address) ?tcpip.LinkAddress {
-        const entry = self.link_addr_cache.getPtr(addr) orelse return null;
-        entry.timestamp = std.time.milliTimestamp();
-        return entry.addr;
-    }
-
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {
         try self.endpoints.put(id, ep);
+        ep.incRef();
     }
 
     pub fn unregisterTransportEndpoint(self: *Stack, id: TransportEndpointID) void {
-        _ = self.endpoints.remove(id);
-    }
-
-    pub fn unregisterTransportEndpointNoDecRef(self: *Stack, id: TransportEndpointID) ?TransportEndpoint {
-        return self.endpoints.removeReturningEndpoint(id);
+        const ep_opt = self.endpoints.fetchRemove(id);
+        if (ep_opt) |kv| {
+            kv.value.decRef();
+        }
     }
 
     pub fn getNextEphemeralPort(self: *Stack) u16 {
@@ -658,7 +592,7 @@ pub const Stack = struct {
         if (nic_id != 0) {
             const nic_opt = self.nics.get(nic_id);
             const next_hop = remote_addr;
-            const link_addr_opt = self.getLinkAddress(next_hop);
+            const link_addr_opt = self.link_addr_cache.get(next_hop);
 
             const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
@@ -679,7 +613,7 @@ pub const Stack = struct {
 
         const nic_opt = self.nics.get(route_entry.nic);
         const next_hop = route_entry.gateway;
-        const link_addr_opt = if (next_hop.isAny()) self.getLinkAddress(remote_addr) else self.getLinkAddress(next_hop);
+        const link_addr_opt = if (next_hop.isAny()) self.link_addr_cache.get(remote_addr) else self.link_addr_cache.get(next_hop);
 
         const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
@@ -742,94 +676,352 @@ pub const Stack = struct {
             .ptr = self,
             .vtable = &.{
                 .deliverTransportPacket = deliverTransportPacket,
-                .deliverTransportPackets = deliverTransportPackets,
             },
         };
     }
 
-    fn deliverTransportPacket(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
-        var packets = [_]tcpip.PacketBuffer{pkt};
-        return deliverTransportPackets(ptr, r, protocol, &packets);
-    }
-
-    fn deliverTransportPackets(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, packets: []tcpip.PacketBuffer) void {
+    pub fn deliverTransportPacket(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
         const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
 
         const proto_opt = self.transport_protocols.get(protocol);
+
         const proto = proto_opt orelse return;
+        const ports = proto.parsePorts(pkt);
 
-        var last_id: ?TransportEndpointID = null;
-        var last_ep: ?TransportEndpoint = null;
+        const id = TransportEndpointID{
+            .local_port = ports.dst,
+            .local_address = r.local_address,
+            .remote_port = ports.src,
+            .remote_address = r.remote_address,
+        };
 
-        for (packets) |pkt| {
-            const ports = proto.parsePorts(pkt);
-            const id = TransportEndpointID{
+        const ep_opt = self.endpoints.get(id);
+
+        if (ep_opt) |ep| {
+            ep.handlePacket(r, id, pkt);
+            ep.decRef();
+        } else {
+            // Try global handler first (for ICMP, etc)
+            if (proto.vtable.handlePacket) |handle| {
+                handle(proto.ptr, r, id, pkt);
+                return;
+            }
+
+            // Try wildcard match for listeners
+            const listener_id = TransportEndpointID{
                 .local_port = ports.dst,
                 .local_address = r.local_address,
-                .remote_port = ports.src,
-                .remote_address = r.remote_address,
+                .remote_port = 0,
+                .remote_address = switch (r.local_address) {
+                    .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                },
             };
 
-            if (last_id == null or !id.eq(last_id.?)) {
-                if (last_ep) |ep| ep.decRef();
-                last_id = id;
-                last_ep = self.endpoints.get(id);
+            const listener_opt = self.endpoints.get(listener_id);
 
-                if (last_ep == null) {
-                    // Try global handler first (for ICMP, etc)
-                    if (proto.vtable.handlePacket) |handle| {
-                        handle(proto.ptr, r, id, pkt);
-                        last_id = null;
-                        continue;
-                    }
+            if (listener_opt) |ep| {
+                ep.handlePacket(r, id, pkt);
+                ep.decRef();
+            } else {
+                // Try INADDR_ANY (0.0.0.0 / ::)
+                const any_addr = switch (r.local_address) {
+                    .v4 => tcpip.Address{ .v4 = .{ 0, 0, 0, 0 } },
+                    .v6 => tcpip.Address{ .v6 = [_]u8{0} ** 16 },
+                };
 
-                    // Try wildcard match for listeners
-                    const listener_id = TransportEndpointID{
-                        .local_port = ports.dst,
-                        .local_address = r.local_address,
-                        .remote_port = 0,
-                        .remote_address = switch (r.local_address) {
-                            .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
-                            .v6 => .{ .v6 = [_]u8{0} ** 16 },
-                        },
-                    };
+                const any_id = TransportEndpointID{
+                    .local_port = ports.dst,
+                    .local_address = any_addr,
+                    .remote_port = 0,
+                    .remote_address = switch (r.local_address) {
+                        .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                        .v6 => .{ .v6 = [_]u8{0} ** 16 },
+                    },
+                };
 
-                    last_ep = self.endpoints.get(listener_id);
-
-                    if (last_ep == null) {
-                        // Try INADDR_ANY (0.0.0.0 / ::)
-                        const any_addr = switch (r.local_address) {
-                            .v4 => tcpip.Address{ .v4 = .{ 0, 0, 0, 0 } },
-                            .v6 => tcpip.Address{ .v6 = [_]u8{0} ** 16 },
-                        };
-
-                        const any_id = TransportEndpointID{
-                            .local_port = ports.dst,
-                            .local_address = any_addr,
-                            .remote_port = 0,
-                            .remote_address = switch (r.local_address) {
-                                .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
-                                .v6 => .{ .v6 = [_]u8{0} ** 16 },
-                            },
-                        };
-                        last_ep = self.endpoints.get(any_id);
-                    }
-
-                    if (last_ep == null) {
-                        if (protocol == 17) {
-                            log.warn("Stack: No endpoint for UDP port {}. Looked for exact: {}, remote: {}", .{ ports.dst, id.hash(), id.remote_address });
-                        }
-                        last_id = null;
-                        continue;
+                if (self.endpoints.get(any_id)) |ep| {
+                    ep.handlePacket(r, id, pkt);
+                    ep.decRef();
+                } else {
+                    if (protocol == 17) {
+                        log.warn("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
+                        log.debug("Exact: local={any}:{} remote={any}:{}", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
+                        log.debug("Any: local={any}:{} remote={any}:{}", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });
                     }
                 }
             }
-
-            if (last_ep) |ep| {
-                ep.handlePacket(r, id, pkt);
-            }
         }
-
-        if (last_ep) |ep| ep.decRef();
     }
 };
+
+test "Stack.findRoute 0.0.0.0 bind" {
+    const allocator = std.testing.allocator;
+    var s = try Stack.init(allocator);
+    defer s.deinit();
+
+    // Mock LinkEndpoint
+    var fake_link = struct {
+        fn writePacket(_: *anyopaque, _: ?*const Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            return;
+        }
+        fn attach(_: *anyopaque, _: *NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) LinkEndpointCapabilities {
+            return 0;
+        }
+    }{};
+
+    const link_ep = LinkEndpoint{
+        .ptr = &fake_link,
+        .vtable = &.{
+            .writePacket = @TypeOf(fake_link).writePacket,
+            .attach = @TypeOf(fake_link).attach,
+            .linkAddress = @TypeOf(fake_link).linkAddress,
+            .mtu = @TypeOf(fake_link).mtu,
+            .setMTU = @TypeOf(fake_link).setMTU,
+            .capabilities = @TypeOf(fake_link).capabilities,
+        },
+    };
+
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+
+    const local_ip = tcpip.Address{ .v4 = .{ 10, 0, 0, 1 } };
+    try nic.addAddress(.{
+        .protocol = 0x0800,
+        .address_with_prefix = .{ .address = local_ip, .prefix_len = 24 },
+    });
+
+    // Add a route
+    try s.addRoute(.{
+        .destination = .{ .address = .{ .v4 = .{ 10, 0, 0, 0 } }, .prefix = 24 },
+        .gateway = .{ .v4 = .{ 0, 0, 0, 0 } },
+        .nic = 1,
+        .mtu = 1500,
+    });
+
+    // Test findRoute with any (0.0.0.0) source address
+    const remote_ip = tcpip.Address{ .v4 = .{ 10, 0, 0, 2 } };
+    const route = try s.findRoute(0, .{ .v4 = .{ 0, 0, 0, 0 } }, remote_ip, 0x0800);
+
+    try std.testing.expect(route.local_address.eq(local_ip));
+    try std.testing.expect(route.remote_address.eq(remote_ip));
+    try std.testing.expectEqual(@as(tcpip.NICID, 1), route.nic.id);
+}
+
+test "Stack NIC creation" {
+    const FakeLinkEndpoint = struct {
+        address: [6]u8 = [_]u8{ 1, 2, 3, 4, 5, 6 },
+        mtu_val: u32 = 1500,
+
+        fn writePacket(ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            _ = ptr;
+            _ = r;
+            _ = protocol;
+            _ = pkt;
+            return;
+        }
+        fn attach(ptr: *anyopaque, dispatcher: *NetworkDispatcher) void {
+            _ = ptr;
+            _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return .{ .addr = self.address };
+        }
+        fn mtu(ptr: *anyopaque) u32 {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return self.mtu_val;
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            self.mtu_val = m;
+        }
+        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities {
+            _ = ptr;
+            return CapabilityNone;
+        }
+    };
+
+    var fake_ep = FakeLinkEndpoint{};
+    const ep = LinkEndpoint{
+        .ptr = &fake_ep,
+        .vtable = &.{
+            .writePacket = FakeLinkEndpoint.writePacket,
+            .attach = FakeLinkEndpoint.attach,
+            .linkAddress = FakeLinkEndpoint.linkAddress,
+            .mtu = FakeLinkEndpoint.mtu,
+            .setMTU = FakeLinkEndpoint.setMTU,
+            .capabilities = FakeLinkEndpoint.capabilities,
+        },
+    };
+
+    var s = try Stack.init(std.testing.allocator);
+    defer s.deinit();
+
+    try s.createNIC(1, ep);
+    try std.testing.expect(s.nics.contains(1));
+}
+
+test "Stack Transport Demux" {
+    const FakeTransportEndpoint = struct {
+        notified: bool = false,
+        stack: *Stack,
+        ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+
+        fn handlePacket(ptr: *anyopaque, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            _ = r;
+            _ = id;
+            _ = pkt;
+            self.notified = true;
+        }
+        fn close(ptr: *anyopaque) void {
+            decRef(ptr);
+        }
+        fn incRef(ptr: *anyopaque) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            _ = self.ref_count.fetchAdd(1, .monotonic);
+        }
+        fn decRef(ptr: *anyopaque) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            if (self.ref_count.fetchSub(1, .release) == 1) {
+                self.ref_count.fence(.acquire);
+                self.stack.allocator.destroy(self);
+            }
+        }
+    };
+
+    const FakeTransportProtocol = struct {
+        fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber {
+            _ = ptr;
+            return 17;
+        }
+        fn newEndpoint(ptr: *anyopaque, s: *Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
+            _ = ptr;
+            _ = s;
+            _ = net_proto;
+            _ = wait_queue;
+            return tcpip.Error.NotPermitted;
+        }
+        fn parsePorts(ptr: *anyopaque, pkt: tcpip.PacketBuffer) TransportProtocol.PortPair {
+            _ = ptr;
+            _ = pkt;
+            return .{ .src = 1234, .dst = 80 };
+        }
+    };
+
+    var s = try Stack.init(std.testing.allocator);
+    defer s.deinit();
+
+    var fake_proto_ptr = FakeTransportProtocol{};
+    const proto = TransportProtocol{
+        .ptr = &fake_proto_ptr,
+        .vtable = &.{
+            .number = FakeTransportProtocol.number,
+            .newEndpoint = FakeTransportProtocol.newEndpoint,
+            .parsePorts = FakeTransportProtocol.parsePorts,
+        },
+    };
+    try s.registerTransportProtocol(proto);
+
+    const fake_ep_ptr = try s.allocator.create(FakeTransportEndpoint);
+    fake_ep_ptr.* = .{ .stack = &s };
+    const ep = TransportEndpoint{
+        .ptr = fake_ep_ptr,
+        .vtable = &.{
+            .handlePacket = FakeTransportEndpoint.handlePacket,
+            .close = FakeTransportEndpoint.close,
+            .incRef = FakeTransportEndpoint.incRef,
+            .decRef = FakeTransportEndpoint.decRef,
+        },
+    };
+
+    const id = TransportEndpointID{
+        .local_port = 80,
+        .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
+        .remote_port = 1234,
+        .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
+    };
+    try s.registerTransportEndpoint(id, ep);
+
+    const r = Route{
+        .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
+        .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
+        .local_link_address = .{ .addr = [_]u8{0} ** 6 },
+        .net_proto = 0x0800,
+        .nic = undefined,
+    };
+
+    Stack.deliverTransportPacket(&s, &r, 17, .{
+        .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
+        .header = buffer.Prependable.init(&[_]u8{}),
+    });
+
+    try std.testing.expect(fake_ep_ptr.notified);
+    ep.close();
+}
+
+test "Jumbo Frames" {
+    const FakeLinkEndpoint = struct {
+        address: [6]u8 = [_]u8{ 1, 2, 3, 4, 5, 6 },
+        mtu_val: u32 = 1500,
+        last_pkt_size: usize = 0,
+
+        fn writePacket(ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            _ = r;
+            _ = protocol;
+            self.last_pkt_size = pkt.data.size + pkt.header.usedLength();
+            return;
+        }
+        fn attach(ptr: *anyopaque, dispatcher: *NetworkDispatcher) void {
+            _ = ptr;
+            _ = dispatcher;
+        }
+        fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return .{ .addr = self.address };
+        }
+        fn mtu(ptr: *anyopaque) u32 {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            return self.mtu_val;
+        }
+        fn setMTU(ptr: *anyopaque, m: u32) void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            self.mtu_val = m;
+        }
+        fn capabilities(ptr: *anyopaque) LinkEndpointCapabilities {
+            _ = ptr;
+            return CapabilityNone;
+        }
+    };
+
+    var fake_ep = FakeLinkEndpoint{};
+    const ep = LinkEndpoint{
+        .ptr = &fake_ep,
+        .vtable = &.{
+            .writePacket = FakeLinkEndpoint.writePacket,
+            .attach = FakeLinkEndpoint.attach,
+            .linkAddress = FakeLinkEndpoint.linkAddress,
+            .mtu = FakeLinkEndpoint.mtu,
+            .setMTU = FakeLinkEndpoint.setMTU,
+            .capabilities = FakeLinkEndpoint.capabilities,
+        },
+    };
+
+    var s = try Stack.init(std.testing.allocator);
+    defer s.deinit();
+
+    ep.setMTU(9000);
+    try std.testing.expectEqual(@as(u32, 9000), ep.mtu());
+
+    try s.createNIC(1, ep);
+}

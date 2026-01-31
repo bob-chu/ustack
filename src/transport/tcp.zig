@@ -8,6 +8,7 @@ const waiter = @import("../waiter.zig");
 const ipv4 = @import("../network/ipv4.zig");
 const log = @import("../log.zig").scoped(.tcp);
 const time = @import("../time.zig");
+const stats = @import("../stats.zig");
 
 const congestion = @import("congestion/control.zig");
 
@@ -20,7 +21,6 @@ pub const TCPProtocol = struct {
     segment_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node),
     packet_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node),
     accept_node_pool: buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node),
-    endpoint_pool: buffer.Pool(TCPEndpoint),
 
     pub fn init(allocator: std.mem.Allocator) *TCPProtocol {
         const self = allocator.create(TCPProtocol) catch unreachable;
@@ -31,7 +31,6 @@ pub const TCPProtocol = struct {
             .segment_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node).init(allocator, 131072),
             .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 131072),
             .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 4096),
-            .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 16384),
         };
         return self;
     }
@@ -42,16 +41,6 @@ pub const TCPProtocol = struct {
         self.segment_node_pool.deinit();
         self.packet_node_pool.deinit();
         self.accept_node_pool.deinit();
-
-        // Properly destroy pooled endpoints
-        var current = self.endpoint_pool.free_list;
-        while (current) |ep| {
-            // std.debug.print("Cleaning up pooled endpoint {p}\n", .{ep});
-            ep.deinit_resources();
-            current = ep.next;
-        }
-        self.endpoint_pool.deinit();
-
         self.allocator.destroy(self);
     }
 
@@ -74,16 +63,8 @@ pub const TCPProtocol = struct {
     fn newEndpoint(ptr: *anyopaque, s: *stack.Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
         const self = @as(*TCPProtocol, @ptrCast(@alignCast(ptr)));
         _ = net_proto;
-        const ep = try self.endpoint_pool.acquire();
-        errdefer self.endpoint_pool.release(ep);
-
-        if (!ep.is_pooled) {
-            ep.* = TCPEndpoint.init(s, self, wait_queue, 1460) catch return tcpip.Error.OutOfMemory;
-            ep.is_pooled = true;
-        } else {
-            try ep.reset(s, self, wait_queue, 1460);
-        }
-        ep.ref_count = 1;
+        const ep = s.allocator.create(TCPEndpoint) catch return tcpip.Error.OutOfMemory;
+        ep.* = try TCPEndpoint.init(s, self, wait_queue, 1460);
         ep.retransmit_timer.context = ep;
         return ep.endpoint();
     }
@@ -93,9 +74,7 @@ pub const TCPProtocol = struct {
         const ep_opt = r.nic.stack.endpoints.get(id);
         if (ep_opt) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
-            tcp_ep.ref_count += 1;
             tcp_ep.handlePacket(r, id, pkt);
-            tcp_ep.decRef();
             ep.decRef();
             return;
         }
@@ -111,9 +90,7 @@ pub const TCPProtocol = struct {
         };
         if (r.nic.stack.endpoints.get(listener_id)) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
-            tcp_ep.ref_count += 1;
             tcp_ep.handlePacket(r, id, pkt);
-            tcp_ep.decRef();
             ep.decRef();
             return;
         }
@@ -132,9 +109,7 @@ pub const TCPProtocol = struct {
         };
         if (r.nic.stack.endpoints.get(any_id)) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
-            tcp_ep.ref_count += 1;
             tcp_ep.handlePacket(r, id, pkt);
-            tcp_ep.decRef();
             ep.decRef();
             return;
         }
@@ -149,36 +124,6 @@ pub const TCPProtocol = struct {
 };
 
 pub const TCPEndpoint = struct {
-    pub const Packet = struct {
-        data: buffer.VectorisedView,
-        seq: u32,
-    };
-
-    pub const SackBlock = struct {
-        start: u32,
-        end: u32,
-    };
-
-    pub const SyncacheEntry = struct {
-        remote_addr: tcpip.FullAddress,
-        rcv_nxt: u32,
-        snd_nxt: u32,
-        ts_recent: u32,
-        ts_enabled: bool,
-        sack_enabled: bool,
-        ws_negotiated: bool,
-        snd_wnd_scale: u8,
-        mss: u16,
-    };
-
-    pub const Segment = struct {
-        data: buffer.VectorisedView,
-        seq: u32,
-        len: u32,
-        flags: u8,
-        timestamp: i64,
-    };
-
     stack: *stack.Stack,
     proto: *TCPProtocol,
     waiter_queue: *waiter.Queue,
@@ -200,12 +145,7 @@ pub const TCPEndpoint = struct {
 
     cc: congestion.CongestionControl,
     ref_count: usize = 1,
-    is_destroying: bool = false,
     cached_route: ?stack.Route = null,
-
-    is_pooled: bool = false,
-    next: ?*TCPEndpoint = null,
-    prev: ?*TCPEndpoint = null,
 
     accepted_queue: std.TailQueue(tcpip.AcceptReturn) = .{},
     rcv_list: std.TailQueue(Packet) = .{},
@@ -230,13 +170,43 @@ pub const TCPEndpoint = struct {
     ts_recent: u32 = 0,
     max_segment_size: u16 = 1460,
 
+    pub const SackBlock = struct {
+        start: u32,
+        end: u32,
+    };
+
+    pub const SyncacheEntry = struct {
+        remote_addr: tcpip.FullAddress,
+        rcv_nxt: u32,
+        snd_nxt: u32,
+        ts_recent: u32,
+        ts_enabled: bool,
+        sack_enabled: bool,
+        ws_negotiated: bool,
+        snd_wnd_scale: u8,
+        mss: u16,
+    };
+
+    pub const Segment = struct {
+        data: buffer.VectorisedView,
+        seq: u32,
+        len: u32,
+        flags: u8,
+        timestamp: i64 = 0,
+    };
+
+    pub const Packet = struct {
+        data: buffer.VectorisedView,
+        seq: u32,
+    };
+
     pub fn init(s: *stack.Stack, proto: *TCPProtocol, wq: *waiter.Queue, mss: u16) !TCPEndpoint {
         const cc = try congestion.NewReno.init(s.allocator, mss);
         var self = TCPEndpoint{
             .stack = s,
             .proto = proto,
             .waiter_queue = wq,
-            .snd_nxt = 1000,
+            .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))),
             .cc = cc,
             .max_segment_size = mss,
             .retransmit_timer = time.Timer.init(handleRetransmitTimer, undefined),
@@ -359,7 +329,7 @@ pub const TCPEndpoint = struct {
         var r = self.cached_route.?;
         const next_hop = r.next_hop orelse ra.addr;
         if (r.remote_link_address == null) {
-            if (self.stack.getLinkAddress(next_hop)) |link_addr| {
+            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
                 self.cached_route.?.remote_link_address = link_addr;
             }
@@ -378,8 +348,6 @@ pub const TCPEndpoint = struct {
         const rcv_used = @as(u32, @intCast(self.rcv_buf_used));
         self.rcv_wnd = if (rcv_used < self.rcv_wnd_max) self.rcv_wnd_max - rcv_used else 0;
         var total_sent: usize = 0;
-        var packet_batch: [64]tcpip.PacketBuffer = undefined;
-        var batch_count: usize = 0;
         var current_view_idx: usize = 0;
         var current_view_offset: usize = 0;
         while (total_sent < view.size) {
@@ -419,82 +387,19 @@ pub const TCPEndpoint = struct {
             pb_data.original_views = original_views;
             pb_data.view_pool = &self.proto.view_pool;
 
-            const ts_len: u8 = if (self.ts_enabled) 12 else 0;
-            const sack_len_unpadded: u8 = if (self.sack_enabled and self.hint_sack_enabled and self.sack_blocks.items.len > 0) @as(u8, @intCast(2 + self.sack_blocks.items.len * 8)) else 0;
-            const sack_len = (sack_len_unpadded + 3) & ~@as(u8, 3);
-            const options_len = ts_len + sack_len;
-            const hdr_buf = self.proto.header_pool.acquire() catch break;
-
-            var pre = buffer.Prependable.init(hdr_buf);
-            const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
-            @memset(tcp_hdr, 0);
-            var h = header.TCP.init(tcp_hdr);
-            h.encode(la.port, ra.port, self.snd_nxt, self.rcv_nxt, header.TCPFlagAck | header.TCPFlagPsh, @as(u16, @intCast(@min(self.rcv_wnd >> @as(u5, @intCast(self.rcv_wnd_scale)), 65535))));
-            var opt_ptr = h.data[20..];
-            if (self.ts_enabled) {
-                h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
-                opt_ptr[0] = 1;
-                opt_ptr[1] = 1;
-                opt_ptr[2] = 8;
-                opt_ptr[3] = 10;
-                std.mem.writeInt(u32, opt_ptr[4..8][0..4][0..4][0..4], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
-                std.mem.writeInt(u32, opt_ptr[8..12][0..4][0..4][0..4], self.ts_recent, .big);
-                opt_ptr = opt_ptr[12..];
-            }
-            if (sack_len > 0) {
-                h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
-                opt_ptr[0] = 5;
-                opt_ptr[1] = sack_len_unpadded;
-                for (self.sack_blocks.items, 0..) |block, j_val| {
-                    if (j_val >= 4) break;
-                    const opt_idx_val = 2 + j_val * 8;
-                    std.mem.writeInt(u32, opt_ptr[opt_idx_val .. opt_idx_val + 4][0..4][0..4][0..4], block.start, .big);
-                    std.mem.writeInt(u32, opt_ptr[opt_idx_val + 4 .. opt_idx_val + 8][0..4][0..4][0..4], block.end, .big);
-                }
-                var k: usize = sack_len_unpadded;
-                while (k < sack_len) : (k += 1)
-                    opt_ptr[k] = 1;
-            }
-            const pkt_buf_inner_val = tcpip.PacketBuffer{ .data = pb_data, .header = pre };
-            h.setChecksum(h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, pkt_buf_inner_val.data));
             const node = self.proto.segment_node_pool.acquire() catch break;
-            const snd_view_mem = try self.proto.view_pool.acquire();
-            const snd_original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, snd_view_mem))));
-            @memcpy(snd_original_views[0..seg_view_cnt], original_views[0..seg_view_cnt]);
-            for (snd_original_views[0..seg_view_cnt]) |cv| {
-                if (cv.cluster) |c| c.acquire();
-            }
-
-            var snd_pb_data = buffer.VectorisedView.init(payload_len, snd_original_views[0..seg_view_cnt]);
-            snd_pb_data.original_views = snd_original_views;
-            snd_pb_data.view_pool = &self.proto.view_pool;
-            node.data = .{ .data = snd_pb_data, .seq = self.snd_nxt, .len = payload_len, .flags = header.TCPFlagAck | header.TCPFlagPsh, .timestamp = std.time.milliTimestamp() };
+            node.data = .{
+                .data = pb_data,
+                .seq = self.snd_nxt,
+                .len = payload_len,
+                .flags = header.TCPFlagAck | header.TCPFlagPsh,
+                .timestamp = 0,
+            };
             self.snd_queue.append(node);
-            packet_batch[batch_count] = pkt_buf_inner_val;
-            batch_count += 1;
             self.snd_nxt +%= payload_len;
             total_sent += payload_len;
-
-            if (batch_count == 64) {
-                const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse return tcpip.Error.NoRoute;
-                net_ep.writePackets(&r, ProtocolNumber, packet_batch[0..batch_count]) catch |err| return err;
-                for (packet_batch[0..batch_count]) |pkt| {
-                    self.proto.header_pool.release(pkt.header.buf);
-                    var m = pkt;
-                    m.data.deinit();
-                }
-                batch_count = 0;
-            }
         }
-        if (batch_count > 0) {
-            const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse return tcpip.Error.NoRoute;
-            net_ep.writePackets(&r, ProtocolNumber, packet_batch[0..batch_count]) catch |err| return err;
-            for (packet_batch[0..batch_count]) |pkt| {
-                self.proto.header_pool.release(pkt.header.buf);
-                var m = pkt;
-                m.data.deinit();
-            }
-        }
+        if (total_sent > 0) try self.flushSendQueue();
         if (total_sent == 0) return tcpip.Error.WouldBlock;
         if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, 200);
         return total_sent;
@@ -565,15 +470,19 @@ pub const TCPEndpoint = struct {
         var r = self.cached_route.?;
         const next_hop = r.next_hop orelse ra.addr;
         if (r.remote_link_address == null) {
-            if (self.stack.getLinkAddress(next_hop)) |link_addr| {
+            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
                 self.cached_route.?.remote_link_address = link_addr;
             }
         }
-        if (r.remote_link_address == null) return;
         var packet_batch: [64]tcpip.PacketBuffer = undefined;
         var batch_count: usize = 0;
+        const now = std.time.milliTimestamp();
         while (it) |node| {
+            if (node.data.timestamp != 0) {
+                it = node.next;
+                continue;
+            }
             const hdr_buf = self.proto.header_pool.acquire() catch break;
             var pre = buffer.Prependable.init(hdr_buf);
             const options_len: u8 = if (node.data.flags & header.TCPFlagSyn != 0) 12 else 0;
@@ -586,21 +495,32 @@ pub const TCPEndpoint = struct {
                 var opt_ptr = h.data[20..];
                 opt_ptr[0] = 2;
                 opt_ptr[1] = 4;
-                std.mem.writeInt(u16, opt_ptr[2..4][0..2][0..2][0..2], self.max_segment_size, .big);
+                std.mem.writeInt(u16, opt_ptr[2..4][0..2], self.max_segment_size, .big);
                 opt_ptr = opt_ptr[4..];
-                opt_ptr[0] = 1;
-                opt_ptr[1] = 3;
-                opt_ptr[2] = 3;
-                opt_ptr[3] = self.rcv_wnd_scale;
-                opt_ptr = opt_ptr[4..];
-                opt_ptr[0] = 4;
-                opt_ptr[1] = 2;
-                opt_ptr[2] = 1;
-                opt_ptr[3] = 1;
+                if (node.data.flags & header.TCPFlagSyn != 0) {
+                    opt_ptr[0] = 1;
+                    opt_ptr[1] = 3;
+                    opt_ptr[2] = 3;
+                    opt_ptr[3] = self.rcv_wnd_scale;
+                }
             }
             h.setChecksum(h.calculateChecksumVectorised(la.addr.v4, ra.addr.v4, node.data.data));
             packet_batch[batch_count] = .{ .data = node.data.data, .header = pre };
 
+            // Increment stats
+            stats.global_stats.tcp.tx_segments += 1;
+            if (node.data.flags & header.TCPFlagSyn != 0) {
+                if (node.data.flags & header.TCPFlagAck != 0) {
+                    stats.global_stats.tcp.tx_syn_ack += 1;
+                } else {
+                    stats.global_stats.tcp.tx_syn += 1;
+                }
+            }
+            if (node.data.flags & header.TCPFlagAck != 0) stats.global_stats.tcp.tx_ack += 1;
+            if (node.data.flags & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh += 1;
+            if (node.data.flags & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin += 1;
+
+            node.data.timestamp = now;
             batch_count += 1;
             if (batch_count == 64) {
                 const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse break;
@@ -654,7 +574,7 @@ pub const TCPEndpoint = struct {
                 it = node.next;
                 continue;
             }
-            if (force or (now - node.data.timestamp > 200)) {
+            if (node.data.timestamp != 0 and (force or (now - node.data.timestamp > 200))) {
                 if (!force) self.cc.onLoss();
                 const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
                 const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
@@ -665,7 +585,7 @@ pub const TCPEndpoint = struct {
                 var r = self.cached_route.?;
                 const next_hop = r.next_hop orelse ra.addr;
                 if (r.remote_link_address == null) {
-                    if (self.stack.getLinkAddress(next_hop)) |link_addr| {
+                    if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
                         r.remote_link_address = link_addr;
                         self.cached_route.?.remote_link_address = link_addr;
                     }
@@ -728,20 +648,11 @@ pub const TCPEndpoint = struct {
         self.ref_count += 1;
     }
     pub fn decRef(self: *TCPEndpoint) void {
-        if (self.ref_count == 0) return;
         self.ref_count -= 1;
-        if (self.ref_count == 0) {
-            if (self.is_destroying) return;
-            self.is_destroying = true;
-            self.cleanup_internal();
-            if (!self.proto.endpoint_pool.tryRelease(self)) {
-                self.deinit_resources();
-                self.stack.allocator.destroy(self);
-            }
-        }
+        if (self.ref_count == 0) self.destroy();
     }
 
-    fn cleanup_internal(self: *TCPEndpoint) void {
+    fn destroy(self: *TCPEndpoint) void {
         if (self.local_addr) |la| {
             const ra = self.remote_addr orelse tcpip.FullAddress{
                 .nic = 0,
@@ -757,77 +668,38 @@ pub const TCPEndpoint = struct {
                 .remote_port = ra.port,
                 .remote_address = ra.addr,
             };
-            self.local_addr = null;
-            // Unregister without decRef because we are already destroying (ref count reached 0)
-            _ = self.stack.unregisterTransportEndpointNoDecRef(id);
+            self.stack.unregisterTransportEndpoint(id);
         }
+
+        self.syncache.deinit();
+        self.sack_blocks.deinit();
+        self.peer_sack_blocks.deinit();
 
         while (self.rcv_list.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
+
         while (self.ooo_list.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.packet_node_pool.release(node);
         }
+
         while (self.accepted_queue.popFirst()) |node| {
             node.data.ep.close();
             self.proto.accept_node_pool.release(node);
         }
+
+        if (self.owns_waiter_queue) self.stack.allocator.destroy(self.waiter_queue);
+
+        self.stack.timer_queue.cancel(&self.retransmit_timer);
+        self.cc.deinit();
+
         while (self.snd_queue.popFirst()) |node| {
             node.data.data.deinit();
             self.proto.segment_node_pool.release(node);
         }
-        self.stack.timer_queue.cancel(&self.retransmit_timer);
 
-        if (self.owns_waiter_queue) {
-            self.stack.allocator.destroy(self.waiter_queue);
-            self.owns_waiter_queue = false;
-        }
-    }
-
-    fn deinit_resources(self: *TCPEndpoint) void {
-        self.cleanup_internal();
-        self.syncache.deinit();
-        self.sack_blocks.deinit();
-        self.peer_sack_blocks.deinit();
-        self.cc.deinit();
-    }
-
-    pub fn reset(self: *TCPEndpoint, s: *stack.Stack, proto: *TCPProtocol, wq: *waiter.Queue, mss: u16) !void {
-        self.cleanup_internal();
-
-        self.stack = s;
-        self.proto = proto;
-        self.waiter_queue = wq;
-        self.state = .initial;
-        self.is_destroying = false;
-        self.local_addr = null;
-        self.remote_addr = null;
-        self.snd_nxt = 1000;
-        self.rcv_nxt = 0;
-        self.rcv_buf_used = 0;
-        self.rcv_view_count = 0;
-        self.rcv_wnd = self.rcv_wnd_max;
-        self.snd_wnd = 65535;
-        self.cached_route = null;
-        self.dup_ack_count = 0;
-        self.last_ack = 0;
-        self.rcv_packets_since_ack = 0;
-        self.retransmit_count = 0;
-        self.ts_enabled = false;
-        self.ts_recent = 0;
-        self.max_segment_size = mss;
-
-        self.syncache.clearRetainingCapacity();
-        self.sack_blocks.clearRetainingCapacity();
-        self.peer_sack_blocks.clearRetainingCapacity();
-
-        try self.cc.reset(mss);
-    }
-
-    fn destroy(self: *TCPEndpoint) void {
-        self.deinit_resources();
         self.stack.allocator.destroy(self);
     }
 
@@ -966,66 +838,22 @@ pub const TCPEndpoint = struct {
 
         const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = addr.port, .remote_address = addr.addr };
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
-        const net_proto: u16 = if (addr.addr == .v4) 0x0800 else 0x86dd;
-        if (self.cached_route == null or self.cached_route.?.net_proto != net_proto) {
-            self.cached_route = try self.stack.findRoute(addr.nic, la.addr, addr.addr, net_proto);
-        }
-        var r = self.cached_route.?;
-        if (self.stack.getLinkAddress(addr.addr)) |link_addr| r.remote_link_address = link_addr;
-        const options_len: u8 = if (self.ts_enabled) 24 else 12;
-        const hdr_buf = self.proto.header_pool.acquire() catch return tcpip.Error.OutOfMemory;
-        errdefer self.proto.header_pool.release(hdr_buf);
-        var pre = buffer.Prependable.init(hdr_buf);
-        const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
-        @memset(tcp_hdr, 0);
-        var h = header.TCP.init(tcp_hdr);
-        h.encode(la.port, addr.port, initial_seq, 0, header.TCPFlagSyn, @as(u16, @intCast(@min(self.rcv_wnd >> @as(u5, @intCast(self.rcv_wnd_scale)), 65535))));
-        h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
-        var opt_ptr = h.data[20..];
-        opt_ptr[0] = 2;
-        opt_ptr[1] = 4;
-        std.mem.writeInt(u16, opt_ptr[2..4][0..2][0..2][0..2], self.max_segment_size, .big);
-        opt_ptr = opt_ptr[4..];
-        opt_ptr[0] = 1;
-        opt_ptr[1] = 3;
-        opt_ptr[2] = 3;
-        opt_ptr[3] = self.rcv_wnd_scale;
-        opt_ptr = opt_ptr[4..];
-        opt_ptr[0] = 4;
-        opt_ptr[1] = 2;
-        opt_ptr[2] = 1;
-        opt_ptr[3] = 1;
-        opt_ptr = opt_ptr[4..];
-        if (self.ts_enabled) {
-            opt_ptr[0] = 8;
-            opt_ptr[1] = 10;
-            std.mem.writeInt(u32, opt_ptr[2..6][0..4][0..4][0..4], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
-            std.mem.writeInt(u32, opt_ptr[6..10][0..4][0..4][0..4], 0, .big);
-            opt_ptr[10] = 1;
-            opt_ptr[11] = 1;
-        }
-        _ = &h; // Force update syn - final fix v2
-        const pb_final = tcpip.PacketBuffer{ .data = buffer.VectorisedView.empty(), .header = pre };
+
         const node = self.proto.segment_node_pool.acquire() catch return tcpip.Error.OutOfMemory;
-        node.data = .{ .data = pb_final.data.clone(self.stack.allocator) catch {
-            self.proto.segment_node_pool.release(node);
-            return tcpip.Error.OutOfMemory;
-        }, .seq = initial_seq, .len = 0, .flags = header.TCPFlagSyn, .timestamp = std.time.milliTimestamp() };
+        node.data = .{ .data = buffer.VectorisedView.empty(), .seq = initial_seq, .len = 0, .flags = header.TCPFlagSyn, .timestamp = 0 };
         self.snd_queue.append(node);
         if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, 200);
-        var mut_r = r;
-        try mut_r.writePacket(6, pb_final);
-        self.proto.header_pool.release(hdr_buf);
+        try self.flushSendQueue();
     }
 
     fn shutdown_internal(self: *TCPEndpoint, flags: u8) tcpip.Error!void {
         _ = flags;
         if (self.state == .established) {
             self.state = .fin_wait1;
-            try self.sendControl(header.TCPFlagFin | header.TCPFlagAck);
+            try self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck);
         } else if (self.state == .close_wait) {
             self.state = .last_ack;
-            try self.sendControl(header.TCPFlagFin | header.TCPFlagAck);
+            try self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck);
         }
     }
 
@@ -1057,9 +885,32 @@ pub const TCPEndpoint = struct {
     }
 
     fn close(self: *TCPEndpoint) void {
+        if (self.state == .closed) {
+            self.decRef();
+            return;
+        }
+
         if (self.state == .established) {
             self.state = .fin_wait1;
-            self.sendControl(header.TCPFlagFin | header.TCPFlagAck) catch {};
+            self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck) catch {};
+        } else if (self.state == .close_wait) {
+            self.state = .last_ack;
+            self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck) catch {};
+        } else if (self.state == .listen) {
+            self.state = .closed;
+            if (self.local_addr) |la| {
+                const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } } };
+                self.stack.unregisterTransportEndpoint(id);
+            }
+        } else if (self.state == .syn_sent or self.state == .syn_recv) {
+            self.state = .closed;
+            // Optionally send RST here, but for now just unregister
+            if (self.local_addr) |la| {
+                if (self.remote_addr) |ra| {
+                    const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+                    self.stack.unregisterTransportEndpoint(id);
+                }
+            }
         }
         self.decRef();
     }
@@ -1068,6 +919,20 @@ pub const TCPEndpoint = struct {
         const v = pkt.data.first() orelse return;
         const h = header.TCP.init(v);
         const fl = h.flags();
+
+        // Increment TCP RX stats
+        stats.global_stats.tcp.rx_segments += 1;
+        if (fl & header.TCPFlagSyn != 0) {
+            if (fl & header.TCPFlagAck != 0) {
+                stats.global_stats.tcp.rx_syn_ack += 1;
+            } else {
+                stats.global_stats.tcp.rx_syn += 1;
+            }
+        }
+        if (fl & header.TCPFlagAck != 0) stats.global_stats.tcp.rx_ack += 1;
+        if (fl & header.TCPFlagPsh != 0) stats.global_stats.tcp.rx_psh += 1;
+        if (fl & header.TCPFlagFin != 0) stats.global_stats.tcp.rx_fin += 1;
+
         var notify_mask: waiter.EventMask = 0;
         defer {
             if (notify_mask != 0) self.waiter_queue.notify(notify_mask);
@@ -1105,41 +970,61 @@ pub const TCPEndpoint = struct {
         switch (self.state) {
             .listen => {
                 if (fl & header.TCPFlagSyn != 0) {
-                    if (self.syncache.items.len + self.accepted_queue.len >= self.backlog) return;
-                    var entry = SyncacheEntry{ .remote_addr = .{ .nic = r.nic.id, .addr = id.remote_address, .port = h.sourcePort() }, .rcv_nxt = h.sequenceNumber() +% 1, .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))), .ts_recent = self.ts_recent, .ts_enabled = self.ts_enabled, .sack_enabled = false, .ws_negotiated = false, .snd_wnd_scale = 0, .mss = self.max_segment_size };
-                    var opt_idx: usize = 20;
-                    while (opt_idx < hlen) {
-                        const kind = v[opt_idx];
-                        if (kind == 0) break;
-                        if (kind == 1) {
-                            opt_idx += 1;
-                            continue;
+                    // Check if we already have a syncache entry for this peer
+                    for (self.syncache.items) |*entry| {
+                        if (entry.remote_addr.addr.eq(id.remote_address) and entry.remote_addr.port == h.sourcePort()) {
+                            // Retransmit SYN-ACK (we'll re-encode it below)
+                            // entry.rcv_nxt = h.sequenceNumber() +% 1; // Optional: update rcv_nxt if peer changed ISN?
+                            // We use the existing snd_nxt (server ISN) to be consistent
+                            break;
                         }
-                        if (opt_idx + 1 >= hlen) break;
-                        const len = v[opt_idx + 1];
-                        if (len < 2 or opt_idx + len > hlen) break;
-                        if (kind == 2 and len == 4) entry.mss = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2][0..2][0..2], .big) else if (kind == 3 and len == 3) {
-                            entry.snd_wnd_scale = v[opt_idx + 2];
-                            entry.ws_negotiated = true;
-                        } else if (kind == 4 and len == 2) entry.sack_enabled = true;
-                        opt_idx += len;
+                    } else {
+                        if (self.syncache.items.len + self.accepted_queue.len >= self.backlog) return;
+                        var entry = SyncacheEntry{ .remote_addr = .{ .nic = r.nic.id, .addr = id.remote_address, .port = h.sourcePort() }, .rcv_nxt = h.sequenceNumber() +% 1, .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))), .ts_recent = self.ts_recent, .ts_enabled = self.ts_enabled, .sack_enabled = false, .ws_negotiated = false, .snd_wnd_scale = 0, .mss = self.max_segment_size };
+                        var opt_idx: usize = 20;
+                        while (opt_idx < hlen) {
+                            const kind = v[opt_idx];
+                            if (kind == 0) break;
+                            if (kind == 1) {
+                                opt_idx += 1;
+                                continue;
+                            }
+                            if (opt_idx + 1 >= hlen) break;
+                            const len = v[opt_idx + 1];
+                            if (len < 2 or opt_idx + len > hlen) break;
+                            if (kind == 2 and len == 4) entry.mss = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2], .big) else if (kind == 3 and len == 3) {
+                                entry.snd_wnd_scale = v[opt_idx + 2];
+                                entry.ws_negotiated = true;
+                            } else if (kind == 4 and len == 2) entry.sack_enabled = true;
+                            opt_idx += len;
+                        }
+                        self.syncache.append(entry) catch return;
                     }
-                    self.syncache.append(entry) catch return;
-                    const options_len: u8 = (if (entry.ts_enabled) @as(u8, 12) else 0) + (if (entry.ws_negotiated) @as(u8, 4) else 0) + (if (entry.sack_enabled) @as(u8, 4) else 0) + 4;
+
+                    // Find the entry (either existing or just added)
+                    var current_entry: *SyncacheEntry = undefined;
+                    for (self.syncache.items) |*e| {
+                        if (e.remote_addr.addr.eq(id.remote_address) and e.remote_addr.port == h.sourcePort()) {
+                            current_entry = e;
+                            break;
+                        }
+                    }
+
+                    const options_len: u8 = (if (current_entry.ts_enabled) @as(u8, 12) else 0) + (if (current_entry.ws_negotiated) @as(u8, 4) else 0) + (if (current_entry.sack_enabled) @as(u8, 4) else 0) + 4;
                     const hdr_buf = self.proto.header_pool.acquire() catch return;
                     defer self.proto.header_pool.release(hdr_buf);
                     var pre = buffer.Prependable.init(hdr_buf);
                     const tcp_hdr = pre.prepend(header.TCPMinimumSize + options_len).?;
                     @memset(tcp_hdr, 0);
                     var reply_h = header.TCP.init(tcp_hdr);
-                    reply_h.encode(id.local_port, id.remote_port, entry.snd_nxt, entry.rcv_nxt, header.TCPFlagSyn | header.TCPFlagAck, @as(u16, @intCast(@min(self.rcv_wnd, 65535))));
+                    reply_h.encode(id.local_port, id.remote_port, current_entry.snd_nxt, current_entry.rcv_nxt, header.TCPFlagSyn | header.TCPFlagAck, @as(u16, @intCast(@min(self.rcv_wnd, 65535))));
                     reply_h.data[header.TCPDataOffset] = ((5 + (options_len / 4)) << 4);
                     var opt_ptr = reply_h.data[20..];
                     opt_ptr[0] = 2;
                     opt_ptr[1] = 4;
-                    std.mem.writeInt(u16, opt_ptr[2..4][0..2][0..2][0..2], self.max_segment_size, .big);
+                    std.mem.writeInt(u16, opt_ptr[2..4][0..2], self.max_segment_size, .big);
                     opt_ptr = opt_ptr[4..];
-                    if (entry.ws_negotiated) {
+                    if (current_entry.ws_negotiated) {
                         opt_ptr[0] = 3;
                         opt_ptr[1] = 3;
                         opt_ptr[2] = self.rcv_wnd_scale;
@@ -1147,23 +1032,29 @@ pub const TCPEndpoint = struct {
                         opt_ptr[0] = 1;
                         opt_ptr = opt_ptr[1..];
                     }
-                    if (entry.sack_enabled) {
+                    if (current_entry.sack_enabled) {
                         opt_ptr[0] = 4;
                         opt_ptr[1] = 2;
                         opt_ptr[2] = 1;
                         opt_ptr[3] = self.rcv_wnd_scale;
                         opt_ptr = opt_ptr[4..];
                     }
-                    if (entry.ts_enabled) {
+                    if (current_entry.ts_enabled) {
                         opt_ptr[0] = 8;
                         opt_ptr[1] = 10;
-                        std.mem.writeInt(u32, opt_ptr[2..6][0..4][0..4][0..4], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
-                        std.mem.writeInt(u32, opt_ptr[6..10][0..4][0..4][0..4], entry.ts_recent, .big);
+                        std.mem.writeInt(u32, opt_ptr[2..6][0..4], @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0xFFFFFFFF))), .big);
+                        std.mem.writeInt(u32, opt_ptr[6..10][0..4], current_entry.ts_recent, .big);
                         opt_ptr[10] = 1;
                         opt_ptr[11] = 1;
                     }
                     reply_h.setChecksum(reply_h.calculateChecksum(id.local_address.v4, id.remote_address.v4, &[_]u8{}));
                     const pb = tcpip.PacketBuffer{ .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 }, .header = pre };
+
+                    // Increment stats for server SYN-ACK
+                    stats.global_stats.tcp.tx_segments += 1;
+                    stats.global_stats.tcp.tx_syn_ack += 1;
+                    stats.global_stats.tcp.tx_ack += 1;
+
                     var mut_r = r.*;
                     mut_r.writePacket(6, pb) catch {};
                 } else if (fl & header.TCPFlagAck != 0) {
@@ -1176,30 +1067,20 @@ pub const TCPEndpoint = struct {
                     }
                     if (found_idx) |idx| {
                         const entry = self.syncache.swapRemove(idx);
-                        const new_ep = self.proto.endpoint_pool.acquire() catch return;
-                        errdefer self.proto.endpoint_pool.release(new_ep);
-
+                        const new_ep = self.stack.allocator.create(TCPEndpoint) catch return;
                         const new_wq = self.stack.allocator.create(waiter.Queue) catch {
+                            self.stack.allocator.destroy(new_ep);
                             return;
                         };
                         new_wq.* = .{};
-                        errdefer self.stack.allocator.destroy(new_wq);
-
-                        if (!new_ep.is_pooled) {
-                            new_ep.* = TCPEndpoint.init(self.stack, self.proto, new_wq, entry.mss) catch {
-                                return;
-                            };
-                            new_ep.is_pooled = true;
-                        } else {
-                            new_ep.reset(self.stack, self.proto, new_wq, entry.mss) catch {
-                                return;
-                            };
-                        }
-
+                        new_ep.* = TCPEndpoint.init(self.stack, self.proto, new_wq, entry.mss) catch {
+                            self.stack.allocator.destroy(new_wq);
+                            self.stack.allocator.destroy(new_ep);
+                            return;
+                        };
                         new_ep.retransmit_timer.context = new_ep;
                         new_ep.owns_waiter_queue = true;
                         new_ep.state = .established;
-                        new_ep.ref_count = 1;
                         new_ep.rcv_nxt = entry.rcv_nxt;
                         new_ep.snd_nxt = entry.snd_nxt +% 1;
                         new_ep.last_ack = new_ep.snd_nxt;
@@ -1217,7 +1098,7 @@ pub const TCPEndpoint = struct {
                             new_ep.decRef();
                             return;
                         };
-                        const node = self.proto.accept_node_pool.acquire() catch {
+                        const node = self.stack.allocator.create(std.TailQueue(tcpip.AcceptReturn).Node) catch {
                             new_ep.decRef();
                             return;
                         };
@@ -1401,13 +1282,29 @@ pub const TCPEndpoint = struct {
                 }
             },
             .fin_wait1 => {
-                if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) self.state = .fin_wait2;
+                var acked = false;
+                if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) {
+                    self.state = .fin_wait2;
+                    acked = true;
+                }
                 if (fl & header.TCPFlagFin != 0) {
                     self.rcv_nxt +%= 1;
-                    self.state = .close_wait;
+                    if (acked) {
+                        self.state = .closed;
+                    } else {
+                        self.state = .closing;
+                    }
                     self.sendControl(header.TCPFlagAck) catch {};
                     self.rcv_packets_since_ack = 0;
                     notify_mask |= waiter.EventIn | waiter.EventHUp;
+                    if (self.state == .closed) {
+                        if (self.local_addr) |la| {
+                            if (self.remote_addr) |ra| {
+                                const ep_id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+                                self.stack.unregisterTransportEndpoint(ep_id);
+                            }
+                        }
+                    }
                 }
             },
             .fin_wait2 => {
@@ -1416,22 +1313,59 @@ pub const TCPEndpoint = struct {
                     self.state = .closed;
                     self.sendControl(header.TCPFlagAck) catch {};
                     notify_mask |= waiter.EventHUp;
+                    if (self.local_addr) |la| {
+                        if (self.remote_addr) |ra| {
+                            const ep_id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+                            self.stack.unregisterTransportEndpoint(ep_id);
+                        }
+                    }
                 }
             },
             .closing => {
                 if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) {
                     self.state = .closed;
                     notify_mask |= waiter.EventHUp;
+                    if (self.local_addr) |la| {
+                        if (self.remote_addr) |ra| {
+                            const ep_id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+                            self.stack.unregisterTransportEndpoint(ep_id);
+                        }
+                    }
                 }
             },
             .last_ack => {
                 if (fl & header.TCPFlagAck != 0 and h.ackNumber() == self.snd_nxt) {
                     self.state = .closed;
                     notify_mask |= waiter.EventHUp;
+                    if (self.local_addr) |la| {
+                        if (self.remote_addr) |ra| {
+                            const ep_id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+                            self.stack.unregisterTransportEndpoint(ep_id);
+                        }
+                    }
                 }
             },
             else => {},
         }
+    }
+
+    fn enqueueControl(self: *TCPEndpoint, fl: u8) tcpip.Error!void {
+        const node = self.proto.segment_node_pool.acquire() catch return tcpip.Error.OutOfMemory;
+        node.data = .{
+            .data = buffer.VectorisedView.empty(),
+            .seq = self.snd_nxt,
+            .len = 0,
+            .flags = fl,
+            .timestamp = 0,
+        };
+
+        self.snd_queue.append(node);
+        self.snd_nxt +%= 1;
+        self.rcv_packets_since_ack = 0;
+
+        try self.flushSendQueue();
+
+        if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, 200);
     }
 
     fn sendControl(self: *TCPEndpoint, fl: u8) tcpip.Error!void {
@@ -1467,9 +1401,14 @@ pub const TCPEndpoint = struct {
                 opt_ptr[k_final] = 1;
         }
         h.setChecksum(h.calculateChecksum(la.addr.v4, ra.addr.v4, &[_]u8{}));
-        _ = &h;
         self.rcv_packets_since_ack = 0;
-        if ((fl & header.TCPFlagSyn != 0) or (fl & header.TCPFlagFin != 0)) self.snd_nxt +%= 1;
+
+        // Increment TCP TX stats
+        stats.global_stats.tcp.tx_segments += 1;
+        if (fl & header.TCPFlagAck != 0) stats.global_stats.tcp.tx_ack += 1;
+        if (fl & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh += 1;
+        if (fl & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin += 1;
+
         const pb = tcpip.PacketBuffer{ .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 }, .header = pre };
         var mut_r = r;
         try mut_r.writePacket(6, pb);

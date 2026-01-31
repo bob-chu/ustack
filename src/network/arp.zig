@@ -4,6 +4,7 @@ const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
 const time = @import("../time.zig");
+const stats = @import("../stats.zig");
 
 pub const ProtocolNumber = 0x0806;
 pub const ProtocolAddress = "arp";
@@ -84,6 +85,7 @@ pub const ARPProtocol = struct {
                     .nic = nic,
                 };
 
+                stats.global_stats.arp.tx_requests += 1;
                 return nic.linkEP.writePacket(&r, ProtocolNumber, pb);
             }
         }
@@ -188,6 +190,7 @@ pub const ARPEndpoint = struct {
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
+            stats.global_stats.arp.rx_requests += 1;
             if (self.nic.hasAddress(target_proto_addr)) {
                 const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
@@ -217,8 +220,11 @@ pub const ARPEndpoint = struct {
                     .nic = self.nic,
                 };
 
+                stats.global_stats.arp.tx_replies += 1;
                 self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
             }
+        } else if (h.op() == 2) { // Reply
+            stats.global_stats.arp.rx_replies += 1;
         }
     }
 };

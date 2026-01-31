@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
 
     // Add other examples
     const examples = [_]struct { name: []const u8, path: []const u8, lib: []const u8 }{
+        .{ .name = "example_ping_pong", .path = "examples/ping_pong.zig", .lib = "ev" },
         .{ .name = "example_tap_libev", .path = "examples/main_tap_libev.zig", .lib = "ev" },
         .{ .name = "example_tap_libev_mux", .path = "examples/main_tap_libev_mux.zig", .lib = "ev" },
         .{ .name = "example_af_packet_libev", .path = "examples/main_af_packet_libev.zig", .lib = "ev" },
@@ -83,7 +84,8 @@ pub fn build(b: *std.Build) void {
             std.mem.eql(u8, ex.name, "example_af_packet_libev_mux") or
             std.mem.eql(u8, ex.name, "example_unified") or
             std.mem.eql(u8, ex.name, "example_uperf_libev") or
-            std.mem.eql(u8, ex.name, "example_af_xdp_libev"))
+            std.mem.eql(u8, ex.name, "example_af_xdp_libev") or
+            std.mem.eql(u8, ex.name, "example_ping_pong"))
         {
             exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
         }
