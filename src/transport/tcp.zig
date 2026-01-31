@@ -127,7 +127,6 @@ pub const TCPEndpoint = struct {
     stack: *stack.Stack,
     proto: *TCPProtocol,
     waiter_queue: *waiter.Queue,
-    owns_waiter_queue: bool = false,
     state: EndpointState = .initial,
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
@@ -690,8 +689,6 @@ pub const TCPEndpoint = struct {
             self.proto.accept_node_pool.release(node);
         }
 
-        if (self.owns_waiter_queue) self.stack.allocator.destroy(self.waiter_queue);
-
         self.stack.timer_queue.cancel(&self.retransmit_timer);
         self.cc.deinit();
 
@@ -1079,7 +1076,6 @@ pub const TCPEndpoint = struct {
                             return;
                         };
                         new_ep.retransmit_timer.context = new_ep;
-                        new_ep.owns_waiter_queue = true;
                         new_ep.state = .established;
                         new_ep.rcv_nxt = entry.rcv_nxt;
                         new_ep.snd_nxt = entry.snd_nxt +% 1;

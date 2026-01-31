@@ -29,6 +29,7 @@ const Config = struct {
     interface: []const u8,
     mtu: u32 = 1500,
     max_conns: ?u32 = null,
+    concurrency: u32 = 1,
 };
 
 const MuxContext = union(enum) {
@@ -125,6 +126,7 @@ fn parseArgs(args: []const []const u8) !Config {
     var target_ip: ?[4]u8 = null;
     var port: u16 = 5201;
     var max_conns: ?u32 = null;
+    var concurrency: u32 = 1;
 
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -143,6 +145,10 @@ fn parseArgs(args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingMaxConns;
             max_conns = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "-C")) {
+            i += 1;
+            if (i >= args.len) return error.MissingConcurrency;
+            concurrency = try std.fmt.parseInt(u32, args[i], 10);
         }
     }
 
@@ -156,6 +162,7 @@ fn parseArgs(args: []const []const u8) !Config {
         .target_ip = target_ip,
         .interface = interface,
         .max_conns = max_conns,
+        .concurrency = concurrency,
     };
 }
 
@@ -222,6 +229,8 @@ const PingServer = struct {
     mux_ctx: MuxContext,
     conn_count: u32 = 0,
     active_conns: u32 = 0,
+    start_time: i64 = 0,
+    end_time: i64 = 0,
 
     pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*PingServer {
         const self = try allocator.create(PingServer);
@@ -252,9 +261,14 @@ const PingServer = struct {
                 if (err == tcpip.Error.WouldBlock) return;
                 return;
             };
+            if (self.conn_count == 0) {
+                self.start_time = std.time.milliTimestamp();
+            }
             self.conn_count += 1;
             self.active_conns += 1;
-            std.debug.print("Server: Accepted connection #{} from {any}\n", .{ self.conn_count, res.ep.getRemoteAddress() });
+            if (self.conn_count % 10000 == 0) {
+                std.debug.print("Server: Accepted connection #{} from {any}\n", .{ self.conn_count, res.ep.getRemoteAddress() });
+            }
             if (PingConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config, self, self.conn_count)) |conn| {
                 conn.onEvent();
             } else |err| {
@@ -271,6 +285,9 @@ const PingClient = struct {
     mux: *EventMultiplexer,
     config: Config,
     next_conn_id: u32 = 1,
+    active_conns: u32 = 0,
+    start_time: i64 = 0,
+    end_time: i64 = 0,
 
     pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*PingClient {
         const self = try allocator.create(PingClient);
@@ -279,17 +296,25 @@ const PingClient = struct {
             .allocator = allocator,
             .mux = mux,
             .config = config,
+            .active_conns = 0,
         };
         return self;
     }
 
     pub fn start(self: *PingClient) !void {
-        try self.startConnection();
+        self.start_time = std.time.milliTimestamp();
+        const total = self.config.max_conns orelse 1;
+        const concurrency = self.config.concurrency;
+        var i: u32 = 0;
+        while (i < concurrency and i < total) : (i += 1) {
+            try self.startConnection();
+        }
     }
 
     pub fn startConnection(self: *PingClient) !void {
         const id = self.next_conn_id;
         self.next_conn_id += 1;
+        self.active_conns += 1;
 
         const wq = try self.allocator.create(waiter.Queue);
         wq.* = .{};
@@ -306,15 +331,23 @@ const PingClient = struct {
     }
 
     pub fn onConnectionFinished(self: *PingClient) void {
-        const max = self.config.max_conns orelse 1;
-        if (self.next_conn_id <= max) {
-            std.debug.print("Client: Connection #{} finished, starting next...\n", .{self.next_conn_id - 1});
+        self.active_conns -= 1;
+        const total = self.config.max_conns orelse 1;
+
+        if (self.next_conn_id <= total) {
             self.startConnection() catch |err| {
                 std.debug.print("Client: Failed to start next connection: {}\n", .{err});
-                if (global_loop) |l| my_ev_break(l);
             };
-        } else {
-            std.debug.print("Client: All connections finished, exiting\n\n", .{});
+        }
+
+        if (self.active_conns == 0 and self.next_conn_id > total) {
+            self.end_time = std.time.milliTimestamp();
+            const duration_ms = @as(f64, @floatFromInt(self.end_time - self.start_time));
+            const duration_s = duration_ms / 1000.0;
+            const cps = @as(f64, @floatFromInt(total)) / duration_s;
+
+            std.debug.print("Client: All concurrent connections finished, exiting\n", .{});
+            std.debug.print("Benchmark: {} connections in {d:.2}ms, CPS: {d:.2}\n\n", .{ total, duration_ms, cps });
             stats.global_stats.dump();
             stats.dumpLinkStats(&stats.global_link_stats);
             if (global_loop) |l| my_ev_break(l);
@@ -359,13 +392,11 @@ const PingConnection = struct {
 
         const events = self.wq.events();
         if (events & waiter.EventHUp != 0) {
-            std.debug.print("Connection {} received HUp\n", .{self.connection_id});
             self.close();
             return;
         }
 
         if (events & waiter.EventErr != 0) {
-            std.debug.print("Connection {} received Err\n", .{self.connection_id});
             self.close();
             return;
         }
@@ -406,7 +437,9 @@ const PingConnection = struct {
             const view = buf.toView(self.allocator) catch return;
             defer self.allocator.free(view);
             if (std.mem.eql(u8, view, "pong")) {
-                std.debug.print("Client: Received pong, initiating shutdown\n", .{});
+                if (self.connection_id % 10000 == 0) {
+                    std.debug.print("Client: Received pong #{}, initiating shutdown\n", .{self.connection_id});
+                }
                 _ = self.ep.shutdown(0) catch {}; // Shutdown write side
             }
         }
@@ -442,16 +475,28 @@ const PingConnection = struct {
             const client = @as(*PingClient, @ptrCast(@alignCast(self.parent)));
             client.onConnectionFinished();
         } else {
-            std.debug.print("Server: Connection closed\n", .{});
             const server = @as(*PingServer, @ptrCast(@alignCast(self.parent)));
             server.active_conns -= 1;
             if (server.config.max_conns) |max| {
                 if (server.conn_count >= max and server.active_conns == 0) {
+                    server.end_time = std.time.milliTimestamp();
+                    const duration_ms = @as(f64, @floatFromInt(server.end_time - server.start_time));
+                    const duration_s = duration_ms / 1000.0;
+                    const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
+
                     std.debug.print("Server: All connections handled, breaking loop...\n", .{});
+                    std.debug.print("Benchmark: {} connections in {d:.2}ms, CPS: {d:.2}\n\n", .{ server.conn_count, duration_ms, cps });
+                    stats.global_stats.dump();
+                    stats.dumpLinkStats(&stats.global_link_stats);
                     if (global_loop) |l| my_ev_break(l);
                 }
             }
         }
+
+        // Deferring destruction to avoid use-after-free in ustack's notify loop.
+        // For a benchmark of 100k connections, this is ~15-20MB leak which is acceptable.
+        // self.allocator.destroy(self.wq);
+        // self.allocator.destroy(self);
     }
 };
 
