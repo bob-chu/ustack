@@ -14,46 +14,7 @@ Do NOT assume multi-threading. Do NOT add locks. Do NOT suggest parallelization.
 
 ---
 
-## 📚 Important Documentation (READ FIRST)
 
-Before making changes to timer systems, performance optimization, or testing infrastructure, **MANDATORY reading**:
-
-### **1. [docs/100K_CPS_ROADMAP.md](docs/100K_CPS_ROADMAP.md)** — Master Navigation Document
-- **Purpose:** Entry point for the 100k CPS optimization initiative
-- **Read if:** You're new to the project or working on performance
-- **Contains:** Document map, quick start guides, current status, terminology glossary
-
-### **2. [docs/TIMER_WHEEL_DESIGN.md](docs/TIMER_WHEEL_DESIGN.md)** — Timer System Design
-- **Purpose:** Technical design of the hierarchical timer wheel (V2) with bitmask optimization
-- **Read if:** Working on `src/time.zig`, timer integration, or TCP retransmit logic
-- **Critical sections:**
-  - Section 1.1: Problem Statement (why timer optimization matters)
-  - Section 3.3: Cascading mechanics
-  - Section 5: Memory safety contract and failure modes
-  - Section 6: API contract and event loop integration
-
-### **3. [docs/CPS_OPTIMIZATION_PLAN.md](docs/CPS_OPTIMIZATION_PLAN.md)** — Implementation Roadmap
-- **Purpose:** Phased implementation plan with status tracking
-- **Read if:** Planning work, estimating effort, or checking phase dependencies
-- **Key sections:**
-  - Status Dashboard: Real-time progress across all phases
-  - Dependency Graph: Critical path vs parallel work opportunities
-  - Phase 5: Rollback procedures and feature flags
-
-### **4. [docs/CPS_OPTIMIZATION_TEST_PLAN.md](docs/CPS_OPTIMIZATION_TEST_PLAN.md)** — Testing Strategy
-- **Purpose:** Comprehensive test plan from unit → integration → performance
-- **Read if:** Writing tests, setting up benchmarks, or reproducing bugs
-- **Key sections:**
-  - Section 0: Test execution sequence (order matters!)
-  - Section 5: MANDATORY environment setup for reproducible benchmarks
-  - Section 6: Failure triage protocol (P0-P3 severity levels)
-  - Test-to-Code Mapping: Links test IDs to actual file locations
-
-### **5. [docs/TIME_WAIT_REUSE_DESIGN.md](docs/TIME_WAIT_REUSE_DESIGN.md)** — TIME-WAIT Optimization
-- **Purpose:** Design for TIME-WAIT state optimization (future work)
-- **Read if:** Working on TCP state machine, connection lifecycle, or port exhaustion issues
-
----
 
 ## 🛠 Build, Lint, and Test Commands
 
