@@ -41,7 +41,16 @@ pub const UDPProtocol = struct {
         .number = number,
         .newEndpoint = newEndpoint,
         .parsePorts = parsePorts,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*UDPProtocol, @ptrCast(@alignCast(ptr)));
+        // UDPProtocol.deinit needs allocator, but it already has view_pool etc initialized with it.
+        // Wait, UDPProtocol.deinit(self, allocator) takes an allocator.
+        // Let's use the one from view_pool.
+        self.deinit(self.view_pool.allocator);
+    }
 
     fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber {
         _ = ptr;

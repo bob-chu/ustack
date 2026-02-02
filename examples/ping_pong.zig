@@ -38,19 +38,16 @@ const MuxContext = union(enum) {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 0 }){};
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     const config = try parseArgs(args);
-    std.debug.print("Starting ping-pong with config: {any}\n", .{config});
 
     global_stack = try ustack.init(allocator);
     global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
 
-    std.debug.print("AF_PACKET initialized on {s}\n", .{config.interface});
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     global_eth.linkEndpoint().setMTU(config.mtu);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
@@ -97,19 +94,20 @@ pub fn main() !void {
 
     if (config.mode == .server) {
         _ = try PingServer.init(&global_stack, allocator, mux, config);
-        std.debug.print("Ping server listening on port {}\n", .{config.port});
     } else {
         const client = try PingClient.init(&global_stack, allocator, mux, config);
         try client.start();
-        std.debug.print("Ping client connecting to {any} port {}\n", .{ config.target_ip.?, config.port });
     }
 
     my_ev_run(loop);
 
-    // Print stats on exit
-    std.debug.print("\n=== SERVER STATS ===\n", .{});
+    // Print stats BEFORE deinit to ensure pointers are valid if needed (though stats are global)
+    std.debug.print("\n=== BENCHMARK STATS ===\n", .{});
     stats.global_stats.dump();
     stats.dumpLinkStats(&stats.global_link_stats);
+
+    global_stack.deinit();
+    if (global_mux) |m| m.deinit();
 }
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -185,19 +183,19 @@ var global_loop: ?*anyopaque = null;
 var global_mark_done: bool = false;
 var global_done_time: i64 = 0;
 
-fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
+    fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
     _ = revents;
-    var budget: usize = 16;
+    var budget: usize = 256;
     while (budget > 0) : (budget -= 1) {
-        const ok = global_af_packet.readPacket() catch |err| {
-            std.debug.print("AF_PACKET read error: {}\n", .{err});
+        const ok = global_af_packet.readPacket() catch {
             return;
         };
         if (!ok) break;
     }
 }
+
 
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
     _ = loop;
@@ -283,18 +281,16 @@ const PingServer = struct {
                 const diff_conns = self.conn_count - self.last_conn_count;
                 const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
                 const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
-                std.debug.print("Server: Current CPS: {d:.2} (Total: {})\n", .{ current_cps, self.conn_count });
+                if (self.conn_count > 0) {
+                    std.debug.print("CPS: {d:.0}\n", .{current_cps});
+                }
                 self.last_report_time = now;
                 self.last_conn_count = self.conn_count;
             }
 
-            if (self.conn_count % 10000 == 0) {
-                std.debug.print("Server: Accepted connection #{} from {any}\n", .{ self.conn_count, res.ep.getRemoteAddress() });
-            }
             if (PingConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config, self, self.conn_count)) |conn| {
                 conn.onEvent();
-            } else |err| {
-                std.debug.print("Server: Failed to init connection: {}\n", .{err});
+            } else |_| {
                 self.active_conns -= 1;
             }
         }
@@ -357,9 +353,7 @@ const PingClient = struct {
         const total = self.config.max_conns orelse 1;
 
         if (self.next_conn_id <= total) {
-            self.startConnection() catch |err| {
-                std.debug.print("Client: Failed to start next connection: {}\n", .{err});
-            };
+            self.startConnection() catch {};
         }
 
         if (self.active_conns == 0 and self.next_conn_id > total) {
@@ -368,8 +362,7 @@ const PingClient = struct {
             const duration_s = duration_ms / 1000.0;
             const cps = @as(f64, @floatFromInt(total)) / duration_s;
 
-            std.debug.print("Client: All concurrent connections finished, exiting\n", .{});
-            std.debug.print("Benchmark: {} connections in {d:.2}ms, CPS: {d:.2}\n\n", .{ total, duration_ms, cps });
+            std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ total, cps });
             if (global_loop) |l| my_ev_break(l);
         }
     }
@@ -384,6 +377,7 @@ const PingConnection = struct {
     parent: *anyopaque,
     connection_id: u32,
     closed: bool = false,
+    pending_cleanup: bool = false,
     sent: bool = false,
     wait_entry: waiter.Entry,
     mux_ctx: MuxContext,
@@ -408,7 +402,8 @@ const PingConnection = struct {
     }
 
     fn onEvent(self: *PingConnection) void {
-        if (self.closed) return;
+        // Return early if already closed or pending cleanup to avoid use-after-free
+        if (self.closed or self.pending_cleanup) return;
 
         const events = self.wq.events();
         if (events & waiter.EventHUp != 0) {
@@ -449,17 +444,12 @@ const PingConnection = struct {
             return;
         }
 
-        // Clear consumption callback to avoid rcv_buf_used underflow in TCP stack
-        buf.consumption_callback = null;
         defer buf.deinit();
 
         if (self.sent) {
             const view = buf.toView(self.allocator) catch return;
             defer self.allocator.free(view);
             if (std.mem.eql(u8, view, "pong")) {
-                if (self.connection_id % 10000 == 0) {
-                    std.debug.print("Client: Received pong #{}, initiating shutdown\n", .{self.connection_id});
-                }
                 _ = self.ep.shutdown(0) catch {}; // Shutdown write side
             }
         }
@@ -488,6 +478,9 @@ const PingConnection = struct {
     fn close(self: *PingConnection) void {
         if (self.closed) return;
         self.closed = true;
+        // Set pending_cleanup FIRST to prevent any race with in-flight events
+        self.pending_cleanup = true;
+
         self.wq.eventUnregister(&self.wait_entry);
         self.ep.close();
 
@@ -504,19 +497,17 @@ const PingConnection = struct {
                     const duration_s = duration_ms / 1000.0;
                     const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
 
-                    std.debug.print("Server: All connections handled, waiting 1s for last ACK...\n", .{});
                     global_mark_done = true;
                     global_done_time = std.time.milliTimestamp();
 
-                    std.debug.print("Benchmark: {} connections in {d:.2}ms, CPS: {d:.2}\n\n", .{ server.conn_count, duration_ms, cps });
+                    std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
                 }
             }
         }
 
-        // Deferring destruction to avoid use-after-free in ustack's notify loop.
-        // For a benchmark of 100k connections, this is ~15-20MB leak which is acceptable.
-        // self.allocator.destroy(self.wq);
-        // self.allocator.destroy(self);
+        // Now safe to destroy - no more events will be processed for this connection
+        self.allocator.destroy(self.wq);
+        self.allocator.destroy(self);
     }
 };
 

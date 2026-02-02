@@ -67,12 +67,7 @@ pub const TCPProtocol = struct {
         // Drain endpoint pool and really deinit them
         while (self.endpoint_pool.free_list) |ep| {
             self.endpoint_pool.free_list = ep.next;
-            if (ep.pooled) {
-                ep.cc.deinit();
-                ep.sack_blocks.deinit();
-                ep.peer_sack_blocks.deinit();
-                ep.syncache.deinit();
-            }
+            ep.deinit();
             self.allocator.destroy(ep);
         }
 
@@ -89,7 +84,13 @@ pub const TCPProtocol = struct {
         .newEndpoint = newEndpoint,
         .parsePorts = parsePorts,
         .handlePacket = handlePacket_external,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*TCPProtocol, @ptrCast(@alignCast(ptr)));
+        self.deinit();
+    }
 
     fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber {
         _ = ptr;
@@ -768,6 +769,16 @@ pub const TCPEndpoint = struct {
         if (self.ref_count == 0) self.destroy();
     }
 
+    pub fn deinit(self: *TCPEndpoint) void {
+        if (self.pooled) {
+            self.cc.deinit();
+            self.sack_blocks.deinit();
+            self.peer_sack_blocks.deinit();
+            self.syncache.deinit();
+            self.pooled = false;
+        }
+    }
+
     fn destroy(self: *TCPEndpoint) void {
         // Drain queues
         while (self.rcv_list.popFirst()) |node| {
@@ -792,14 +803,13 @@ pub const TCPEndpoint = struct {
             self.proto.segment_node_pool.release(node);
         }
 
-        self.proto.endpoint_pool.release(self);
+        if (!self.proto.endpoint_pool.tryRelease(self)) {
+            self.deinit();
+            self.proto.allocator.destroy(self);
+        }
     }
 
     pub fn close(self: *TCPEndpoint) void {
-        if (self.state == .closed) {
-            return;
-        }
-
         if (self.state == .established) {
             self.state = .fin_wait1;
             self.enqueueControl(header.TCPFlagFin | header.TCPFlagAck) catch {};
@@ -823,7 +833,7 @@ pub const TCPEndpoint = struct {
             }
         }
 
-        // Always try to unregister if closing/error
+        // Always try to unregister if closing/error/closed
         if (self.state == .fin_wait1 or self.state == .last_ack or self.state == .closed or self.state == .error_state) {
             if (self.local_addr) |la| {
                 if (self.remote_addr) |ra| {
@@ -1061,7 +1071,16 @@ pub const TCPEndpoint = struct {
 
         // Increment stats
         stats.global_stats.tcp.tx_segments += 1;
+        if (flags & header.TCPFlagSyn != 0) {
+            if (flags & header.TCPFlagAck != 0) {
+                stats.global_stats.tcp.tx_syn_ack += 1;
+            } else {
+                stats.global_stats.tcp.tx_syn += 1;
+            }
+        }
         if (flags & header.TCPFlagAck != 0) stats.global_stats.tcp.tx_ack += 1;
+        if (flags & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh += 1;
+        if (flags & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin += 1;
 
         var mut_r = r;
         try mut_r.writePacket(6, pb);
@@ -1072,6 +1091,19 @@ pub const TCPEndpoint = struct {
         if (v.len < header.TCPMinimumSize) return;
         const h = header.TCP.init(v);
         const fl = h.flags();
+
+        // Increment stats
+        stats.global_stats.tcp.rx_segments += 1;
+        if (fl & header.TCPFlagSyn != 0) {
+            if (fl & header.TCPFlagAck != 0) {
+                stats.global_stats.tcp.rx_syn_ack += 1;
+            } else {
+                stats.global_stats.tcp.rx_syn += 1;
+            }
+        }
+        if (fl & header.TCPFlagAck != 0) stats.global_stats.tcp.rx_ack += 1;
+        if (fl & header.TCPFlagPsh != 0) stats.global_stats.tcp.rx_psh += 1;
+        if (fl & header.TCPFlagFin != 0) stats.global_stats.tcp.rx_fin += 1;
 
         var notify_mask: waiter.EventMask = 0;
         defer {
@@ -1197,6 +1229,8 @@ pub const TCPEndpoint = struct {
                     var mut_r = r.*;
                     mut_r.writePacket(ProtocolNumber, pb) catch {};
                     stats.global_stats.tcp.tx_segments += 1;
+                    stats.global_stats.tcp.tx_syn_ack += 1;
+                    stats.global_stats.tcp.tx_ack += 1;
                 } else if (fl & header.TCPFlagAck != 0) {
                     const sync_key = SyncacheKey{ .addr = id.remote_address, .port = h.sourcePort() };
                     if (self.syncache.fetchRemove(sync_key)) |kv| {
@@ -1423,7 +1457,10 @@ pub const TCPEndpoint = struct {
             it = node.next;
         }
         const node = try self.proto.packet_node_pool.acquire();
-        node.data = .{ .data = pkt_data, .seq = seq };
+        node.data = .{ 
+            .data = try pkt_data.cloneInPool(&self.proto.view_pool), 
+            .seq = seq 
+        };
         if (it) |next| {
             self.ooo_list.insertBefore(next, node);
         } else {

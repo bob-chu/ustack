@@ -126,7 +126,12 @@ pub const NetworkProtocol = struct {
         newEndpoint: *const fn (ptr: *anyopaque, nic: *NIC, addr: tcpip.AddressWithPrefix, dispatcher: TransportDispatcher) tcpip.Error!NetworkEndpoint,
         linkAddressRequest: *const fn (ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *NIC) tcpip.Error!void,
         parseAddresses: *const fn (ptr: *anyopaque, pkt: tcpip.PacketBuffer) AddressPair,
+        deinit: ?*const fn (ptr: *anyopaque) void = null,
     };
+
+    pub fn deinit(self: NetworkProtocol) void {
+        if (self.vtable.deinit) |f| f(self.ptr);
+    }
 
     pub fn number(self: NetworkProtocol) tcpip.NetworkProtocolNumber {
         return self.vtable.number(self.ptr);
@@ -220,7 +225,12 @@ pub const TransportProtocol = struct {
         newEndpoint: *const fn (ptr: *anyopaque, stack: *Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint,
         parsePorts: *const fn (ptr: *anyopaque, pkt: tcpip.PacketBuffer) PortPair,
         handlePacket: ?*const fn (ptr: *anyopaque, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void = null,
+        deinit: ?*const fn (ptr: *anyopaque) void = null,
     };
+
+    pub fn deinit(self: TransportProtocol) void {
+        if (self.vtable.deinit) |f| f(self.ptr);
+    }
 
     pub fn number(self: TransportProtocol) tcpip.TransportProtocolNumber {
         return self.vtable.number(self.ptr);
@@ -557,8 +567,19 @@ pub const Stack = struct {
         self.nics.deinit();
         self.endpoints.deinit();
         self.link_addr_cache.deinit();
+
+        var transport_it = self.transport_protocols.valueIterator();
+        while (transport_it.next()) |proto| {
+            proto.deinit();
+        }
         self.transport_protocols.deinit();
+
+        var network_it = self.network_protocols.valueIterator();
+        while (network_it.next()) |proto| {
+            proto.deinit();
+        }
         self.network_protocols.deinit();
+
         self.route_table.deinit();
     }
 

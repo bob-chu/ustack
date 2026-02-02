@@ -26,7 +26,14 @@ pub const IPv4Protocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        _ = ptr;
+        // IPv4Protocol is stateless and usually allocated on stack or once.
+        // But in main.zig it's on heap.
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;

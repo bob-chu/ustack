@@ -266,6 +266,8 @@ const IperfServer = struct {
 
     bytes_received: u64 = 0,
     packets_received: u64 = 0,
+    bytes_since_last_report: u64 = 0,
+    packets_since_last_report: u64 = 0,
     last_report_time: i64 = 0,
     start_time: i64 = 0, // Added
     udp_start_time: i64 = 0,
@@ -398,20 +400,22 @@ const IperfServer = struct {
 
             self.bytes_received += buf.size;
             self.packets_received += 1;
+            self.bytes_since_last_report += buf.size;
+            self.packets_since_last_report += 1;
             const elapsed = now - self.last_report_time;
             if (elapsed >= 1000) {
                 const seconds = @as(f64, @floatFromInt(elapsed)) / 1000.0;
-                const bytes = @as(f64, @floatFromInt(self.bytes_received));
+                const bytes = @as(f64, @floatFromInt(self.bytes_since_last_report));
                 const mbps = (bytes * 8.0) / seconds / 1000000.0;
-                const pps = @as(f64, @floatFromInt(self.packets_received)) / seconds;
+                const pps = @as(f64, @floatFromInt(self.packets_since_last_report)) / seconds;
 
                 const start_sec = @as(f64, @floatFromInt(self.last_report_time - self.udp_start_time)) / 1000.0;
                 const end_sec = @as(f64, @floatFromInt(now - self.udp_start_time)) / 1000.0;
 
                 std.debug.print("[  5] {d: >5.2}-{d: >5.2} sec  {d: >6.2} MBytes  {d: >6.2} Mbits/sec  {d: >6.0} pps\n", .{ start_sec, end_sec, bytes / 1024.0 / 1024.0, mbps, pps });
 
-                self.bytes_received = 0;
-                self.packets_received = 0;
+                self.bytes_since_last_report = 0;
+                self.packets_since_last_report = 0;
                 self.last_report_time = now;
             }
         }

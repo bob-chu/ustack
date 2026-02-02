@@ -240,6 +240,7 @@ pub const AfPacket = struct {
 
             const view_mem = self.view_pool.acquire() catch {
                 stats.global_stats.tcp.pool_exhausted += 1;
+                c.release();
                 continue;
             };
             const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
