@@ -19,10 +19,9 @@ test "TCP Fast Retransmit" {
     try s.registerNetworkProtocol(ipv4_proto.protocol());
     try s.registerTransportProtocol(tcp_proto.protocol());
     var wq_server = waiter.Queue{};
-    var ep_server = try allocator.create(TCPEndpoint);
-    ep_server.* = try TCPEndpoint.init(&s, tcp_proto, &wq_server, 1460);
-    ep_server.retransmit_timer.context = ep_server;
-    defer ep_server.decRef();
+    const ep_server_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_server);
+    const ep_server = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_server_res.ptr)));
+    defer ep_server.close();
 
     var fake_ep = struct {
         last_pkt: ?[]u8 = null,
@@ -65,10 +64,9 @@ test "TCP Fast Retransmit" {
     try ep_server.endpoint().bind(sa);
     try ep_server.endpoint().listen(10);
     var wq_client = waiter.Queue{};
-    var ep_client = try allocator.create(TCPEndpoint);
-    ep_client.* = try TCPEndpoint.init(&s, tcp_proto, &wq_client, 1460);
-    ep_client.retransmit_timer.context = ep_client;
-    defer ep_client.decRef();
+    const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
+    const ep_client = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_client_res.ptr)));
+    defer ep_client.close();
     try ep_client.endpoint().bind(ca);
     try ep_client.endpoint().connect(sa);
     const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
@@ -138,10 +136,9 @@ test "TCP Retransmission" {
     try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = sa.addr, .prefix_len = 24 } });
     try s.addLinkAddress(ca.addr, .{ .addr = [_]u8{0} ** 6 });
     var wq_server = waiter.Queue{};
-    var ep_server = try allocator.create(TCPEndpoint);
-    ep_server.* = try TCPEndpoint.init(&s, tcp_proto, &wq_server, 1460);
-    ep_server.retransmit_timer.context = ep_server;
-    defer ep_server.decRef();
+    const ep_server_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_server);
+    const ep_server = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_server_res.ptr)));
+    defer ep_server.close();
     try ep_server.endpoint().bind(sa);
     try ep_server.endpoint().listen(10);
     const syn_buf = try allocator.alloc(u8, header.TCPMinimumSize);
@@ -215,12 +212,10 @@ test "TCP CWND Enforcement" {
     try s.createNIC(1, link_ep);
     _ = s.nics.get(1).?;
     var wq = waiter.Queue{};
-    var ep = try allocator.create(TCPEndpoint);
-    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
-    ep.retransmit_timer.context = ep;
-    defer ep.decRef();
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
+    defer ep.close();
     ep.state = .established;
-
     ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
     ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
     ep.rcv_nxt = 1000;
@@ -270,11 +265,10 @@ test "TCP SACK Blocks Generation" {
     try s.registerTransportProtocol(tcp_proto.protocol());
 
     var wq = waiter.Queue{};
-    var ep = try allocator.create(TCPEndpoint);
-    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
-    ep.retransmit_timer.context = ep;
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
     ep.hint_sack_enabled = true;
-    defer ep.decRef();
+    defer ep.close();
     ep.state = .established;
     ep.rcv_nxt = 1000;
 
@@ -311,10 +305,9 @@ test "TCP readv/writev zero-copy" {
     try s.registerTransportProtocol(tcp_proto.protocol());
 
     var wq = waiter.Queue{};
-    var ep = try allocator.create(TCPEndpoint);
-    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
-    ep.retransmit_timer.context = ep;
-    defer ep.decRef();
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
+    defer ep.close();
     ep.state = .established;
     ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
     ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };

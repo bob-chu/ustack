@@ -128,6 +128,7 @@ pub fn Pool(comptime T: type) type {
             }
             stats.global_stats.pool.generic_fallback += 1;
             const node = try self.allocator.create(T);
+            @memset(std.mem.asBytes(node), 0);
             node.next = null;
             node.prev = null;
             return node;

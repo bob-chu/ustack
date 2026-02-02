@@ -68,29 +68,25 @@ test "TCP TIME_WAIT Reuse" {
     var wq_client = waiter.Queue{};
     const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
     const ep_client = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_client_res.ptr)));
-    // ep_client.retransmit_timer.context = ep_client;
-    // ep_client.time_wait_timer.context = ep_client;
-    defer ep_client.decRef();
+    defer ep_client.close();
 
     try ep_client.endpoint().bind(ca);
     try ep_client.endpoint().connect(sa);
 
     // Mock SYN-ACK from server
-    const r_to_client = stack.Route{ .local_address = ca.addr, .remote_address = sa.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
-    const id_to_client = stack.TransportEndpointID{ .local_port = 1234, .local_address = ca.addr, .remote_port = 80, .remote_address = sa.addr, .protocol = tcp.ProtocolNumber };
-    
     const client_isn = header.TCP.init(fake_link.last_pkt.?[20..]).sequenceNumber();
-
+    const r_to_client = stack.Route{ .local_address = ca.addr, .remote_address = sa.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
+    const id_to_client = stack.TransportEndpointID{ .local_port = 1234, .local_address = ca.addr, .remote_port = 80, .remote_address = sa.addr };
+    
     var syn_ack_buf = try allocator.alloc(u8, header.TCPMinimumSize);
     defer allocator.free(syn_ack_buf);
     @memset(syn_ack_buf, 0);
     var syn_ack = header.TCP.init(syn_ack_buf);
     syn_ack.encode(sa.port, ca.port, 5000, client_isn +% 1, header.TCPFlagSyn | header.TCPFlagAck, 65535);
     const syn_ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(syn_ack_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
-    var mut_syn_ack = syn_ack_pkt;
     
-    ep_client.handlePacket(&r_to_client, id_to_client, mut_syn_ack);
-    mut_syn_ack.data.deinit();
+    ep_client.handlePacket(&r_to_client, id_to_client, syn_ack_pkt);
+    syn_ack_pkt.data.deinit();
     try std.testing.expect(ep_client.state == .established);
 
     // 2. Close connection (Active close by client)
@@ -104,9 +100,8 @@ test "TCP TIME_WAIT Reuse" {
     var ack = header.TCP.init(ack_buf);
     ack.encode(sa.port, ca.port, 5001, ep_client.snd_nxt, header.TCPFlagAck, 65535);
     const ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(ack_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
-    var mut_ack = ack_pkt;
-    ep_client.handlePacket(&r_to_client, id_to_client, mut_ack);
-    mut_ack.data.deinit();
+    ep_client.handlePacket(&r_to_client, id_to_client, ack_pkt);
+    ack_pkt.data.deinit();
     try std.testing.expect(ep_client.state == .fin_wait2);
 
     // Mock FIN from server
@@ -116,18 +111,15 @@ test "TCP TIME_WAIT Reuse" {
     var fin = header.TCP.init(fin_buf);
     fin.encode(sa.port, ca.port, 5001, ep_client.snd_nxt, header.TCPFlagFin | header.TCPFlagAck, 65535);
     const fin_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fin_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
-    var mut_fin = fin_pkt;
-    ep_client.handlePacket(&r_to_client, id_to_client, mut_fin);
-    mut_fin.data.deinit();
+    ep_client.handlePacket(&r_to_client, id_to_client, fin_pkt);
+    fin_pkt.data.deinit();
     try std.testing.expect(ep_client.state == .time_wait);
 
     // 3. Try to establish NEW connection with same 4-tuple without SO_REUSEADDR
     var wq_client2 = waiter.Queue{};
     const ep_client2_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client2);
     const ep_client2 = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_client2_res.ptr)));
-    // ep_client2.retransmit_timer.context = ep_client2;
-    // ep_client2.time_wait_timer.context = ep_client2;
-    defer ep_client2.decRef();
+    defer ep_client2.close();
 
     try ep_client2.endpoint().bind(ca);
     const connect_res = ep_client2.endpoint().connect(sa);
