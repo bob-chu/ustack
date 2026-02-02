@@ -182,6 +182,8 @@ extern fn my_ev_run(loop: ?*anyopaque) void;
 extern fn my_ev_break(loop: ?*anyopaque) void;
 
 var global_loop: ?*anyopaque = null;
+var global_mark_done: bool = false;
+var global_done_time: i64 = 0;
 
 fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
@@ -202,6 +204,12 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     _ = watcher;
     _ = revents;
     _ = global_stack.timer_queue.tick();
+
+    if (global_mark_done) {
+        if (std.time.milliTimestamp() - global_done_time >= 1000) {
+            if (global_loop) |l| my_ev_break(l);
+        }
+    }
 }
 
 fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
@@ -231,6 +239,8 @@ const PingServer = struct {
     active_conns: u32 = 0,
     start_time: i64 = 0,
     end_time: i64 = 0,
+    last_report_time: i64 = 0,
+    last_conn_count: u32 = 0,
 
     pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*PingServer {
         const self = try allocator.create(PingServer);
@@ -248,6 +258,7 @@ const PingServer = struct {
             .config = config,
             .mux_ctx = .{ .server = self },
             .wait_entry = undefined,
+            .last_report_time = std.time.milliTimestamp(),
         };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn);
@@ -266,6 +277,17 @@ const PingServer = struct {
             }
             self.conn_count += 1;
             self.active_conns += 1;
+
+            const now = std.time.milliTimestamp();
+            if (now - self.last_report_time >= 1000) {
+                const diff_conns = self.conn_count - self.last_conn_count;
+                const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
+                const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
+                std.debug.print("Server: Current CPS: {d:.2} (Total: {})\n", .{ current_cps, self.conn_count });
+                self.last_report_time = now;
+                self.last_conn_count = self.conn_count;
+            }
+
             if (self.conn_count % 10000 == 0) {
                 std.debug.print("Server: Accepted connection #{} from {any}\n", .{ self.conn_count, res.ep.getRemoteAddress() });
             }
@@ -348,8 +370,6 @@ const PingClient = struct {
 
             std.debug.print("Client: All concurrent connections finished, exiting\n", .{});
             std.debug.print("Benchmark: {} connections in {d:.2}ms, CPS: {d:.2}\n\n", .{ total, duration_ms, cps });
-            stats.global_stats.dump();
-            stats.dumpLinkStats(&stats.global_link_stats);
             if (global_loop) |l| my_ev_break(l);
         }
     }
@@ -484,11 +504,11 @@ const PingConnection = struct {
                     const duration_s = duration_ms / 1000.0;
                     const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
 
-                    std.debug.print("Server: All connections handled, breaking loop...\n", .{});
+                    std.debug.print("Server: All connections handled, waiting 1s for last ACK...\n", .{});
+                    global_mark_done = true;
+                    global_done_time = std.time.milliTimestamp();
+
                     std.debug.print("Benchmark: {} connections in {d:.2}ms, CPS: {d:.2}\n\n", .{ server.conn_count, duration_ms, cps });
-                    stats.global_stats.dump();
-                    stats.dumpLinkStats(&stats.global_link_stats);
-                    if (global_loop) |l| my_ev_break(l);
                 }
             }
         }

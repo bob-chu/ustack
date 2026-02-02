@@ -32,6 +32,9 @@ pub const TCPProtocol = struct {
             .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 131072),
             .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 4096),
         };
+        // Pre-warm a reasonable amount of buffers/nodes for initial bursts
+        self.header_pool.prewarm(128) catch {};
+        self.view_pool.prewarm(128) catch {};
         return self;
     }
 
@@ -158,7 +161,7 @@ pub const TCPEndpoint = struct {
     peer_sack_blocks: std.ArrayList(SackBlock) = undefined,
 
     backlog: i32 = 0,
-    syncache: std.ArrayList(SyncacheEntry) = undefined,
+    syncache: SyncacheMap = undefined,
 
     dup_ack_count: u32 = 0,
     last_ack: u32 = 0,
@@ -184,7 +187,47 @@ pub const TCPEndpoint = struct {
         ws_negotiated: bool,
         snd_wnd_scale: u8,
         mss: u16,
+
+        pub fn hash(self: SyncacheEntry) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&self.remote_addr.port));
+            const addr_hash = self.remote_addr.addr.hash();
+            h.update(std.mem.asBytes(&addr_hash));
+            return h.final();
+        }
+
+        pub fn eql(self: SyncacheEntry, other: SyncacheEntry) bool {
+            return self.remote_addr.port == other.remote_addr.port and self.remote_addr.addr.eq(other.remote_addr.addr);
+        }
     };
+
+    pub const SyncacheKey = struct {
+        addr: tcpip.Address,
+        port: u16,
+
+        pub fn hash(self: SyncacheKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&self.port));
+            const addr_hash = self.addr.hash();
+            h.update(std.mem.asBytes(&addr_hash));
+            return h.final();
+        }
+
+        pub fn eql(self: SyncacheKey, other: SyncacheKey) bool {
+            return self.port == other.port and self.addr.eq(other.addr);
+        }
+    };
+
+    pub const SyncacheContext = struct {
+        pub fn hash(_: SyncacheContext, key: SyncacheKey) u64 {
+            return key.hash();
+        }
+        pub fn eql(_: SyncacheContext, a: SyncacheKey, b: SyncacheKey) bool {
+            return a.eql(b);
+        }
+    };
+
+    pub const SyncacheMap = std.HashMap(SyncacheKey, SyncacheEntry, SyncacheContext, std.hash_map.default_max_load_percentage);
 
     pub const Segment = struct {
         data: buffer.VectorisedView,
@@ -211,7 +254,7 @@ pub const TCPEndpoint = struct {
             .retransmit_timer = time.Timer.init(handleRetransmitTimer, undefined),
             .sack_blocks = std.ArrayList(SackBlock).init(s.allocator),
             .peer_sack_blocks = std.ArrayList(SackBlock).init(s.allocator),
-            .syncache = std.ArrayList(SyncacheEntry).init(s.allocator),
+            .syncache = SyncacheMap.init(s.allocator),
         };
         self.rcv_wnd = self.rcv_wnd_max;
         return self;
@@ -913,6 +956,12 @@ pub const TCPEndpoint = struct {
     }
 
     pub fn handlePacket(self: *TCPEndpoint, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+        defer {
+            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.tcp_endpoint.record(end_processing - pkt.timestamp_ns);
+            }
+        }
         const v = pkt.data.first() orelse return;
         const h = header.TCP.init(v);
         const fl = h.flags();
@@ -967,45 +1016,40 @@ pub const TCPEndpoint = struct {
         switch (self.state) {
             .listen => {
                 if (fl & header.TCPFlagSyn != 0) {
-                    // Check if we already have a syncache entry for this peer
-                    for (self.syncache.items) |*entry| {
-                        if (entry.remote_addr.addr.eq(id.remote_address) and entry.remote_addr.port == h.sourcePort()) {
-                            // Retransmit SYN-ACK (we'll re-encode it below)
-                            // entry.rcv_nxt = h.sequenceNumber() +% 1; // Optional: update rcv_nxt if peer changed ISN?
-                            // We use the existing snd_nxt (server ISN) to be consistent
-                            break;
-                        }
+                    stats.global_stats.tcp.syncache_searches += 1;
+                    const key = SyncacheKey{ .addr = id.remote_address, .port = h.sourcePort() };
+
+                    if (self.syncache.getPtr(key)) |entry| {
+                        _ = entry;
+                        // Retransmit SYN-ACK logic (it will be re-encoded below using entry)
                     } else {
-                        if (self.syncache.items.len + self.accepted_queue.len >= self.backlog) return;
+                        if (self.syncache.count() + self.accepted_queue.len >= self.backlog) return;
                         var entry = SyncacheEntry{ .remote_addr = .{ .nic = r.nic.id, .addr = id.remote_address, .port = h.sourcePort() }, .rcv_nxt = h.sequenceNumber() +% 1, .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))), .ts_recent = self.ts_recent, .ts_enabled = self.ts_enabled, .sack_enabled = false, .ws_negotiated = false, .snd_wnd_scale = 0, .mss = self.max_segment_size };
-                        var opt_idx: usize = 20;
-                        while (opt_idx < hlen) {
-                            const kind = v[opt_idx];
+                        var s_opt_idx: usize = 20;
+                        while (s_opt_idx < hlen) {
+                            const kind = v[s_opt_idx];
                             if (kind == 0) break;
                             if (kind == 1) {
-                                opt_idx += 1;
+                                s_opt_idx += 1;
                                 continue;
                             }
-                            if (opt_idx + 1 >= hlen) break;
-                            const len = v[opt_idx + 1];
-                            if (len < 2 or opt_idx + len > hlen) break;
-                            if (kind == 2 and len == 4) entry.mss = std.mem.readInt(u16, v[opt_idx + 2 .. opt_idx + 4][0..2], .big) else if (kind == 3 and len == 3) {
-                                entry.snd_wnd_scale = v[opt_idx + 2];
+                            if (s_opt_idx + 1 >= hlen) break;
+                            const len = v[s_opt_idx + 1];
+                            if (len < 2 or s_opt_idx + len > hlen) break;
+                            if (kind == 2 and len == 4) entry.mss = std.mem.readInt(u16, v[s_opt_idx + 2 .. s_opt_idx + 4][0..2], .big) else if (kind == 3 and len == 3) {
+                                entry.snd_wnd_scale = v[s_opt_idx + 2];
                                 entry.ws_negotiated = true;
                             } else if (kind == 4 and len == 2) entry.sack_enabled = true;
-                            opt_idx += len;
+                            s_opt_idx += len;
                         }
-                        self.syncache.append(entry) catch return;
+                        self.syncache.put(key, entry) catch return;
+                        if (self.syncache.count() > stats.global_stats.tcp.syncache_max_size) {
+                            stats.global_stats.tcp.syncache_max_size = self.syncache.count();
+                        }
                     }
 
                     // Find the entry (either existing or just added)
-                    var current_entry: *SyncacheEntry = undefined;
-                    for (self.syncache.items) |*e| {
-                        if (e.remote_addr.addr.eq(id.remote_address) and e.remote_addr.port == h.sourcePort()) {
-                            current_entry = e;
-                            break;
-                        }
-                    }
+                    const current_entry = self.syncache.getPtr(key).?;
 
                     const options_len: u8 = (if (current_entry.ts_enabled) @as(u8, 12) else 0) + (if (current_entry.ws_negotiated) @as(u8, 4) else 0) + (if (current_entry.sack_enabled) @as(u8, 4) else 0) + 4;
                     const hdr_buf = self.proto.header_pool.acquire() catch return;
@@ -1055,52 +1099,43 @@ pub const TCPEndpoint = struct {
                     var mut_r = r.*;
                     mut_r.writePacket(6, pb) catch {};
                 } else if (fl & header.TCPFlagAck != 0) {
-                    var found_idx: ?usize = null;
-                    for (self.syncache.items, 0..) |entry, i| {
-                        if (entry.remote_addr.addr.eq(id.remote_address) and entry.remote_addr.port == h.sourcePort() and h.ackNumber() == entry.snd_nxt +% 1) {
-                            found_idx = i;
-                            break;
+                    stats.global_stats.tcp.syncache_searches += 1;
+                    const key = SyncacheKey{ .addr = id.remote_address, .port = h.sourcePort() };
+
+                    if (self.syncache.get(key)) |entry| {
+                        if (h.ackNumber() == entry.snd_nxt +% 1) {
+                            const new_ep = self.stack.allocator.create(TCPEndpoint) catch return;
+                            new_ep.* = TCPEndpoint.init(self.stack, self.proto, self.waiter_queue, entry.mss) catch {
+                                self.stack.allocator.destroy(new_ep);
+                                return;
+                            };
+                            new_ep.local_addr = .{ .nic = r.nic.id, .addr = id.local_address, .port = id.local_port };
+                            new_ep.remote_addr = entry.remote_addr;
+                            new_ep.rcv_nxt = entry.rcv_nxt;
+                            new_ep.snd_nxt = entry.snd_nxt +% 1;
+                            new_ep.last_ack = entry.snd_nxt +% 1;
+                            new_ep.state = .established;
+                            new_ep.ts_recent = entry.ts_recent;
+                            new_ep.ts_enabled = entry.ts_enabled;
+                            new_ep.snd_wnd_scale = entry.snd_wnd_scale;
+
+                            const ep_id = stack.TransportEndpointID{ .local_port = id.local_port, .local_address = id.local_address, .remote_port = entry.remote_addr.port, .remote_address = entry.remote_addr.addr };
+                            self.stack.registerTransportEndpoint(ep_id, new_ep.transportEndpoint()) catch {
+                                new_ep.decRef();
+                                return;
+                            };
+
+                            const node = self.proto.accept_node_pool.acquire() catch {
+                                new_ep.decRef();
+                                return;
+                            };
+                            node.data = .{ .ep = new_ep.endpoint(), .wq = self.waiter_queue };
+                            self.accepted_queue.append(node);
+                            notify_mask |= waiter.EventIn;
+
+                            _ = self.syncache.remove(key);
+                            stats.global_stats.tcp.established += 1;
                         }
-                    }
-                    if (found_idx) |idx| {
-                        const entry = self.syncache.swapRemove(idx);
-                        const new_ep = self.stack.allocator.create(TCPEndpoint) catch return;
-                        const new_wq = self.stack.allocator.create(waiter.Queue) catch {
-                            self.stack.allocator.destroy(new_ep);
-                            return;
-                        };
-                        new_wq.* = .{};
-                        new_ep.* = TCPEndpoint.init(self.stack, self.proto, new_wq, entry.mss) catch {
-                            self.stack.allocator.destroy(new_wq);
-                            self.stack.allocator.destroy(new_ep);
-                            return;
-                        };
-                        new_ep.retransmit_timer.context = new_ep;
-                        new_ep.state = .established;
-                        new_ep.rcv_nxt = entry.rcv_nxt;
-                        new_ep.snd_nxt = entry.snd_nxt +% 1;
-                        new_ep.last_ack = new_ep.snd_nxt;
-                        new_ep.local_addr = .{ .nic = r.nic.id, .addr = id.local_address, .port = id.local_port };
-                        new_ep.remote_addr = entry.remote_addr;
-                        new_ep.ts_enabled = entry.ts_enabled;
-                        new_ep.ts_recent = entry.ts_recent;
-                        new_ep.sack_enabled = entry.sack_enabled;
-                        new_ep.snd_wnd_scale = entry.snd_wnd_scale;
-                        if (!entry.ws_negotiated) new_ep.rcv_wnd_scale = 0;
-                        new_ep.max_segment_size = entry.mss;
-                        new_ep.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(entry.snd_wnd_scale));
-                        const new_id = stack.TransportEndpointID{ .local_port = new_ep.local_addr.?.port, .local_address = new_ep.local_addr.?.addr, .remote_port = new_ep.remote_addr.?.port, .remote_address = new_ep.remote_addr.?.addr };
-                        self.stack.registerTransportEndpoint(new_id, new_ep.transportEndpoint()) catch {
-                            new_ep.decRef();
-                            return;
-                        };
-                        const node = self.stack.allocator.create(std.TailQueue(tcpip.AcceptReturn).Node) catch {
-                            new_ep.decRef();
-                            return;
-                        };
-                        node.data = .{ .ep = new_ep.endpoint(), .wq = new_wq };
-                        self.accepted_queue.append(node);
-                        notify_mask |= waiter.EventIn;
                     }
                 }
             },

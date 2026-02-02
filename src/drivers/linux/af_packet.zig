@@ -248,6 +248,7 @@ pub const AfPacket = struct {
             const pkt = tcpip.PacketBuffer{
                 .data = buffer.VectorisedView.init(len, original_views[0..1]),
                 .header = buffer.Prependable.init(&[_]u8{}),
+                .timestamp_ns = @intCast(std.time.nanoTimestamp()),
             };
             var mut_pkt = pkt;
             mut_pkt.data.original_views = original_views;

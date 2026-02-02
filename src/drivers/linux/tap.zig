@@ -130,6 +130,7 @@ pub const Tap = struct {
         const pkt = tcpip.PacketBuffer{
             .data = buffer.VectorisedView.init(len, &views),
             .header = buffer.Prependable.init(&[_]u8{}),
+            .timestamp_ns = @intCast(std.time.nanoTimestamp()),
         };
 
         if (self.dispatcher) |d| {

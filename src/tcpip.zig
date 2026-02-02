@@ -279,7 +279,7 @@ pub const Subnet = struct {
     }
 
     // Convenience method to get prefix value
-    pub fn prefix(self: Subnet) u8 {
+    pub fn getPrefix(self: Subnet) u8 {
         return self.prefix;
     }
 };
@@ -297,10 +297,13 @@ pub const PacketBuffer = struct {
     network_header: ?buffer.View = null,
     transport_header: ?buffer.View = null,
 
+    timestamp_ns: i64 = 0,
+
     pub fn clone(self: PacketBuffer, allocator: std.mem.Allocator) Error!PacketBuffer {
         return .{
             .data = try self.data.clone(allocator),
             .header = self.header,
+            .timestamp_ns = self.timestamp_ns,
         };
     }
 };

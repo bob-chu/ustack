@@ -5,6 +5,7 @@ const header = @import("header.zig");
 const waiter = @import("waiter.zig");
 const time = @import("time.zig");
 const log = @import("log.zig").scoped(.stack);
+const stats = @import("stats.zig");
 
 pub const LinkEndpointCapabilities = u32;
 pub const CapabilityNone: LinkEndpointCapabilities = 0;
@@ -308,6 +309,12 @@ pub const NIC = struct {
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+        defer {
+            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.network_layer.record(end_processing - pkt.timestamp_ns);
+            }
+        }
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
 
@@ -515,6 +522,8 @@ pub const Stack = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
+        var cluster_pool = buffer.ClusterPool.init(allocator);
+        try cluster_pool.prewarm(1024);
         return .{
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
@@ -524,10 +533,11 @@ pub const Stack = struct {
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
             .timer_queue = .{},
-            .cluster_pool = buffer.ClusterPool.init(allocator),
+            .cluster_pool = cluster_pool,
             .ephemeral_port = 32768,
         };
     }
+
 
     pub fn deinit(self: *Stack) void {
         self.cluster_pool.deinit();
@@ -681,6 +691,12 @@ pub const Stack = struct {
     }
 
     pub fn deliverTransportPacket(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
+        defer {
+            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.transport_dispatch.record(end_processing - pkt.timestamp_ns);
+            }
+        }
         const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
 
         const proto_opt = self.transport_protocols.get(protocol);

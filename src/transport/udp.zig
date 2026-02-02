@@ -4,6 +4,7 @@ const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
 const waiter = @import("../waiter.zig");
+const stats = @import("../stats.zig");
 
 pub const ProtocolNumber = 17;
 
@@ -227,6 +228,12 @@ pub const UDPEndpoint = struct {
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+        defer {
+            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.udp_endpoint.record(end_processing - pkt.timestamp_ns);
+            }
+        }
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         var mut_pkt = pkt;
 
