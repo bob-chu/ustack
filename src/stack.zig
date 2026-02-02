@@ -460,7 +460,7 @@ const RouteTable = struct {
 };
 
 pub const TransportTable = struct {
-    endpoints: std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
+    shards: [256]std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
 
     const TransportContext = struct {
         pub fn hash(_: TransportContext, key: TransportEndpointID) u64 {
@@ -472,29 +472,37 @@ pub const TransportTable = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) TransportTable {
-        return .{
-            .endpoints = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator),
-        };
+        var self: TransportTable = undefined;
+        for (&self.shards) |*shard| {
+            shard.* = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator);
+        }
+        return self;
     }
 
     pub fn deinit(self: *TransportTable) void {
-        self.endpoints.deinit();
+        for (&self.shards) |*shard| {
+            shard.deinit();
+        }
+    }
+
+    fn getShard(self: *TransportTable, id: TransportEndpointID) *std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80) {
+        return &self.shards[id.hash() % 256];
     }
 
     pub fn put(self: *TransportTable, id: TransportEndpointID, ep: TransportEndpoint) !void {
-        try self.endpoints.put(id, ep);
+        try self.getShard(id).put(id, ep);
     }
 
     pub fn fetchRemove(self: *TransportTable, id: TransportEndpointID) ?std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).KV {
-        return self.endpoints.fetchRemove(id);
+        return self.getShard(id).fetchRemove(id);
     }
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
-        return self.endpoints.remove(id);
+        return self.getShard(id).remove(id);
     }
 
     pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
-        const ep = self.endpoints.get(id);
+        const ep = self.getShard(id).get(id);
         if (ep) |e| e.incRef();
         return ep;
     }
@@ -562,6 +570,10 @@ pub const Stack = struct {
         try self.transport_protocols.put(proto.number(), proto);
     }
 
+    pub fn getLinkAddress(self: *Stack, addr: tcpip.Address) ?tcpip.LinkAddress {
+        return self.link_addr_cache.get(addr);
+    }
+
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
         if (self.link_addr_cache.get(addr)) |prev| {
             if (prev.eq(link_addr)) return;
@@ -569,9 +581,11 @@ pub const Stack = struct {
         try self.link_addr_cache.put(addr, link_addr);
 
         // Notify all transport endpoints that they might be writable now (due to ARP resolution)
-        var it = self.endpoints.endpoints.valueIterator();
-        while (it.next()) |ep| {
-            ep.notify(waiter.EventOut);
+        for (&self.endpoints.shards) |*shard| {
+            var it = shard.valueIterator();
+            while (it.next()) |ep| {
+                ep.notify(waiter.EventOut);
+            }
         }
     }
 

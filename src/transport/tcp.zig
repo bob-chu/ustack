@@ -244,11 +244,13 @@ pub const TCPEndpoint = struct {
 
     pub fn init(s: *stack.Stack, proto: *TCPProtocol, wq: *waiter.Queue, mss: u16) !TCPEndpoint {
         const cc = try congestion.NewReno.init(s.allocator, mss);
+        const initial_seq = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF)));
         var self = TCPEndpoint{
             .stack = s,
             .proto = proto,
             .waiter_queue = wq,
-            .snd_nxt = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF))),
+            .snd_nxt = initial_seq,
+            .last_ack = initial_seq,
             .cc = cc,
             .max_segment_size = mss,
             .retransmit_timer = time.Timer.init(handleRetransmitTimer, undefined),
@@ -690,29 +692,12 @@ pub const TCPEndpoint = struct {
         self.ref_count += 1;
     }
     pub fn decRef(self: *TCPEndpoint) void {
+        if (self.ref_count == 0) return;
         self.ref_count -= 1;
         if (self.ref_count == 0) self.destroy();
     }
 
     fn destroy(self: *TCPEndpoint) void {
-        if (self.local_addr) |la| {
-            const ra = self.remote_addr orelse tcpip.FullAddress{
-                .nic = 0,
-                .addr = switch (la.addr) {
-                    .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
-                    .v6 => .{ .v6 = [_]u8{0} ** 16 },
-                },
-                .port = 0,
-            };
-            const id = stack.TransportEndpointID{
-                .local_port = la.port,
-                .local_address = la.addr,
-                .remote_port = ra.port,
-                .remote_address = ra.addr,
-            };
-            self.stack.unregisterTransportEndpoint(id);
-        }
-
         self.syncache.deinit();
         self.sack_blocks.deinit();
         self.peer_sack_blocks.deinit();
@@ -924,9 +909,8 @@ pub const TCPEndpoint = struct {
         self.state = .bound;
     }
 
-    fn close(self: *TCPEndpoint) void {
+    pub fn close(self: *TCPEndpoint) void {
         if (self.state == .closed) {
-            self.decRef();
             return;
         }
 
