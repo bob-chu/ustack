@@ -13,7 +13,6 @@ test "TCP Fast Retransmit" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
     const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
@@ -89,7 +88,6 @@ test "TCP Retransmission" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
     const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
@@ -186,7 +184,6 @@ test "TCP CWND Enforcement" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
     const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
@@ -258,7 +255,6 @@ test "TCP SACK Blocks Generation" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
     const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
@@ -298,7 +294,6 @@ test "TCP readv/writev zero-copy" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();
     const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
@@ -307,16 +302,9 @@ test "TCP readv/writev zero-copy" {
     var wq = waiter.Queue{};
     const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
     const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
-    defer ep.close();
     ep.state = .established;
     ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
     ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
-
-    // Test writev
-    const data1 = "hello ";
-    const data2 = "world";
-    var iov_write = [_][]u8{ @constCast(data1), @constCast(data2) };
-    var uio_write = buffer.Uio.init(&iov_write);
 
     // We need a mock NIC/Link to capture the packets
     var fake_link = struct {
@@ -342,6 +330,13 @@ test "TCP readv/writev zero-copy" {
         }
     }{ .captured = std.ArrayList(u8).init(allocator) };
     defer fake_link.captured.deinit();
+    defer ep.close();
+
+    // Test writev
+    const data1 = "hello ";
+    const data2 = "world";
+    var iov_write = [_][]u8{ @constCast(data1), @constCast(data2) };
+    var uio_write = buffer.Uio.init(&iov_write);
 
     const link_ep = stack.LinkEndpoint{ .ptr = &fake_link, .vtable = &.{ .writePacket = @TypeOf(fake_link).writePacket, .attach = @TypeOf(fake_link).attach, .linkAddress = @TypeOf(fake_link).linkAddress, .mtu = @TypeOf(fake_link).mtu, .setMTU = @TypeOf(fake_link).setMTU, .capabilities = @TypeOf(fake_link).capabilities } };
     try s.createNIC(1, link_ep);

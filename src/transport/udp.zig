@@ -311,7 +311,10 @@ pub const UDPEndpoint = struct {
 
     fn setOption(ptr: *anyopaque, opt: tcpip.EndpointOption) tcpip.Error!void {
         _ = ptr;
-        _ = opt;
+        switch (opt) {
+            .ts_enabled => {},
+            .reuse_address => {},
+        }
         return;
     }
 
@@ -319,6 +322,7 @@ pub const UDPEndpoint = struct {
         _ = ptr;
         return switch (opt_type) {
             .ts_enabled => .{ .ts_enabled = false },
+            .reuse_address => .{ .reuse_address = false },
         };
     }
 
@@ -415,7 +419,7 @@ pub const UDPEndpoint = struct {
                 r.remote_link_address = link_addr;
             } else {
                 if (!self.retry_timer.active) {
-                    self.stack.timer_queue.schedule(&self.retry_timer, 1000);
+                    self.stack.timer_queue.schedule(&self.retry_timer, 10);
                 }
             }
         }
@@ -423,7 +427,7 @@ pub const UDPEndpoint = struct {
         self.write(r, to.port, data) catch |err| {
             if (err == tcpip.Error.WouldBlock) {
                 if (!self.retry_timer.active) {
-                    self.stack.timer_queue.schedule(&self.retry_timer, 1000);
+                    self.stack.timer_queue.schedule(&self.retry_timer, 10);
                 }
             }
             return err;
@@ -497,7 +501,6 @@ test "UDP handlePacket" {
 
     var wq = waiter.Queue{};
     const udp_proto = UDPProtocol.init(allocator);
-    defer udp_proto.deinit(allocator);
     var ep = try allocator.create(UDPEndpoint);
     ep.* = UDPEndpoint.init(&s, udp_proto, &wq);
     defer ep.transportEndpoint().close();

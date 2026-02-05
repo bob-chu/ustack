@@ -328,6 +328,8 @@ pub const NIC = struct {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
 
+        if (remote.eq(self.linkEP.linkAddress())) return;
+
         const proto_opt = self.stack.network_protocols.get(protocol);
 
         if (proto_opt == null) return;
@@ -495,7 +497,7 @@ pub const TransportTable = struct {
         }
     }
 
-    fn getShard(self: *TransportTable, id: TransportEndpointID) *std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80) {
+    pub fn getShard(self: *TransportTable, id: TransportEndpointID) *std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80) {
         return &self.shards[id.hash() % 256];
     }
 
@@ -529,6 +531,7 @@ pub const Stack = struct {
     timer_queue: time.TimerQueue,
     cluster_pool: buffer.ClusterPool,
     ephemeral_port: u16,
+    tcp_msl: u64 = 30000,
 
     pub const AddressContext = struct {
         pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
@@ -553,11 +556,19 @@ pub const Stack = struct {
             .timer_queue = .{},
             .cluster_pool = cluster_pool,
             .ephemeral_port = 32768,
+            .tcp_msl = 30000,
         };
     }
 
-
     pub fn deinit(self: *Stack) void {
+        var shard_idx: usize = 0;
+        while (shard_idx < 256) : (shard_idx += 1) {
+            var it = self.endpoints.shards[shard_idx].valueIterator();
+            while (it.next()) |ep| {
+                ep.decRef();
+            }
+        }
+        self.endpoints.deinit();
         self.cluster_pool.deinit();
         var nic_it = self.nics.valueIterator();
         while (nic_it.next()) |nic| {
@@ -565,7 +576,6 @@ pub const Stack = struct {
             self.allocator.destroy(nic.*);
         }
         self.nics.deinit();
-        self.endpoints.deinit();
         self.link_addr_cache.deinit();
 
         var transport_it = self.transport_protocols.valueIterator();
@@ -596,16 +606,21 @@ pub const Stack = struct {
     }
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
+        var is_new = false;
         if (self.link_addr_cache.get(addr)) |prev| {
             if (prev.eq(link_addr)) return;
+        } else {
+            is_new = true;
         }
         try self.link_addr_cache.put(addr, link_addr);
 
-        // Notify all transport endpoints that they might be writable now (due to ARP resolution)
-        for (&self.endpoints.shards) |*shard| {
-            var it = shard.valueIterator();
-            while (it.next()) |ep| {
-                ep.notify(waiter.EventOut);
+        // Only notify if this is a NEW address or it CHANGED.
+        if (is_new) {
+            for (&self.endpoints.shards) |*shard| {
+                var it = shard.valueIterator();
+                while (it.next()) |ep| {
+                    ep.notify(waiter.EventOut);
+                }
             }
         }
     }

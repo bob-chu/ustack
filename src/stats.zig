@@ -23,7 +23,7 @@ pub const StackStats = struct {
         std.debug.print("  Rx Req: {d}, Rx Rep: {d}, Tx Req: {d}, Tx Rep: {d}\n", .{ self.arp.rx_requests, self.arp.rx_replies, self.arp.tx_requests, self.arp.tx_replies });
         std.debug.print("TCP:\n", .{});
         std.debug.print("  Rx Seg: {d}, Tx Seg: {d}, Retrans: {d}\n", .{ self.tcp.rx_segments, self.tcp.tx_segments, self.tcp.retransmits });
-        std.debug.print("  Active: {d}, Passive: {d}, Failed: {d}, Resets: {d}, PoolEx: {d}, SynDrop: {d}\n", .{ self.tcp.active_opens, self.tcp.passive_opens, self.tcp.failed_connections, self.tcp.resets_sent, self.tcp.pool_exhausted, self.tcp.syncache_dropped });
+        std.debug.print("  Active: {d}, Passive: {d}, Failed: {d}, Resets: {d}, ActiveEP: {d}, PoolEx: {d}, SynDrop: {d}\n", .{ self.tcp.active_opens, self.tcp.passive_opens, self.tcp.failed_connections, self.tcp.resets_sent, self.tcp.active_endpoints, self.tcp.pool_exhausted, self.tcp.syncache_dropped });
         std.debug.print("  Syncache: searches={d}, max_size={d}\n", .{ self.tcp.syncache_searches, self.tcp.syncache_max_size });
         std.debug.print("  Rx Flags - SYN: {d}, SYN+ACK: {d}, ACK: {d}, PSH: {d}, FIN: {d}\n", .{ self.tcp.rx_syn, self.tcp.rx_syn_ack, self.tcp.rx_ack, self.tcp.rx_psh, self.tcp.rx_fin });
         std.debug.print("  Tx Flags - SYN: {d}, SYN+ACK: {d}, ACK: {d}, PSH: {d}, FIN: {d}\n", .{ self.tcp.tx_syn, self.tcp.tx_syn_ack, self.tcp.tx_ack, self.tcp.tx_psh, self.tcp.tx_fin });
@@ -104,6 +104,7 @@ pub const TCPStats = struct {
     established: usize = 0,
     resets_sent: usize = 0,
     resets_received: usize = 0,
+    active_endpoints: usize = 0,
     pool_exhausted: usize = 0,
     syncache_dropped: usize = 0,
     syncache_searches: usize = 0,

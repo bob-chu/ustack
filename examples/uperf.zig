@@ -54,6 +54,7 @@ pub fn main() !void {
     std.debug.print("Starting iperf with config: {any}\n", .{config});
 
     global_stack = try ustack.init(allocator);
+    global_stack.tcp_msl = 10; // Set MSL to 10ms for benchmark recycling
     global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
 
     std.debug.print("AF_PACKET initialized on {s}\n", .{config.interface});
@@ -91,7 +92,7 @@ pub fn main() !void {
     my_ev_io_start(loop, &io_watcher);
 
     var timer_watcher = std.mem.zeroInit(c.ev_timer, .{});
-    my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.01, 0.01);
+    my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.001, 0.001);
     my_ev_timer_start(loop, &timer_watcher);
 
     // Safety timeout to prevent hanging forever (only for client)
@@ -218,11 +219,20 @@ fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callco
     }
 }
 
+var last_tick_time: i64 = 0;
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
     _ = revents;
-    _ = global_stack.timer_queue.tick();
+
+    const now = std.time.milliTimestamp();
+    if (last_tick_time == 0) last_tick_time = now;
+    const diff = now - last_tick_time;
+    if (diff > 0) {
+        _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(diff)));
+        last_tick_time = now;
+    }
+
     if (global_server) |s| {
         s.report();
     }

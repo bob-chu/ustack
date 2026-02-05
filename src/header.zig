@@ -220,6 +220,18 @@ pub fn internetChecksum(data: []const u8, initial: u32) u32 {
         }
     }
 
+    // Unroll remaining loop for performance
+    while (i + 16 <= data.len) : (i += 16) {
+        sum += @as(u32, data[i]) << 8 | data[i + 1];
+        sum += @as(u32, data[i + 2]) << 8 | data[i + 3];
+        sum += @as(u32, data[i + 4]) << 8 | data[i + 5];
+        sum += @as(u32, data[i + 6]) << 8 | data[i + 7];
+        sum += @as(u32, data[i + 8]) << 8 | data[i + 9];
+        sum += @as(u32, data[i + 10]) << 8 | data[i + 11];
+        sum += @as(u32, data[i + 12]) << 8 | data[i + 13];
+        sum += @as(u32, data[i + 14]) << 8 | data[i + 15];
+    }
+
     while (i + 1 < data.len) : (i += 2) {
         sum += (@as(u32, data[i]) << 8) | data[i + 1];
     }

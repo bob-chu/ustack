@@ -55,7 +55,7 @@ pub const ARPProtocol = struct {
             if (!arp_ep.pending_requests.contains(addr)) {
                 arp_ep.pending_requests.put(addr, std.time.milliTimestamp()) catch {};
                 if (!arp_ep.timer.active) {
-                    nic.stack.timer_queue.schedule(&arp_ep.timer, 1000);
+                    nic.stack.timer_queue.schedule(&arp_ep.timer, 10);
                 }
 
                 const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
@@ -133,7 +133,7 @@ pub const ARPEndpoint = struct {
         var has_pending = false;
 
         while (it.next()) |entry| {
-            if (now - entry.value_ptr.* >= 1000) {
+            if (now - entry.value_ptr.* >= 10) {
                 const proto_opt = self.nic.stack.network_protocols.get(ProtocolNumber);
                 if (proto_opt) |p| {
                     const proto = @as(*ARPProtocol, @ptrCast(@alignCast(p.ptr)));
@@ -151,7 +151,7 @@ pub const ARPEndpoint = struct {
         }
 
         if (has_pending) {
-            self.nic.stack.timer_queue.schedule(&self.timer, 1000);
+            self.nic.stack.timer_queue.schedule(&self.timer, 10);
         }
     }
 

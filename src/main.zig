@@ -83,4 +83,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("drivers/linux/test_af_xdp.zig");
     _ = @import("transport/tcp_test.zig");
+    _ = @import("transport/tcp_2msl_test.zig");
 }

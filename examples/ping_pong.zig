@@ -46,6 +46,7 @@ pub fn main() !void {
     const config = try parseArgs(args);
 
     global_stack = try ustack.init(allocator);
+    global_stack.tcp_msl = 10; // Set MSL to 10ms for benchmark recycling
     global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
 
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
@@ -83,7 +84,7 @@ pub fn main() !void {
     my_ev_io_start(loop, &io_watcher);
 
     var timer_watcher = std.mem.zeroInit(c.ev_timer, .{});
-    my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.01, 0.01);
+    my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.001, 0.001);
     my_ev_timer_start(loop, &timer_watcher);
 
     const mux = try EventMultiplexer.init(allocator);
@@ -183,11 +184,11 @@ var global_loop: ?*anyopaque = null;
 var global_mark_done: bool = false;
 var global_done_time: i64 = 0;
 
-    fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
+fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
     _ = revents;
-    var budget: usize = 256;
+    var budget: usize = 1024;
     while (budget > 0) : (budget -= 1) {
         const ok = global_af_packet.readPacket() catch {
             return;
@@ -196,12 +197,21 @@ var global_done_time: i64 = 0;
     }
 }
 
-
+var last_tick_time: i64 = 0;
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
     _ = revents;
-    _ = global_stack.timer_queue.tick();
+
+    perform_cleanup();
+
+    const now = std.time.milliTimestamp();
+    if (last_tick_time == 0) last_tick_time = now;
+    const diff = now - last_tick_time;
+    if (diff > 0) {
+        _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(diff)));
+        last_tick_time = now;
+    }
 
     if (global_mark_done) {
         if (std.time.milliTimestamp() - global_done_time >= 1000) {
@@ -246,8 +256,9 @@ const PingServer = struct {
         wq.* = .{};
 
         const ep = try s.transport_protocols.get(6).?.newEndpoint(s, 0x0800, wq);
+        try ep.setOption(.{ .ts_enabled = true });
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = config.port });
-        try ep.listen(10);
+        try ep.listen(1024);
 
         self.* = .{
             .listener = ep,
@@ -266,6 +277,9 @@ const PingServer = struct {
 
     fn onEvent(self: *PingServer) void {
         while (true) {
+            if (self.config.max_conns) |max| {
+                if (self.conn_count >= max) return;
+            }
             const res = self.listener.accept() catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
                 return;
@@ -275,6 +289,7 @@ const PingServer = struct {
             }
             self.conn_count += 1;
             self.active_conns += 1;
+            // std.debug.print("Accepted {}\n", .{self.conn_count});
 
             const now = std.time.milliTimestamp();
             if (now - self.last_report_time >= 1000) {
@@ -288,11 +303,25 @@ const PingServer = struct {
                 self.last_conn_count = self.conn_count;
             }
 
-            if (PingConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config, self, self.conn_count)) |conn| {
-                conn.onEvent();
-            } else |_| {
+            const conn = PingConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config, self, self.conn_count) catch {
+                res.ep.close();
                 self.active_conns -= 1;
-            }
+                if (self.config.max_conns) |max| {
+                    if (self.conn_count >= max and self.active_conns == 0) {
+                        self.end_time = std.time.milliTimestamp();
+                        const duration_ms = @as(f64, @floatFromInt(self.end_time - self.start_time));
+                        const duration_s = duration_ms / 1000.0;
+                        const cps = @as(f64, @floatFromInt(self.conn_count)) / duration_s;
+
+                        std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ self.conn_count, cps });
+
+                        global_mark_done = true;
+                        global_done_time = std.time.milliTimestamp();
+                    }
+                }
+                continue;
+            };
+            conn.onEvent();
         }
     }
 };
@@ -333,10 +362,14 @@ const PingClient = struct {
         const id = self.next_conn_id;
         self.next_conn_id += 1;
         self.active_conns += 1;
+        errdefer self.active_conns -= 1;
 
         const wq = try self.allocator.create(waiter.Queue);
+        errdefer self.allocator.destroy(wq);
         wq.* = .{};
         const ep = try self.stack.transport_protocols.get(6).?.newEndpoint(self.stack, 0x0800, wq);
+        errdefer ep.close();
+        try ep.setOption(.{ .ts_enabled = true });
 
         const conn = try PingConnection.init(self.allocator, ep, wq, self.mux, self.config, self, id);
 
@@ -378,9 +411,11 @@ const PingConnection = struct {
     connection_id: u32,
     closed: bool = false,
     pending_cleanup: bool = false,
+    owns_wq: bool = false,
     sent: bool = false,
     wait_entry: waiter.Entry,
     mux_ctx: MuxContext,
+    next_cleanup: ?*PingConnection = null,
 
     pub fn init(allocator: std.mem.Allocator, ep: ustack.tcpip.Endpoint, wq: *waiter.Queue, mux: *EventMultiplexer, config: Config, parent: *anyopaque, id: u32) !*PingConnection {
         const self = try allocator.create(PingConnection);
@@ -394,6 +429,7 @@ const PingConnection = struct {
             .connection_id = id,
             .mux_ctx = .{ .connection = self },
             .wait_entry = undefined,
+            .owns_wq = config.mode == .client,
         };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn | waiter.EventOut | waiter.EventHUp | waiter.EventErr);
@@ -402,10 +438,10 @@ const PingConnection = struct {
     }
 
     fn onEvent(self: *PingConnection) void {
-        // Return early if already closed or pending cleanup to avoid use-after-free
         if (self.closed or self.pending_cleanup) return;
 
         const events = self.wq.events();
+
         if (events & waiter.EventHUp != 0) {
             self.close();
             return;
@@ -477,8 +513,8 @@ const PingConnection = struct {
 
     fn close(self: *PingConnection) void {
         if (self.closed) return;
+        // std.debug.print("Conn {}: closing\n", .{self.connection_id});
         self.closed = true;
-        // Set pending_cleanup FIRST to prevent any race with in-flight events
         self.pending_cleanup = true;
 
         self.wq.eventUnregister(&self.wait_entry);
@@ -497,19 +533,35 @@ const PingConnection = struct {
                     const duration_s = duration_ms / 1000.0;
                     const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
 
+                    std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
+
                     global_mark_done = true;
                     global_done_time = std.time.milliTimestamp();
-
-                    std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
                 }
             }
         }
 
-        // Now safe to destroy - no more events will be processed for this connection
-        self.allocator.destroy(self.wq);
-        self.allocator.destroy(self);
+        // Defer destruction
+        self.next_cleanup = global_cleanup_list;
+        global_cleanup_list = self;
     }
 };
+
+var global_cleanup_list: ?*PingConnection = null;
+
+fn perform_cleanup() void {
+    var current = global_cleanup_list;
+    global_cleanup_list = null;
+    while (current) |conn| {
+        const next = conn.next_cleanup;
+        const allocator = conn.allocator;
+        if (conn.owns_wq) {
+            allocator.destroy(conn.wq);
+        }
+        allocator.destroy(conn);
+        current = next;
+    }
+}
 
 const SimplePayload = struct {
     data: []const u8,

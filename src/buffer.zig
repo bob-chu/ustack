@@ -108,6 +108,14 @@ pub fn Pool(comptime T: type) type {
             };
         }
 
+        pub fn prewarm(self: *Self, count: usize) !void {
+            const to_warm = @min(count, self.capacity);
+            for (0..to_warm) |_| {
+                const node = try self.allocator.create(T);
+                self.release(node);
+            }
+        }
+
         pub fn deinit(self: *Self) void {
             var it = self.free_list;
             while (it) |node| {
@@ -122,15 +130,12 @@ pub fn Pool(comptime T: type) type {
             if (self.free_list) |node| {
                 self.free_list = node.next;
                 self.count -= 1;
-                node.next = null;
-                node.prev = null;
+                @memset(std.mem.asBytes(node), 0);
                 return node;
             }
             stats.global_stats.pool.generic_fallback += 1;
             const node = try self.allocator.create(T);
             @memset(std.mem.asBytes(node), 0);
-            node.next = null;
-            node.prev = null;
             return node;
         }
 

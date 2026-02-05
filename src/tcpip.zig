@@ -209,10 +209,12 @@ pub const Endpoint = struct {
 
 pub const EndpointOptionType = enum {
     ts_enabled,
+    reuse_address,
 };
 
 pub const EndpointOption = union(EndpointOptionType) {
     ts_enabled: bool,
+    reuse_address: bool,
 };
 
 pub const AddressWithPrefix = struct {
