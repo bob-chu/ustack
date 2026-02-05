@@ -569,6 +569,14 @@ pub const TCPEndpoint = struct {
         switch (opt) {
             .ts_enabled => |v| self.ts_enabled = v,
             .reuse_address => {}, // TODO: Implement reuse_address logic if needed
+            .congestion_control => |alg| {
+                self.cc.deinit();
+                self.cc = switch (alg) {
+                    .new_reno => try congestion.NewReno.init(self.stack.allocator, self.max_segment_size),
+                    .cubic => try congestion.Cubic.init(self.stack.allocator, self.max_segment_size),
+                    .bbr => try congestion.BBR.init(self.stack.allocator, self.max_segment_size),
+                };
+            },
         }
     }
 
@@ -577,6 +585,7 @@ pub const TCPEndpoint = struct {
         return switch (opt_type) {
             .ts_enabled => .{ .ts_enabled = self.ts_enabled },
             .reuse_address => .{ .reuse_address = false },
+            .congestion_control => .{ .congestion_control = .new_reno }, // Default for now, tracking active CC would be better
         };
     }
 

@@ -45,6 +45,7 @@ pub fn main() !void {
     var packet_size: usize = 0;
     var duration: u64 = 5;
     var protocol: enum { tcp, udp } = .tcp;
+    var cc_alg: tcpip.CongestionControlAlgorithm = .new_reno;
 
     var idx: usize = 4;
     if (std.mem.eql(u8, mode, "client")) idx = 5;
@@ -58,7 +59,18 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[idx], "-t")) {
             idx += 1;
             duration = try std.fmt.parseInt(u64, args[idx], 10);
-        } else if (std.mem.eql(u8, args[idx], "-u")) protocol = .udp;
+        } else if (std.mem.eql(u8, args[idx], "-u")) {
+            protocol = .udp;
+        } else if (std.mem.eql(u8, args[idx], "-C")) {
+            idx += 1;
+            if (std.mem.eql(u8, args[idx], "cubic")) {
+                cc_alg = .cubic;
+            } else if (std.mem.eql(u8, args[idx], "bbr")) {
+                cc_alg = .bbr;
+            } else if (std.mem.eql(u8, args[idx], "newreno")) {
+                cc_alg = .new_reno;
+            }
+        }
     }
 
     global_stack = try ustack.init(allocator);
@@ -95,10 +107,10 @@ pub fn main() !void {
     my_ev_io_start(loop, &mux_io);
 
     if (std.mem.eql(u8, mode, "server")) {
-        _ = try PerfServer.init(&global_stack, allocator, mux, protocol == .udp);
+        _ = try PerfServer.init(&global_stack, allocator, mux, protocol == .udp, cc_alg);
     } else {
         const target_ip = try parseIp(args[4]);
-        _ = try Connection.initClient(&global_stack, allocator, mux, target_ip, addr_v4, protocol == .udp, mtu, packet_size, duration);
+        _ = try Connection.initClient(&global_stack, allocator, mux, target_ip, addr_v4, protocol == .udp, mtu, packet_size, duration, cc_alg);
     }
     my_ev_run(loop);
 }
@@ -150,16 +162,21 @@ const PerfServer = struct {
     wait_entry: waiter.Entry,
     mux_ctx: MuxContext,
     is_udp: bool,
+    cc_alg: tcpip.CongestionControlAlgorithm,
 
-    pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, is_udp: bool) !*PerfServer {
+    pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, is_udp: bool, cc_alg: tcpip.CongestionControlAlgorithm) !*PerfServer {
         const self = try allocator.create(PerfServer);
         const wq = try allocator.create(waiter.Queue);
         wq.* = .{};
         const ep = try s.transport_protocols.get(if (is_udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 5201 });
-        if (!is_udp) try ep.listen(128);
+        if (!is_udp) {
+            try ep.listen(128);
+        } else {
+            try ep.setOption(.{ .congestion_control = cc_alg });
+        }
 
-        self.* = .{ .listener = ep, .allocator = allocator, .mux = mux, .mux_ctx = .{ .server = self }, .wait_entry = undefined, .is_udp = is_udp };
+        self.* = .{ .listener = ep, .allocator = allocator, .mux = mux, .mux_ctx = .{ .server = self }, .wait_entry = undefined, .is_udp = is_udp, .cc_alg = cc_alg };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn);
 
@@ -172,6 +189,9 @@ const PerfServer = struct {
     fn onAccept(self: *PerfServer) void {
         while (true) {
             const res = self.listener.accept() catch break;
+            if (!self.is_udp) {
+                res.ep.setOption(.{ .congestion_control = self.cc_alg }) catch {};
+            }
             _ = Connection.init(self.allocator, res.ep, res.wq, self.mux, false, 0, 0, 0) catch continue;
         }
     }
@@ -202,10 +222,13 @@ const Connection = struct {
         return self;
     }
 
-    pub fn initClient(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, target: [4]u8, local: [4]u8, is_udp: bool, mtu: u32, pkt_size: usize, duration: u64) !*Connection {
+    pub fn initClient(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, target: [4]u8, local: [4]u8, is_udp: bool, mtu: u32, pkt_size: usize, duration: u64, cc_alg: tcpip.CongestionControlAlgorithm) !*Connection {
         const wq = try allocator.create(waiter.Queue);
         wq.* = .{};
         const ep = try s.transport_protocols.get(if (is_udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
+        if (!is_udp) {
+            try ep.setOption(.{ .congestion_control = cc_alg });
+        }
         const self = try Connection.init(allocator, ep, wq, mux, true, mtu, pkt_size, duration);
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = local }, .port = 0 });
         _ = ep.connect(.{ .nic = 1, .addr = .{ .v4 = target }, .port = 5201 }) catch |err| {
@@ -261,7 +284,7 @@ const Connection = struct {
                 self.packets_since_last_report += 1;
             }
         } else {
-            const slen = if (self.packet_size > 0) self.packet_size else 1400;
+            const slen = if (self.packet_size > 0) self.packet_size else @as(usize, @intCast(self.mtu - 100));
             const static_buf = struct {
                 var buf = [_]u8{'A'} ** 65536;
             };

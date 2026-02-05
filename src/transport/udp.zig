@@ -317,6 +317,7 @@ pub const UDPEndpoint = struct {
         switch (opt) {
             .ts_enabled => {},
             .reuse_address => {},
+            .congestion_control => {},
         }
         return;
     }
@@ -326,6 +327,7 @@ pub const UDPEndpoint = struct {
         return switch (opt_type) {
             .ts_enabled => .{ .ts_enabled = false },
             .reuse_address => .{ .reuse_address = false },
+            .congestion_control => .{ .congestion_control = .new_reno },
         };
     }
 
