@@ -19,6 +19,7 @@ pub const LinkEndpoint = struct {
     pub const VTable = struct {
         writePacket: *const fn (ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void,
         writePackets: ?*const fn (ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void = null,
+        flush: ?*const fn (ptr: *anyopaque) void = null,
         attach: *const fn (ptr: *anyopaque, dispatcher: *NetworkDispatcher) void,
         linkAddress: *const fn (ptr: *anyopaque) tcpip.LinkAddress,
         mtu: *const fn (ptr: *anyopaque) u32,
@@ -61,6 +62,9 @@ pub const LinkEndpoint = struct {
     }
     pub fn close(self: LinkEndpoint) void {
         if (self.vtable.close) |f| f(self.ptr);
+    }
+    pub fn flush(self: LinkEndpoint) void {
+        if (self.vtable.flush) |f| f(self.ptr);
     }
 };
 
@@ -720,6 +724,13 @@ pub const Stack = struct {
 
     pub fn getRouteTable(self: *Stack) []const RouteEntry {
         return self.route_table.getRoutes();
+    }
+
+    pub fn flush(self: *Stack) void {
+        var it = self.nics.valueIterator();
+        while (it.next()) |nic| {
+            nic.*.linkEP.flush();
+        }
     }
 
     pub fn createNIC(self: *Stack, id: tcpip.NICID, ep: LinkEndpoint) !void {

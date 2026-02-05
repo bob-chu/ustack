@@ -11,6 +11,7 @@ pub const AfPacket = struct {
     allocator: std.mem.Allocator,
     cluster_pool: *buffer.ClusterPool,
     view_pool: buffer.BufferPool,
+    header_pool: buffer.BufferPool,
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
     if_index: i32 = 0,
@@ -21,7 +22,7 @@ pub const AfPacket = struct {
         const fd = try std.posix.socket(std.posix.AF.PACKET, std.posix.SOCK.RAW | std.posix.SOCK.NONBLOCK, protocol);
         errdefer std.posix.close(fd);
 
-        const buf_size: i32 = 10 * 1024 * 1024; // 10MB
+        const buf_size: i32 = 10 * 1024 * 1024;
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&buf_size));
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&buf_size));
 
@@ -29,7 +30,6 @@ pub const AfPacket = struct {
         _ = std.posix.setsockopt(fd, 263, 23, std.mem.asBytes(&ignore_outgoing)) catch {};
 
         const if_index = try getIfIndex(fd, dev_name);
-
         var ll_addr = std.posix.sockaddr.ll{
             .family = std.posix.AF.PACKET,
             .protocol = protocol,
@@ -40,7 +40,6 @@ pub const AfPacket = struct {
             .addr = [_]u8{0} ** 8,
         };
         try std.posix.bind(fd, @as(*const std.posix.sockaddr, @ptrCast(&ll_addr)), @sizeOf(std.posix.sockaddr.ll));
-
         const mac = try getIfMac(fd, dev_name);
 
         return AfPacket{
@@ -48,6 +47,7 @@ pub const AfPacket = struct {
             .allocator = allocator,
             .cluster_pool = pool,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 1, 4096),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 4096),
             .if_index = if_index,
             .address = .{ .addr = mac },
         };
@@ -57,22 +57,45 @@ pub const AfPacket = struct {
         return .{
             .ptr = self,
             .vtable = &.{
-                .writePacket = writePacket,
-                .writePackets = writePackets_wrapper,
+                .writePacket = writePacket_external,
+                .writePackets = writePackets_external,
                 .attach = attach,
                 .linkAddress = linkAddress,
-                .mtu = mtu,
-                .setMTU = setMTU,
+                .mtu = mtu_external,
+                .setMTU = setMTU_external,
                 .capabilities = capabilities,
             },
         };
     }
 
-    fn writePackets_wrapper(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+    fn writePackets_external(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
-        for (packets) |p| {
-            try writePacket(self, r, protocol, p);
+        for (packets) |p| try self.writePacket(r, protocol, p);
+    }
+
+    fn writePacket_external(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+        const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
+        return self.writePacket(r, protocol, pkt);
+    }
+
+    pub fn writePacket(self: *AfPacket, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
+        const hdr_len = pkt.header.usedLength();
+        const total_len = hdr_len + pkt.data.size;
+        var buf: [9014]u8 = undefined;
+        if (total_len > buf.len) return tcpip.Error.MessageTooLong;
+        @memcpy(buf[0..hdr_len], pkt.header.view());
+        var off = hdr_len;
+        for (pkt.data.views) |v| {
+            @memcpy(buf[off .. off + v.view.len], v.view);
+            off += v.view.len;
         }
+        // std.debug.print("AF_PACKET: Sending packet len={} type={x}\n", .{ total_len, std.mem.readInt(u16, buf[12..14], .big) });
+        _ = std.posix.write(self.fd, buf[0..total_len]) catch |err| {
+            if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
+            return tcpip.Error.BadLinkEndpoint;
+        };
+        stats.global_link_stats.tx_packets += 1;
+        stats.global_link_stats.tx_bytes += total_len;
     }
 
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
@@ -85,13 +108,17 @@ pub const AfPacket = struct {
         return self.address;
     }
 
-    fn mtu(ptr: *anyopaque) u32 {
+    fn mtu_external(ptr: *anyopaque) u32 {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
         return self.mtu_val;
     }
 
-    fn setMTU(ptr: *anyopaque, m: u32) void {
+    fn setMTU_external(ptr: *anyopaque, m: u32) void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
+        self.setMTU(m);
+    }
+
+    pub fn setMTU(self: *AfPacket, m: u32) void {
         self.mtu_val = m;
     }
 
@@ -99,71 +126,43 @@ pub const AfPacket = struct {
         return 0;
     }
 
-    fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-        const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
-        _ = r;
-        _ = protocol;
-
-        const hdr_len = pkt.header.usedLength();
-        const total_len = hdr_len + pkt.data.size;
-
-        var buf: [9014]u8 = undefined;
-        if (total_len > buf.len) return tcpip.Error.MessageTooLong;
-
-        @memcpy(buf[0..hdr_len], pkt.header.view());
-        var off = hdr_len;
-        for (pkt.data.views) |v| {
-            @memcpy(buf[off .. off + v.view.len], v.view);
-            off += v.view.len;
-        }
-
-        _ = std.posix.send(self.fd, buf[0..total_len], 0) catch |err| {
-            if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
-            return tcpip.Error.BadLinkEndpoint;
-        };
-
-        stats.global_link_stats.tx_packets += 1;
-        stats.global_link_stats.tx_bytes += total_len;
-    }
-
     pub fn readPacket(self: *AfPacket) !bool {
         var num_read: usize = 0;
         const max_batch = 512;
-
         while (num_read < max_batch) {
             const c = self.cluster_pool.acquire() catch {
                 stats.global_stats.tcp.pool_exhausted += 1;
                 return num_read > 0;
             };
-
             const n = std.posix.recv(self.fd, &c.data, 0) catch |err| {
                 c.release();
                 if (err == error.WouldBlock) break;
                 return err;
             };
-
             if (n == 0) {
                 c.release();
                 break;
             }
-
             if (n < header.EthernetMinimumSize) {
                 c.release();
                 continue;
             }
-
-            // std.debug.print("RX: n={} src={any} type={x}\n", .{ n, c.data[6..12], std.mem.readInt(u16, c.data[12..14], .big) });
-
             if (std.mem.eql(u8, c.data[6..12], &self.address.addr)) {
                 c.release();
                 continue;
             }
+
+            const h_buf = self.header_pool.acquire() catch {
+                c.release();
+                return num_read > 0;
+            };
 
             stats.global_link_stats.rx_packets += 1;
             stats.global_link_stats.rx_bytes += n;
 
             const view_mem = self.view_pool.acquire() catch {
                 stats.global_stats.tcp.pool_exhausted += 1;
+                self.header_pool.release(h_buf);
                 c.release();
                 return num_read > 0;
             };
@@ -172,7 +171,7 @@ pub const AfPacket = struct {
 
             const pkt = tcpip.PacketBuffer{
                 .data = buffer.VectorisedView.init(n, original_views[0..1]),
-                .header = buffer.Prependable.init(&[_]u8{}),
+                .header = buffer.Prependable.init(h_buf),
                 .timestamp_ns = @intCast(std.time.nanoTimestamp()),
             };
             var mut_pkt = pkt;
@@ -183,11 +182,10 @@ pub const AfPacket = struct {
                 const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
                 d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, mut_pkt);
             }
-
+            self.header_pool.release(h_buf);
             mut_pkt.data.deinit();
             num_read += 1;
         }
-
         return num_read > 0;
     }
 
