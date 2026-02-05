@@ -1705,6 +1705,8 @@ pub const TCPEndpoint = struct {
             if (node.data.seq == self.rcv_nxt) {
                 _ = self.ooo_list.remove(node);
                 self.rcv_list.append(node);
+                self.rcv_buf_used += node.data.data.size;
+                self.rcv_view_count += node.data.data.views.len;
                 self.rcv_nxt +%= @as(u32, @intCast(node.data.data.size));
             } else if (seqBefore(node.data.seq, self.rcv_nxt)) {
                 _ = self.ooo_list.remove(node);
