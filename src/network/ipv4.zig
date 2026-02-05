@@ -3,6 +3,7 @@ const tcpip = @import("../tcpip.zig");
 const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const log = @import("../log.zig").scoped(.ipv4);
+const stats = @import("../stats.zig");
 
 const buffer = @import("../buffer.zig");
 
@@ -25,7 +26,14 @@ pub const IPv4Protocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        _ = ptr;
+        // IPv4Protocol is stateless and usually allocated on stack or once.
+        // But in main.zig it's on heap.
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;
@@ -161,10 +169,10 @@ pub const IPv4Endpoint = struct {
         var mut_packets_storage: [64]tcpip.PacketBuffer = undefined;
         if (packets.len > 64) return tcpip.Error.MessageTooLong;
         const mut_packets = mut_packets_storage[0..packets.len];
-        
+
         for (packets, 0..) |pkt, i| {
             if (pkt.data.size > max_payload) return tcpip.Error.MessageTooLong;
-            
+
             var mut_pkt = pkt;
             const ip_header = mut_pkt.header.prepend(header.IPv4MinimumSize) orelse return tcpip.Error.NoBufferSpace;
             const h = header.IPv4.init(ip_header);
@@ -178,9 +186,12 @@ pub const IPv4Endpoint = struct {
             @memcpy(ip_header[12..16], &r.local_address.v4);
             @memcpy(ip_header[16..20], &r.remote_address.v4);
             h.setChecksum(h.calculateChecksum());
-            
+
             mut_packets[i] = mut_pkt;
         }
+
+        // Increment IP TX stats
+        stats.global_stats.ip.tx_packets += mut_packets.len;
 
         return self.nic.linkEP.writePackets(&mut_r, ProtocolNumber, mut_packets);
     }
@@ -198,8 +209,12 @@ pub const IPv4Endpoint = struct {
         const csum_calc = header.finishChecksum(header.internetChecksum(headerView[0..hlen], 0));
         if (csum_calc != 0) {
             log.warn("IPv4: Checksum failure from {any} (Calculated: 0x{x}, Header: 0x{x})", .{ h.sourceAddress(), csum_calc, h.checksum() });
+            stats.global_stats.ip.dropped_packets += 1;
             return;
         }
+
+        // Increment IP RX stats
+        stats.global_stats.ip.rx_packets += 1;
 
         if (h.moreFragments() or h.fragmentOffset() > 0) {
             // log.debug("IPv4: Fragment received. offset={}, more={}", .{ h.fragmentOffset(), h.moreFragments() });

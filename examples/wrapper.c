@@ -36,6 +36,9 @@ void my_ev_run(void* loop) {
     // printf("C: ev_run loop=%p\n", loop); fflush(stdout);
     ev_run(loop, 0); 
 }
+void my_ev_break(void* loop) {
+    ev_break(loop, EVBREAK_ALL);
+}
 
 #include <errno.h>
 

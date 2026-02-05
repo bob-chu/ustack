@@ -11,18 +11,16 @@ const TCPProtocol = tcp.TCPProtocol;
 
 test "TCP Fast Retransmit" {
     const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
-    var ipv4_proto = ipv4.IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
-    const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
     var wq_server = waiter.Queue{};
-    var ep_server = try allocator.create(TCPEndpoint);
-    ep_server.* = try TCPEndpoint.init(&s, tcp_proto, &wq_server, 1460);
-    ep_server.retransmit_timer.context = ep_server;
-    defer ep_server.decRef();
+    const ep_server_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_server);
+    const ep_server = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_server_res.ptr)));
+    defer ep_server.close();
 
     var fake_ep = struct {
         last_pkt: ?[]u8 = null,
@@ -65,10 +63,9 @@ test "TCP Fast Retransmit" {
     try ep_server.endpoint().bind(sa);
     try ep_server.endpoint().listen(10);
     var wq_client = waiter.Queue{};
-    var ep_client = try allocator.create(TCPEndpoint);
-    ep_client.* = try TCPEndpoint.init(&s, tcp_proto, &wq_client, 1460);
-    ep_client.retransmit_timer.context = ep_client;
-    defer ep_client.decRef();
+    const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
+    const ep_client = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_client_res.ptr)));
+    defer ep_client.close();
     try ep_client.endpoint().bind(ca);
     try ep_client.endpoint().connect(sa);
     const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
@@ -89,12 +86,11 @@ test "TCP Fast Retransmit" {
 
 test "TCP Retransmission" {
     const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
-    var ipv4_proto = ipv4.IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
-    const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
     var fake_ep = struct {
         last_pkt: ?[]u8 = null,
@@ -138,10 +134,9 @@ test "TCP Retransmission" {
     try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = sa.addr, .prefix_len = 24 } });
     try s.addLinkAddress(ca.addr, .{ .addr = [_]u8{0} ** 6 });
     var wq_server = waiter.Queue{};
-    var ep_server = try allocator.create(TCPEndpoint);
-    ep_server.* = try TCPEndpoint.init(&s, tcp_proto, &wq_server, 1460);
-    ep_server.retransmit_timer.context = ep_server;
-    defer ep_server.decRef();
+    const ep_server_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_server);
+    const ep_server = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_server_res.ptr)));
+    defer ep_server.close();
     try ep_server.endpoint().bind(sa);
     try ep_server.endpoint().listen(10);
     const syn_buf = try allocator.alloc(u8, header.TCPMinimumSize);
@@ -168,6 +163,7 @@ test "TCP Retransmission" {
 
     const accept_res = try ep_server.endpoint().accept();
     const ep_accepted = @as(*TCPEndpoint, @ptrCast(@alignCast(accept_res.ep.ptr)));
+    defer ep_accepted.decRef();
     defer accept_res.ep.close();
     const FakePayloader = struct {
         data: []const u8,
@@ -186,13 +182,13 @@ test "TCP Retransmission" {
 
 test "TCP CWND Enforcement" {
     const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
-    var ipv4_proto = ipv4.IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
-    const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
+
     var fake_link = struct {
         fn writePacket(_: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
             return;
@@ -213,12 +209,10 @@ test "TCP CWND Enforcement" {
     try s.createNIC(1, link_ep);
     _ = s.nics.get(1).?;
     var wq = waiter.Queue{};
-    var ep = try allocator.create(TCPEndpoint);
-    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
-    ep.retransmit_timer.context = ep;
-    defer ep.decRef();
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
+    defer ep.close();
     ep.state = .established;
-
     ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
     ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
     ep.rcv_nxt = 1000;
@@ -259,19 +253,18 @@ test "TCP CWND Enforcement" {
 
 test "TCP SACK Blocks Generation" {
     const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
-    var ipv4_proto = ipv4.IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
-    const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
+
     var wq = waiter.Queue{};
-    var ep = try allocator.create(TCPEndpoint);
-    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
-    ep.retransmit_timer.context = ep;
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
     ep.hint_sack_enabled = true;
-    defer ep.decRef();
+    defer ep.close();
     ep.state = .established;
     ep.rcv_nxt = 1000;
 
@@ -299,28 +292,19 @@ test "TCP SACK Blocks Generation" {
 
 test "TCP readv/writev zero-copy" {
     const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
-    var ipv4_proto = ipv4.IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
-    const tcp_proto = TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
 
     var wq = waiter.Queue{};
-    var ep = try allocator.create(TCPEndpoint);
-    ep.* = try TCPEndpoint.init(&s, tcp_proto, &wq, 1460);
-    ep.retransmit_timer.context = ep;
-    defer ep.decRef();
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
     ep.state = .established;
     ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 80 };
     ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 1234 };
-
-    // Test writev
-    const data1 = "hello ";
-    const data2 = "world";
-    var iov_write = [_][]u8{ @constCast(data1), @constCast(data2) };
-    var uio_write = buffer.Uio.init(&iov_write);
 
     // We need a mock NIC/Link to capture the packets
     var fake_link = struct {
@@ -346,6 +330,13 @@ test "TCP readv/writev zero-copy" {
         }
     }{ .captured = std.ArrayList(u8).init(allocator) };
     defer fake_link.captured.deinit();
+    defer ep.close();
+
+    // Test writev
+    const data1 = "hello ";
+    const data2 = "world";
+    var iov_write = [_][]u8{ @constCast(data1), @constCast(data2) };
+    var uio_write = buffer.Uio.init(&iov_write);
 
     const link_ep = stack.LinkEndpoint{ .ptr = &fake_link, .vtable = &.{ .writePacket = @TypeOf(fake_link).writePacket, .attach = @TypeOf(fake_link).attach, .linkAddress = @TypeOf(fake_link).linkAddress, .mtu = @TypeOf(fake_link).mtu, .setMTU = @TypeOf(fake_link).setMTU, .capabilities = @TypeOf(fake_link).capabilities } };
     try s.createNIC(1, link_ep);

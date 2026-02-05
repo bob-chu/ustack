@@ -1,5 +1,6 @@
 const std = @import("std");
 const header = @import("header.zig");
+const stats = @import("stats.zig");
 const Allocator = std.mem.Allocator;
 
 /// Cluster is a ref-counted fixed-size buffer.
@@ -51,6 +52,20 @@ pub const ClusterPool = struct {
         self.free_list = null;
     }
 
+    pub fn prewarm(self: *ClusterPool, count: usize) !void {
+        for (0..count) |_| {
+            const c = try self.allocator.create(Cluster);
+            c.* = .{
+                .ref_count = 0,
+                .pool = self,
+                .next = self.free_list,
+                .data = undefined,
+            };
+            self.free_list = c;
+            self.count += 1;
+        }
+    }
+
     pub fn acquire(self: *ClusterPool) !*Cluster {
         if (self.free_list) |c| {
             self.free_list = c.next;
@@ -59,6 +74,7 @@ pub const ClusterPool = struct {
             return c;
         }
 
+        stats.global_stats.pool.cluster_fallback += 1;
         const c = try self.allocator.create(Cluster);
         c.* = .{
             .ref_count = 1,
@@ -92,6 +108,14 @@ pub fn Pool(comptime T: type) type {
             };
         }
 
+        pub fn prewarm(self: *Self, count: usize) !void {
+            const to_warm = @min(count, self.capacity);
+            for (0..to_warm) |_| {
+                const node = try self.allocator.create(T);
+                self.release(node);
+            }
+        }
+
         pub fn deinit(self: *Self) void {
             var it = self.free_list;
             while (it) |node| {
@@ -106,13 +130,12 @@ pub fn Pool(comptime T: type) type {
             if (self.free_list) |node| {
                 self.free_list = node.next;
                 self.count -= 1;
-                node.next = null;
-                node.prev = null;
+                @memset(std.mem.asBytes(node), 0);
                 return node;
             }
+            stats.global_stats.pool.generic_fallback += 1;
             const node = try self.allocator.create(T);
-            node.next = null;
-            node.prev = null;
+            @memset(std.mem.asBytes(node), 0);
             return node;
         }
 
@@ -124,6 +147,16 @@ pub fn Pool(comptime T: type) type {
             node.next = self.free_list;
             self.free_list = node;
             self.count += 1;
+        }
+
+        pub fn tryRelease(self: *Self, node: *T) bool {
+            if (self.count >= self.capacity) {
+                return false;
+            }
+            node.next = self.free_list;
+            self.free_list = node;
+            self.count += 1;
+            return true;
         }
     };
 }
@@ -144,6 +177,15 @@ pub const BufferPool = struct {
         };
     }
 
+    pub fn prewarm(self: *BufferPool, count: usize) !void {
+        const to_warm = @min(count, self.capacity);
+        try self.free_list.ensureTotalCapacity(to_warm);
+        for (0..to_warm) |_| {
+            const buf = try self.allocator.alloc(u8, self.buffer_size);
+            self.free_list.appendAssumeCapacity(buf);
+        }
+    }
+
     pub fn deinit(self: *BufferPool) void {
         for (self.free_list.items) |buf| {
             self.allocator.free(buf);
@@ -155,6 +197,7 @@ pub const BufferPool = struct {
         if (self.free_list.popOrNull()) |buf| {
             return buf;
         }
+        stats.global_stats.pool.buffer_fallback += 1;
         return try self.allocator.alloc(u8, self.buffer_size);
     }
 

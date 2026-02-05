@@ -14,6 +14,7 @@ pub const CongestionControl = struct {
         getCwnd: *const fn (ptr: *anyopaque) u32,
         getSsthresh: *const fn (ptr: *anyopaque) u32,
         setMss: ?*const fn (ptr: *anyopaque, mss: u32) void = null,
+        reset: ?*const fn (ptr: *anyopaque, mss: u32) void = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -39,6 +40,14 @@ pub const CongestionControl = struct {
 
     pub fn setMss(self: CongestionControl, mss: u32) void {
         if (self.vtable.setMss) |f| f(self.ptr, mss);
+    }
+
+    pub fn reset(self: CongestionControl, mss: u32) !void {
+        if (self.vtable.reset) |f| {
+            f(self.ptr, mss);
+        } else {
+            return error.NotSupported;
+        }
     }
 
     pub fn deinit(self: CongestionControl) void {
@@ -73,8 +82,19 @@ pub const NewReno = struct {
         .getCwnd = getCwnd,
         .getSsthresh = getSsthresh,
         .setMss = setMss,
+        .reset = reset,
         .deinit = deinit,
     };
+
+    fn reset(ptr: *anyopaque, mss: u32) void {
+        const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));
+        self.* = .{
+            .cwnd = 32 * mss,
+            .ssthresh = 1024 * 1024 * 4,
+            .mss = mss,
+            .allocator = self.allocator,
+        };
+    }
 
     fn setMss(ptr: *anyopaque, mss: u32) void {
         const self = @as(*NewReno, @ptrCast(@alignCast(ptr)));

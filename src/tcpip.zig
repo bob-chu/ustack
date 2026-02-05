@@ -16,6 +16,17 @@ pub const Address = union(enum) {
         };
     }
 
+    pub fn hash(self: Address) u64 {
+        var h = std.hash.Wyhash.init(0);
+        const tag = std.meta.activeTag(self);
+        h.update(std.mem.asBytes(&tag));
+        switch (self) {
+            .v4 => |v| h.update(&v),
+            .v6 => |v| h.update(&v),
+        }
+        return h.final();
+    }
+
     pub fn isAny(self: Address) bool {
         return switch (self) {
             .v4 => |v| std.mem.eql(u8, &v, &[_]u8{ 0, 0, 0, 0 }),
@@ -81,6 +92,7 @@ pub const Error = error{
     NotPermitted,
     OutOfMemory,
     DestinationRequired,
+    NotSupported,
 };
 
 const buffer = @import("buffer.zig");
@@ -132,6 +144,7 @@ pub const Endpoint = struct {
         getLocalAddress: *const fn (ptr: *anyopaque) Error!FullAddress,
         getRemoteAddress: *const fn (ptr: *anyopaque) Error!FullAddress,
         setReceiveWindow: ?*const fn (ptr: *anyopaque, size: u32) void = null,
+        writeBatch: ?*const fn (ptr: *anyopaque, views: []const buffer.VectorisedView, opts: WriteOptions) Error!usize = null,
         setOption: *const fn (ptr: *anyopaque, opt: EndpointOption) Error!void,
         getOption: *const fn (ptr: *anyopaque, opt: EndpointOptionType) EndpointOption,
     };
@@ -196,10 +209,12 @@ pub const Endpoint = struct {
 
 pub const EndpointOptionType = enum {
     ts_enabled,
+    reuse_address,
 };
 
 pub const EndpointOption = union(EndpointOptionType) {
     ts_enabled: bool,
+    reuse_address: bool,
 };
 
 pub const AddressWithPrefix = struct {
@@ -266,7 +281,7 @@ pub const Subnet = struct {
     }
 
     // Convenience method to get prefix value
-    pub fn prefix(self: Subnet) u8 {
+    pub fn getPrefix(self: Subnet) u8 {
         return self.prefix;
     }
 };
@@ -284,10 +299,13 @@ pub const PacketBuffer = struct {
     network_header: ?buffer.View = null,
     transport_header: ?buffer.View = null,
 
+    timestamp_ns: i64 = 0,
+
     pub fn clone(self: PacketBuffer, allocator: std.mem.Allocator) Error!PacketBuffer {
         return .{
             .data = try self.data.clone(allocator),
             .header = self.header,
+            .timestamp_ns = self.timestamp_ns,
         };
     }
 };

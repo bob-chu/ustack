@@ -5,6 +5,7 @@ const header = @import("header.zig");
 const waiter = @import("waiter.zig");
 const time = @import("time.zig");
 const log = @import("log.zig").scoped(.stack);
+const stats = @import("stats.zig");
 
 pub const LinkEndpointCapabilities = u32;
 pub const CapabilityNone: LinkEndpointCapabilities = 0;
@@ -18,6 +19,7 @@ pub const LinkEndpoint = struct {
     pub const VTable = struct {
         writePacket: *const fn (ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void,
         writePackets: ?*const fn (ptr: *anyopaque, r: ?*const Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void = null,
+        flush: ?*const fn (ptr: *anyopaque) void = null,
         attach: *const fn (ptr: *anyopaque, dispatcher: *NetworkDispatcher) void,
         linkAddress: *const fn (ptr: *anyopaque) tcpip.LinkAddress,
         mtu: *const fn (ptr: *anyopaque) u32,
@@ -60,6 +62,9 @@ pub const LinkEndpoint = struct {
     }
     pub fn close(self: LinkEndpoint) void {
         if (self.vtable.close) |f| f(self.ptr);
+    }
+    pub fn flush(self: LinkEndpoint) void {
+        if (self.vtable.flush) |f| f(self.ptr);
     }
 };
 
@@ -125,7 +130,12 @@ pub const NetworkProtocol = struct {
         newEndpoint: *const fn (ptr: *anyopaque, nic: *NIC, addr: tcpip.AddressWithPrefix, dispatcher: TransportDispatcher) tcpip.Error!NetworkEndpoint,
         linkAddressRequest: *const fn (ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *NIC) tcpip.Error!void,
         parseAddresses: *const fn (ptr: *anyopaque, pkt: tcpip.PacketBuffer) AddressPair,
+        deinit: ?*const fn (ptr: *anyopaque) void = null,
     };
+
+    pub fn deinit(self: NetworkProtocol) void {
+        if (self.vtable.deinit) |f| f(self.ptr);
+    }
 
     pub fn number(self: NetworkProtocol) tcpip.NetworkProtocolNumber {
         return self.vtable.number(self.ptr);
@@ -219,7 +229,12 @@ pub const TransportProtocol = struct {
         newEndpoint: *const fn (ptr: *anyopaque, stack: *Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint,
         parsePorts: *const fn (ptr: *anyopaque, pkt: tcpip.PacketBuffer) PortPair,
         handlePacket: ?*const fn (ptr: *anyopaque, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void = null,
+        deinit: ?*const fn (ptr: *anyopaque) void = null,
     };
+
+    pub fn deinit(self: TransportProtocol) void {
+        if (self.vtable.deinit) |f| f(self.ptr);
+    }
 
     pub fn number(self: TransportProtocol) tcpip.TransportProtocolNumber {
         return self.vtable.number(self.ptr);
@@ -308,8 +323,18 @@ pub const NIC = struct {
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+        const start_processing: i64 = @intCast(std.time.nanoTimestamp());
+        defer {
+            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.link_layer.record(@as(i64, @intCast(start_processing - pkt.timestamp_ns)));
+                stats.global_stats.latency.network_layer.record(@as(i64, @intCast(end_processing - start_processing)));
+            }
+        }
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
+
+        if (remote.eq(self.linkEP.linkAddress())) return;
 
         const proto_opt = self.stack.network_protocols.get(protocol);
 
@@ -323,7 +348,13 @@ pub const NIC = struct {
 
         const addrs = proto.parseAddresses(pkt);
         if (!addrs.src.isAny()) {
-            self.stack.addLinkAddress(addrs.src, remote.*) catch {};
+            if (self.stack.link_addr_cache.get(addrs.src)) |prev| {
+                if (!prev.eq(remote.*)) {
+                    self.stack.addLinkAddress(addrs.src, remote.*) catch {};
+                }
+            } else {
+                self.stack.addLinkAddress(addrs.src, remote.*) catch {};
+            }
         }
 
         const r = Route{
@@ -447,7 +478,7 @@ const RouteTable = struct {
 };
 
 pub const TransportTable = struct {
-    endpoints: std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
+    shards: [256]std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
 
     const TransportContext = struct {
         pub fn hash(_: TransportContext, key: TransportEndpointID) u64 {
@@ -459,25 +490,37 @@ pub const TransportTable = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) TransportTable {
-        return .{
-            .endpoints = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator),
-        };
+        var self: TransportTable = undefined;
+        for (&self.shards) |*shard| {
+            shard.* = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator);
+        }
+        return self;
     }
 
     pub fn deinit(self: *TransportTable) void {
-        self.endpoints.deinit();
+        for (&self.shards) |*shard| {
+            shard.deinit();
+        }
+    }
+
+    pub fn getShard(self: *TransportTable, id: TransportEndpointID) *std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80) {
+        return &self.shards[id.hash() % 256];
     }
 
     pub fn put(self: *TransportTable, id: TransportEndpointID, ep: TransportEndpoint) !void {
-        try self.endpoints.put(id, ep);
+        try self.getShard(id).put(id, ep);
+    }
+
+    pub fn fetchRemove(self: *TransportTable, id: TransportEndpointID) ?std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).KV {
+        return self.getShard(id).fetchRemove(id);
     }
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
-        return self.endpoints.remove(id);
+        return self.getShard(id).remove(id);
     }
 
     pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
-        const ep = self.endpoints.get(id);
+        const ep = self.getShard(id).get(id);
         if (ep) |e| e.incRef();
         return ep;
     }
@@ -487,30 +530,51 @@ pub const Stack = struct {
     allocator: std.mem.Allocator,
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
     endpoints: TransportTable,
-    link_addr_cache: std.AutoHashMap(tcpip.Address, tcpip.LinkAddress),
+    link_addr_cache: std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80),
     transport_protocols: std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol),
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
     timer_queue: time.TimerQueue,
     cluster_pool: buffer.ClusterPool,
     ephemeral_port: u16,
+    tcp_msl: u64 = 30000,
+
+    pub const AddressContext = struct {
+        pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
+            return key.hash();
+        }
+        pub fn eql(_: AddressContext, a: tcpip.Address, b: tcpip.Address) bool {
+            return a.eq(b);
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
+        var cluster_pool = buffer.ClusterPool.init(allocator);
+        try cluster_pool.prewarm(1024);
         return .{
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
             .endpoints = TransportTable.init(allocator),
-            .link_addr_cache = std.AutoHashMap(tcpip.Address, tcpip.LinkAddress).init(allocator),
+            .link_addr_cache = std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80).init(allocator),
             .transport_protocols = std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol).init(allocator),
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
             .timer_queue = .{},
-            .cluster_pool = buffer.ClusterPool.init(allocator),
+            .cluster_pool = cluster_pool,
             .ephemeral_port = 32768,
+            .tcp_msl = 30000,
         };
     }
 
     pub fn deinit(self: *Stack) void {
+        var shard_idx: usize = 0;
+        while (shard_idx < 256) : (shard_idx += 1) {
+            var it = self.endpoints.shards[shard_idx].valueIterator();
+            while (it.next()) |ep| {
+                ep.decRef();
+            }
+        }
+        self.endpoints.deinit();
         self.cluster_pool.deinit();
         var nic_it = self.nics.valueIterator();
         while (nic_it.next()) |nic| {
@@ -518,10 +582,20 @@ pub const Stack = struct {
             self.allocator.destroy(nic.*);
         }
         self.nics.deinit();
-        self.endpoints.deinit();
         self.link_addr_cache.deinit();
+
+        var transport_it = self.transport_protocols.valueIterator();
+        while (transport_it.next()) |proto| {
+            proto.deinit();
+        }
         self.transport_protocols.deinit();
+
+        var network_it = self.network_protocols.valueIterator();
+        while (network_it.next()) |proto| {
+            proto.deinit();
+        }
         self.network_protocols.deinit();
+
         self.route_table.deinit();
     }
 
@@ -533,24 +607,40 @@ pub const Stack = struct {
         try self.transport_protocols.put(proto.number(), proto);
     }
 
+    pub fn getLinkAddress(self: *Stack, addr: tcpip.Address) ?tcpip.LinkAddress {
+        return self.link_addr_cache.get(addr);
+    }
+
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
-        const prev = try self.link_addr_cache.fetchPut(addr, link_addr);
+        var is_new = false;
+        if (self.link_addr_cache.get(addr)) |prev| {
+            if (prev.eq(link_addr)) return;
+        } else {
+            is_new = true;
+        }
+        try self.link_addr_cache.put(addr, link_addr);
 
-        if (prev != null and prev.?.value.eq(link_addr)) return;
-
-        // Notify all transport endpoints that they might be writable now (due to ARP resolution)
-        var it = self.endpoints.endpoints.valueIterator();
-        while (it.next()) |ep| {
-            ep.notify(waiter.EventOut);
+        // Only notify if this is a NEW address or it CHANGED.
+        if (is_new) {
+            for (&self.endpoints.shards) |*shard| {
+                var it = shard.valueIterator();
+                while (it.next()) |ep| {
+                    ep.notify(waiter.EventOut);
+                }
+            }
         }
     }
 
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {
         try self.endpoints.put(id, ep);
+        ep.incRef();
     }
 
     pub fn unregisterTransportEndpoint(self: *Stack, id: TransportEndpointID) void {
-        _ = self.endpoints.remove(id);
+        const ep_opt = self.endpoints.fetchRemove(id);
+        if (ep_opt) |kv| {
+            kv.value.decRef();
+        }
     }
 
     pub fn getNextEphemeralPort(self: *Stack) u16 {
@@ -638,6 +728,13 @@ pub const Stack = struct {
         return self.route_table.getRoutes();
     }
 
+    pub fn flush(self: *Stack) void {
+        var it = self.nics.valueIterator();
+        while (it.next()) |nic| {
+            nic.*.linkEP.flush();
+        }
+    }
+
     pub fn createNIC(self: *Stack, id: tcpip.NICID, ep: LinkEndpoint) !void {
         const nic = try self.allocator.create(NIC);
         nic.* = NIC.init(self, id, "", ep, false);
@@ -657,6 +754,12 @@ pub const Stack = struct {
     }
 
     pub fn deliverTransportPacket(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
+        defer {
+            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.transport_dispatch.record(end_processing - pkt.timestamp_ns);
+            }
+        }
         const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
 
         const proto_opt = self.transport_protocols.get(protocol);

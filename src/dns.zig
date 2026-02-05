@@ -196,7 +196,6 @@ test "DNS Query and Response Parsing" {
     defer s.deinit();
 
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
-    defer udp_proto.deinit(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
 
     var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();

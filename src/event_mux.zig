@@ -60,10 +60,13 @@ const ReadyQueue = struct {
     results: std.ArrayList(*waiter.Entry),
 
     pub fn init(allocator: std.mem.Allocator) ReadyQueue {
-        return .{
+        var self = ReadyQueue{
             .list = std.ArrayList(*waiter.Entry).init(allocator),
             .results = std.ArrayList(*waiter.Entry).init(allocator),
         };
+        self.list.ensureTotalCapacity(65536) catch {};
+        self.results.ensureTotalCapacity(65536) catch {};
+        return self;
     }
 
     pub fn deinit(self: *ReadyQueue) void {
@@ -84,7 +87,7 @@ const ReadyQueue = struct {
 
         self.results.clearRetainingCapacity();
         try self.results.appendSlice(self.list.items);
-        
+
         for (self.list.items) |entry| {
             entry.is_queued = false;
         }

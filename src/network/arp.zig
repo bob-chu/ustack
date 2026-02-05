@@ -4,6 +4,7 @@ const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
 const time = @import("../time.zig");
+const stats = @import("../stats.zig");
 
 pub const ProtocolNumber = 0x0806;
 pub const ProtocolAddress = "arp";
@@ -47,46 +48,49 @@ pub const ARPProtocol = struct {
 
     fn linkAddressRequest(ptr: *anyopaque, addr: tcpip.Address, local_addr: tcpip.Address, nic: *stack.NIC) tcpip.Error!void {
         _ = ptr;
-        
+
         const ep_opt = nic.network_endpoints.get(ProtocolNumber);
         if (ep_opt) |ep| {
             const arp_ep = @as(*ARPEndpoint, @ptrCast(@alignCast(ep.ptr)));
             if (!arp_ep.pending_requests.contains(addr)) {
                 arp_ep.pending_requests.put(addr, std.time.milliTimestamp()) catch {};
                 if (!arp_ep.timer.active) {
-                    nic.stack.timer_queue.schedule(&arp_ep.timer, 1000);
+                    nic.stack.timer_queue.schedule(&arp_ep.timer, 10);
                 }
+
+                const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
+                defer nic.stack.allocator.free(hdr_buf);
+
+                var pre = buffer.Prependable.init(hdr_buf);
+                const arp_hdr = pre.prepend(header.ARPSize).?;
+                var h = header.ARP.init(arp_hdr);
+                h.setIPv4OverEthernet();
+                h.setOp(1); // Request
+                @memcpy(h.data[8..14], &nic.linkEP.linkAddress().addr);
+                @memcpy(h.data[14..18], &local_addr.v4);
+                @memcpy(h.data[24..28], &addr.v4);
+
+                const pb = tcpip.PacketBuffer{
+                    .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
+                    .header = pre,
+                };
+
+                const broadcast_hw = tcpip.LinkAddress{ .addr = [_]u8{0xff} ** 6 };
+                var r = stack.Route{
+                    .local_address = local_addr,
+                    .remote_address = addr,
+                    .local_link_address = nic.linkEP.linkAddress(),
+                    .remote_link_address = broadcast_hw,
+                    .net_proto = ProtocolNumber,
+                    .nic = nic,
+                };
+
+                stats.global_stats.arp.tx_requests += 1;
+                return nic.linkEP.writePacket(&r, ProtocolNumber, pb);
             }
         }
 
-        const hdr_buf = nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return tcpip.Error.OutOfMemory;
-        defer nic.stack.allocator.free(hdr_buf);
-
-        var pre = buffer.Prependable.init(hdr_buf);
-        const arp_hdr = pre.prepend(header.ARPSize).?;
-        var h = header.ARP.init(arp_hdr);
-        h.setIPv4OverEthernet();
-        h.setOp(1); // Request
-        @memcpy(h.data[8..14], &nic.linkEP.linkAddress().addr);
-        @memcpy(h.data[14..18], &local_addr.v4);
-        @memcpy(h.data[24..28], &addr.v4);
-
-        const pb = tcpip.PacketBuffer{
-            .data = .{ .views = &[_]buffer.ClusterView{}, .size = 0 },
-            .header = pre,
-        };
-
-        const broadcast_hw = tcpip.LinkAddress{ .addr = [_]u8{0xff} ** 6 };
-        var r = stack.Route{
-            .local_address = local_addr,
-            .remote_address = addr,
-            .local_link_address = nic.linkEP.linkAddress(),
-            .remote_link_address = broadcast_hw,
-            .net_proto = ProtocolNumber,
-            .nic = nic,
-        };
-
-        return nic.linkEP.writePacket(&r, ProtocolNumber, pb);
+        return;
     }
 
     fn newEndpoint(ptr: *anyopaque, nic: *stack.NIC, addr: tcpip.AddressWithPrefix, dispatcher: stack.TransportDispatcher) tcpip.Error!stack.NetworkEndpoint {
@@ -96,7 +100,7 @@ pub const ARPProtocol = struct {
         const ep = try nic.stack.allocator.create(ARPEndpoint);
         ep.* = .{
             .nic = nic,
-            .pending_requests = std.AutoHashMap(tcpip.Address, i64).init(nic.stack.allocator),
+            .pending_requests = std.HashMap(tcpip.Address, i64, stack.Stack.AddressContext, 80).init(nic.stack.allocator),
             .timer = time.Timer.init(ARPEndpoint.handleTimer, ep),
         };
         return ep.networkEndpoint();
@@ -105,7 +109,7 @@ pub const ARPProtocol = struct {
 
 pub const ARPEndpoint = struct {
     nic: *stack.NIC,
-    pending_requests: std.AutoHashMap(tcpip.Address, i64),
+    pending_requests: std.HashMap(tcpip.Address, i64, stack.Stack.AddressContext, 80),
     timer: time.Timer = undefined,
 
     pub fn networkEndpoint(self: *ARPEndpoint) stack.NetworkEndpoint {
@@ -129,7 +133,7 @@ pub const ARPEndpoint = struct {
         var has_pending = false;
 
         while (it.next()) |entry| {
-            if (now - entry.value_ptr.* >= 1000) {
+            if (now - entry.value_ptr.* >= 10) {
                 const proto_opt = self.nic.stack.network_protocols.get(ProtocolNumber);
                 if (proto_opt) |p| {
                     const proto = @as(*ARPProtocol, @ptrCast(@alignCast(p.ptr)));
@@ -147,7 +151,7 @@ pub const ARPEndpoint = struct {
         }
 
         if (has_pending) {
-            self.nic.stack.timer_queue.schedule(&self.timer, 1000);
+            self.nic.stack.timer_queue.schedule(&self.timer, 10);
         }
     }
 
@@ -186,6 +190,7 @@ pub const ARPEndpoint = struct {
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
+            stats.global_stats.arp.rx_requests += 1;
             if (self.nic.hasAddress(target_proto_addr)) {
                 const hdr_buf = self.nic.stack.allocator.alloc(u8, header.ReservedHeaderSize) catch return;
                 defer self.nic.stack.allocator.free(hdr_buf);
@@ -215,8 +220,11 @@ pub const ARPEndpoint = struct {
                     .nic = self.nic,
                 };
 
+                stats.global_stats.arp.tx_replies += 1;
                 self.nic.linkEP.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
             }
+        } else if (h.op() == 2) { // Reply
+            stats.global_stats.arp.rx_replies += 1;
         }
     }
 };

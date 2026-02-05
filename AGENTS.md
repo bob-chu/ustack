@@ -2,6 +2,20 @@
 
 This repository contains a high-performance, user-space TCP/IP network stack implemented in Zig (0.13.0). It is architecturally inspired by gVisor's netstack but optimized for Zig's memory management and concurrency models.
 
+## 🏗️ Architecture Overview
+
+**⚠️ CRITICAL: Single-Threaded Design**  
+ustack is a **single-process, single-thread network stack** using an event loop architecture (similar to nginx, Redis, HAProxy). All operations run on one CPU core with no locking overhead. High performance comes from:
+- **Zero context switches** — No thread/process switching
+- **Cache locality** — All data structures stay in L1/L2 cache
+- **No lock contention** — Event loop serialization eliminates races
+
+Do NOT assume multi-threading. Do NOT add locks. Do NOT suggest parallelization.
+
+---
+
+
+
 ## 🛠 Build, Lint, and Test Commands
 
 The project uses the standard Zig toolchain. A local Zig 0.13.0 distribution is available in the repository.
@@ -85,8 +99,9 @@ To run the `AF_PACKET` example using a `veth` pair:
 - **Exhaustive Switches:** Use Zig's exhaustive switching on error sets and enums.
 
 ### 6. Architectural Patterns
+- **Single-Threaded Event Loop:** ustack runs on ONE CPU core using event loop (libev/libuv). All packet processing, timer management, and TCP state transitions are serialized through the event loop. No locking is needed.
 - **Interfaces (VTables):** Polymorphism is achieved via structs containing a `ptr: *anyopaque` and a pointer to a `VTable`. See `stack.zig` for `LinkEndpoint`, `NetworkEndpoint`, and `TransportProtocol`.
-- **Concurrency (Sharding):** The transport table is sharded (256 shards) to minimize lock contention. Use shard-level locking where appropriate.
+- **Sharding (Hash Distribution):** The transport table is sharded (256 shards) to reduce hash collision chain lengths, NOT for multi-threading. This improves lookup performance from O(N) to O(N/256) in a single-threaded context.
 - **Zero-Copy Buffers:** Use `buffer.VectorisedView` (scatter-gather) and `buffer.Prependable` (backwards-growing header buffer) for packet data. Avoid unnecessary memory copies.
 - **Wait Queues:** Use `waiter.Queue` for blocking/non-blocking I/O notification logic, similar to Linux wait queues.
 

@@ -237,13 +237,11 @@ fn toSockAddr(addr: tcpip.FullAddress, out: *std.posix.sockaddr, len: ?*std.posi
 
 test "POSIX API TCP client/server" {
     const allocator = std.testing.allocator;
+    const tcp_proto = @import("transport/tcp.zig").TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
-
-    // Setup protocols
-    var tcp_proto = @import("transport/tcp.zig").TCPProtocol.init(allocator);
-    defer tcp_proto.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
+
     var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
@@ -481,7 +479,6 @@ test "POSIX upoll basic" {
     defer s.deinit();
 
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
-    defer udp_proto.deinit(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
     var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
     try s.registerNetworkProtocol(ipv4_proto.protocol());

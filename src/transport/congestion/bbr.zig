@@ -35,8 +35,22 @@ pub const BBR = struct {
         .onRetransmit = onRetransmit,
         .getCwnd = getCwnd,
         .getSsthresh = getSsthresh,
+        .reset = reset,
         .deinit = deinit,
     };
+
+    fn reset(ptr: *anyopaque, mss: u32) void {
+        const self = @as(*BBR, @ptrCast(@alignCast(ptr)));
+        self.* = .{
+            .cwnd = mss,
+            .ssthresh = 65535,
+            .mss = mss,
+            .allocator = self.allocator,
+            .min_rtt = 0,
+            .bottleneck_bw = 0,
+            .pacing_rate = 0,
+        };
+    }
 
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*BBR, @ptrCast(@alignCast(ptr)));

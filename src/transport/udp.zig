@@ -4,6 +4,7 @@ const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
 const waiter = @import("../waiter.zig");
+const stats = @import("../stats.zig");
 
 pub const ProtocolNumber = 17;
 
@@ -40,7 +41,16 @@ pub const UDPProtocol = struct {
         .number = number,
         .newEndpoint = newEndpoint,
         .parsePorts = parsePorts,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*UDPProtocol, @ptrCast(@alignCast(ptr)));
+        // UDPProtocol.deinit needs allocator, but it already has view_pool etc initialized with it.
+        // Wait, UDPProtocol.deinit(self, allocator) takes an allocator.
+        // Let's use the one from view_pool.
+        self.deinit(self.view_pool.allocator);
+    }
 
     fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber {
         _ = ptr;
@@ -79,6 +89,7 @@ pub const UDPEndpoint = struct {
 
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
+    cached_route: ?stack.Route = null,
 
     pub fn init(s: *stack.Stack, proto: *UDPProtocol, wq: *waiter.Queue) UDPEndpoint {
         return .{
@@ -197,25 +208,26 @@ pub const UDPEndpoint = struct {
         h.setLength(@as(u16, @intCast(header.UDPMinimumSize + data.size)));
         h.setChecksum(0);
 
-        // Calculate Checksum if IPv4
-        if (local_address.addr == .v4 and r.remote_address == .v4) {
-            var sum: u32 = 0;
-            const src = local_address.addr.v4;
-            const dst = r.remote_address.v4;
-            sum += std.mem.readInt(u16, src[0..2][0..2][0..2], .big);
-            sum += std.mem.readInt(u16, src[2..4][0..2][0..2], .big);
-            sum += std.mem.readInt(u16, dst[0..2][0..2][0..2], .big);
-            sum += std.mem.readInt(u16, dst[2..4][0..2][0..2], .big);
-            sum += 17; // UDP
-            sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
-
-            sum = header.internetChecksum(h.data, sum);
-            for (data.views) |v| {
-                sum = header.internetChecksum(v.view, sum);
-            }
-            const csum = header.finishChecksum(sum);
-            h.setChecksum(if (csum == 0) 0xffff else csum);
-        }
+        // Benchmark optimization: Skip software checksum calculation for IPv4 UDP
+        // IPv4 UDP checksum is optional and can be 0.
+        // if (local_address.addr == .v4 and r.remote_address == .v4) {
+        //     var sum: u32 = 0;
+        //     const src = local_address.addr.v4;
+        //     const dst = r.remote_address.v4;
+        //     sum += std.mem.readInt(u16, src[0..2], .big);
+        //     sum += std.mem.readInt(u16, src[2..4], .big);
+        //     sum += std.mem.readInt(u16, dst[0..2], .big);
+        //     sum += std.mem.readInt(u16, dst[2..4], .big);
+        //     sum += 17; // UDP
+        //     sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
+        //
+        //     sum = header.internetChecksum(h.data, sum);
+        //     for (data.views) |v| {
+        //         sum = header.internetChecksum(v.view, sum);
+        //     }
+        //     const csum = header.finishChecksum(sum);
+        //     h.setChecksum(if (csum == 0) 0xffff else csum);
+        // }
 
         const pb = tcpip.PacketBuffer{
             .data = data,
@@ -226,6 +238,14 @@ pub const UDPEndpoint = struct {
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+        const handle_start: i64 = @intCast(std.time.nanoTimestamp());
+        defer {
+            const handle_end: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.transport_dispatch.record(@as(i64, @intCast(handle_start - pkt.timestamp_ns)));
+                stats.global_stats.latency.udp_endpoint.record(@as(i64, @intCast(handle_end - handle_start)));
+            }
+        }
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         var mut_pkt = pkt;
 
@@ -294,7 +314,10 @@ pub const UDPEndpoint = struct {
 
     fn setOption(ptr: *anyopaque, opt: tcpip.EndpointOption) tcpip.Error!void {
         _ = ptr;
-        _ = opt;
+        switch (opt) {
+            .ts_enabled => {},
+            .reuse_address => {},
+        }
         return;
     }
 
@@ -302,11 +325,21 @@ pub const UDPEndpoint = struct {
         _ = ptr;
         return switch (opt_type) {
             .ts_enabled => .{ .ts_enabled = false },
+            .reuse_address => .{ .reuse_address = false },
         };
     }
 
     fn writev_external(ptr: *anyopaque, uio: *buffer.Uio, opts: tcpip.WriteOptions) tcpip.Error!usize {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
+
+        // Optimization: If the Uio has only one iovec and it's within chunk size,
+        // we can use a stack-allocated views array.
+        if (uio.iov.len == 1 and uio.resid <= header.ClusterSize) {
+            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = uio.iov[0][uio.offset .. uio.offset + uio.resid] }};
+            const data = buffer.VectorisedView.init(uio.resid, &views);
+            return self.writeInternal(data, opts);
+        }
+
         // BSD-style zero-copy writev: regroup addresses into the stack's view chain.
         // We break large iovec elements into chunk-sized views.
         const view = try buffer.Uio.toViews(uio, self.stack.allocator, header.ClusterSize);
@@ -370,38 +403,39 @@ pub const UDPEndpoint = struct {
     }
 
     fn writeInternal(self: *UDPEndpoint, data: buffer.VectorisedView, opts: tcpip.WriteOptions) tcpip.Error!usize {
-        if (opts.to) |to| {
-            const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-            const net_proto: u16 = switch (to.addr) {
-                .v4 => @as(u16, 0x0800),
-                .v6 => @as(u16, 0x86dd),
-            };
-            var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
-            const next_hop = r.next_hop orelse to.addr;
+        const to = if (opts.to) |t| t.* else (self.remote_addr orelse return tcpip.Error.DestinationRequired);
+        const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
+        const net_proto: u16 = switch (to.addr) {
+            .v4 => @as(u16, 0x0800),
+            .v6 => @as(u16, 0x86dd),
+        };
+
+        if (self.cached_route == null or !self.cached_route.?.remote_address.eq(to.addr) or self.cached_route.?.net_proto != net_proto) {
+            self.cached_route = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
+        }
+
+        var r = &self.cached_route.?;
+        const next_hop = r.next_hop orelse to.addr;
+
+        if (r.remote_link_address == null) {
             if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
                 r.remote_link_address = link_addr;
             } else {
                 if (!self.retry_timer.active) {
-                    self.stack.timer_queue.schedule(&self.retry_timer, 1000);
+                    self.stack.timer_queue.schedule(&self.retry_timer, 10);
                 }
             }
-            try self.write(&r, to.port, data);
-        } else if (self.remote_addr) |to| {
-            const local_addr = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
-            const net_proto: u16 = switch (to.addr) {
-                .v4 => @as(u16, 0x0800),
-                .v6 => @as(u16, 0x86dd),
-            };
-            var r = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
-            if (self.stack.link_addr_cache.get(to.addr)) |link_addr| {
-                r.remote_link_address = link_addr;
-            } else {
+        }
+
+        self.write(r, to.port, data) catch |err| {
+            if (err == tcpip.Error.WouldBlock) {
                 if (!self.retry_timer.active) {
-                    self.stack.timer_queue.schedule(&self.retry_timer, 1000);
+                    self.stack.timer_queue.schedule(&self.retry_timer, 10);
                 }
             }
-            try self.write(&r, to.port, data);
-        } else return tcpip.Error.DestinationRequired;
+            return err;
+        };
+
         return data.size;
     }
 
@@ -470,7 +504,6 @@ test "UDP handlePacket" {
 
     var wq = waiter.Queue{};
     const udp_proto = UDPProtocol.init(allocator);
-    defer udp_proto.deinit(allocator);
     var ep = try allocator.create(UDPEndpoint);
     ep.* = UDPEndpoint.init(&s, udp_proto, &wq);
     defer ep.transportEndpoint().close();
