@@ -1257,6 +1257,14 @@ pub const TCPEndpoint = struct {
     }
 
     pub fn handlePacket(self: *TCPEndpoint, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+        const handle_start: i64 = @intCast(std.time.nanoTimestamp());
+        defer {
+            const handle_end: i64 = @intCast(std.time.nanoTimestamp());
+            if (pkt.timestamp_ns != 0) {
+                stats.global_stats.latency.transport_dispatch.record(@as(i64, @intCast(handle_start - pkt.timestamp_ns)));
+                stats.global_stats.latency.tcp_endpoint.record(@as(i64, @intCast(handle_end - handle_start)));
+            }
+        }
         self.incRef();
         defer self.decRef();
 

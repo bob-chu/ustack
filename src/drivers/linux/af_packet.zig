@@ -17,17 +17,48 @@ pub const AfPacket = struct {
     if_index: i32 = 0,
     dispatcher: ?*stack.NetworkDispatcher = null,
 
+    // Ring configuration
+    rx_ring: []u8,
+    tx_ring: []u8,
+    rx_idx: usize = 0,
+    tx_idx: usize = 0,
+    frame_size: u32,
+    frame_nr: u32,
+
     pub fn init(allocator: std.mem.Allocator, pool: *buffer.ClusterPool, dev_name: []const u8) !AfPacket {
         const protocol = @as(u16, @bitCast(std.mem.nativeToBig(u16, header.ETH_P_ALL)));
         const fd = try std.posix.socket(std.posix.AF.PACKET, std.posix.SOCK.RAW | std.posix.SOCK.NONBLOCK, protocol);
         errdefer std.posix.close(fd);
 
-        const buf_size: i32 = 10 * 1024 * 1024;
-        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&buf_size));
-        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&buf_size));
+        // Set TPACKET_V2
+        const version = @as(i32, header.TPACKET_V2);
+        try std.posix.setsockopt(fd, 263, header.PACKET_VERSION, std.mem.asBytes(&version));
 
-        const ignore_outgoing: i32 = 1;
-        _ = std.posix.setsockopt(fd, 263, 23, std.mem.asBytes(&ignore_outgoing)) catch {};
+        // Ring settings: 16KB frames to support Jumbo frames
+        const frame_size: u32 = 16384;
+        const frame_nr: u32 = 256;
+        const block_size: u32 = 4096 * 128; // 512KB block
+        const block_nr: u32 = (frame_size * frame_nr) / block_size;
+
+        const req = header.tpacket_req{
+            .tp_block_size = block_size,
+            .tp_block_nr = block_nr,
+            .tp_frame_size = frame_size,
+            .tp_frame_nr = frame_nr,
+        };
+
+        try std.posix.setsockopt(fd, 263, header.PACKET_RX_RING, std.mem.asBytes(&req));
+        try std.posix.setsockopt(fd, 263, header.PACKET_TX_RING, std.mem.asBytes(&req));
+
+        const rx_ring_size = frame_size * frame_nr;
+        const tx_ring_size = frame_size * frame_nr;
+        const total_ring_size = rx_ring_size + tx_ring_size;
+
+        const ring_ptr = try std.posix.mmap(null, total_ring_size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, fd, 0);
+        errdefer std.posix.munmap(ring_ptr);
+
+        const rx_ring_ptr = ring_ptr[0..rx_ring_size];
+        const tx_ring_ptr = ring_ptr[rx_ring_size..total_ring_size];
 
         const if_index = try getIfIndex(fd, dev_name);
         var ll_addr = std.posix.sockaddr.ll{
@@ -46,10 +77,14 @@ pub const AfPacket = struct {
             .fd = fd,
             .allocator = allocator,
             .cluster_pool = pool,
-            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 1, 4096),
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 4096),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 4096),
             .if_index = if_index,
             .address = .{ .addr = mac },
+            .rx_ring = rx_ring_ptr,
+            .tx_ring = tx_ring_ptr,
+            .frame_size = frame_size,
+            .frame_nr = frame_nr,
         };
     }
 
@@ -64,38 +99,96 @@ pub const AfPacket = struct {
                 .mtu = mtu_external,
                 .setMTU = setMTU_external,
                 .capabilities = capabilities,
+                .close = close_external,
+                .flush = flush_external,
             },
         };
     }
 
+    fn flush_external(ptr: *anyopaque) void {
+        const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
+        self.flush();
+    }
+
+    pub fn flush(self: *AfPacket) void {
+        // Kick kernel to send pending frames
+        const start = std.time.nanoTimestamp();
+        _ = std.os.linux.syscall6(.sendto, @as(usize, @intCast(self.fd)), 0, 0, 0, 0, 0);
+        const end = std.time.nanoTimestamp();
+        stats.global_stats.latency.driver_tx.record(@as(i64, @intCast(end - start)));
+        stats.global_link_stats.tx_syscalls += 1;
+    }
+
+    fn close_external(ptr: *anyopaque) void {
+        const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
+        self.deinit();
+    }
+
+    pub fn deinit(self: *AfPacket) void {
+        const total_ring_size = self.frame_size * self.frame_nr * 2;
+        const mmap_ptr = @as([*]align(std.mem.page_size) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
+        std.posix.munmap(mmap_ptr[0..total_ring_size]);
+        std.posix.close(self.fd);
+    }
+
     fn writePackets_external(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
-        for (packets) |p| try self.writePacket(r, protocol, p);
+        _ = r;
+        _ = protocol;
+        return self.writePackets(packets);
+    }
+
+    pub fn writePackets(self: *AfPacket, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
+        const start = std.time.nanoTimestamp();
+        defer {
+            const end = std.time.nanoTimestamp();
+            stats.global_stats.latency.driver_tx.record(@as(i64, @intCast(end - start)));
+        }
+        var any_sent = false;
+        for (packets) |pkt| {
+            const slot = self.tx_ring[self.tx_idx * self.frame_size .. (self.tx_idx + 1) * self.frame_size];
+            var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
+
+            if (h.tp_status != header.TP_STATUS_KERNEL) {
+                self.flush();
+                if (h.tp_status != header.TP_STATUS_KERNEL) return tcpip.Error.WouldBlock;
+            }
+
+            const hdr_view = pkt.header.view();
+            const data_off = @as(usize, std.mem.alignForward(usize, @sizeOf(header.tpacket2_hdr), 16));
+            var current_off = data_off;
+
+            const total_len = hdr_view.len + pkt.data.size;
+            if (total_len + data_off > self.frame_size) return tcpip.Error.MessageTooLong;
+
+            @memcpy(slot[current_off .. current_off + hdr_view.len], hdr_view);
+            current_off += hdr_view.len;
+
+            for (pkt.data.views) |v| {
+                @memcpy(slot[current_off .. current_off + v.view.len], v.view);
+                current_off += v.view.len;
+            }
+
+            h.tp_len = @as(u32, @intCast(total_len));
+            h.tp_mac = @as(u16, @intCast(data_off));
+            h.tp_net = @as(u16, @intCast(data_off + 14));
+            h.tp_status = header.TP_STATUS_SEND_REQUEST;
+
+            stats.global_link_stats.tx_packets += 1;
+            stats.global_link_stats.tx_bytes += total_len;
+
+            self.tx_idx = (self.tx_idx + 1) % self.frame_nr;
+            any_sent = true;
+        }
+        if (any_sent) self.flush();
     }
 
     fn writePacket_external(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
-        return self.writePacket(r, protocol, pkt);
-    }
-
-    pub fn writePacket(self: *AfPacket, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
-        const hdr_len = pkt.header.usedLength();
-        const total_len = hdr_len + pkt.data.size;
-        var buf: [9014]u8 = undefined;
-        if (total_len > buf.len) return tcpip.Error.MessageTooLong;
-        @memcpy(buf[0..hdr_len], pkt.header.view());
-        var off = hdr_len;
-        for (pkt.data.views) |v| {
-            @memcpy(buf[off .. off + v.view.len], v.view);
-            off += v.view.len;
-        }
-        // std.debug.print("AF_PACKET: Sending packet len={} type={x}\n", .{ total_len, std.mem.readInt(u16, buf[12..14], .big) });
-        _ = std.posix.write(self.fd, buf[0..total_len]) catch |err| {
-            if (err == error.WouldBlock) return tcpip.Error.WouldBlock;
-            return tcpip.Error.BadLinkEndpoint;
-        };
-        stats.global_link_stats.tx_packets += 1;
-        stats.global_link_stats.tx_bytes += total_len;
+        _ = r;
+        _ = protocol;
+        const p = [_]tcpip.PacketBuffer{pkt};
+        return self.writePackets(&p);
     }
 
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
@@ -115,10 +208,6 @@ pub const AfPacket = struct {
 
     fn setMTU_external(ptr: *anyopaque, m: u32) void {
         const self = @as(*AfPacket, @ptrCast(@alignCast(ptr)));
-        self.setMTU(m);
-    }
-
-    pub fn setMTU(self: *AfPacket, m: u32) void {
         self.mtu_val = m;
     }
 
@@ -128,29 +217,46 @@ pub const AfPacket = struct {
 
     pub fn readPacket(self: *AfPacket) !bool {
         var num_read: usize = 0;
-        const max_batch = 512;
+        const max_batch = 1024;
+        const driver_start = std.time.nanoTimestamp();
+        defer {
+            if (num_read > 0) {
+                const driver_end = std.time.nanoTimestamp();
+                stats.global_stats.latency.driver_rx.record(@as(i64, @intCast(driver_end - driver_start)));
+            }
+        }
         while (num_read < max_batch) {
+            const rx_slot = self.rx_ring[self.rx_idx * self.frame_size .. (self.rx_idx + 1) * self.frame_size];
+            var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(rx_slot.ptr)));
+
+            const status = h.tp_status;
+            if ((status & header.TP_STATUS_USER) == 0) break;
+
+            const len = h.tp_len;
+            const data_start = h.tp_mac;
+            if (data_start + len > self.frame_size) {
+                // Invalid frame, skip
+                h.tp_status = header.TP_STATUS_KERNEL;
+                self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
+                continue;
+            }
+            const data = rx_slot[data_start .. data_start + len];
+
+            // Filter out loopback (if source MAC is ours)
+            if (std.mem.eql(u8, data[6..12], &self.address.addr)) {
+                h.tp_status = header.TP_STATUS_KERNEL;
+                self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
+                continue;
+            }
+
             const c = self.cluster_pool.acquire() catch {
-                stats.global_stats.tcp.pool_exhausted += 1;
+                stats.global_stats.pool.cluster_exhausted += 1;
                 return num_read > 0;
             };
-            const n = std.posix.recv(self.fd, &c.data, 0) catch |err| {
-                c.release();
-                if (err == error.WouldBlock) break;
-                return err;
-            };
-            if (n == 0) {
-                c.release();
-                break;
-            }
-            if (n < header.EthernetMinimumSize) {
-                c.release();
-                continue;
-            }
-            if (std.mem.eql(u8, c.data[6..12], &self.address.addr)) {
-                c.release();
-                continue;
-            }
+            @memcpy(c.data[0..len], data);
+
+            h.tp_status = header.TP_STATUS_KERNEL;
+            self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
 
             const h_buf = self.header_pool.acquire() catch {
                 c.release();
@@ -158,19 +264,19 @@ pub const AfPacket = struct {
             };
 
             stats.global_link_stats.rx_packets += 1;
-            stats.global_link_stats.rx_bytes += n;
+            stats.global_link_stats.rx_bytes += len;
 
             const view_mem = self.view_pool.acquire() catch {
-                stats.global_stats.tcp.pool_exhausted += 1;
+                stats.global_stats.pool.view_exhausted += 1;
                 self.header_pool.release(h_buf);
                 c.release();
                 return num_read > 0;
             };
             const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
-            original_views[0] = .{ .cluster = c, .view = c.data[0..n] };
+            original_views[0] = .{ .cluster = c, .view = c.data[0..len] };
 
             const pkt = tcpip.PacketBuffer{
-                .data = buffer.VectorisedView.init(n, original_views[0..1]),
+                .data = buffer.VectorisedView.init(len, original_views[0..1]),
                 .header = buffer.Prependable.init(h_buf),
                 .timestamp_ns = @intCast(std.time.nanoTimestamp()),
             };

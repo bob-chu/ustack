@@ -335,6 +335,8 @@ const PingClient = struct {
     active_conns: u32 = 0,
     start_time: i64 = 0,
     end_time: i64 = 0,
+    last_report_time: i64 = 0,
+    last_report_count: u32 = 0,
 
     pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*PingClient {
         const self = try allocator.create(PingClient);
@@ -350,6 +352,7 @@ const PingClient = struct {
 
     pub fn start(self: *PingClient) !void {
         self.start_time = std.time.milliTimestamp();
+        self.last_report_time = self.start_time;
         const total = self.config.max_conns orelse 1;
         const concurrency = self.config.concurrency;
         var i: u32 = 0;
@@ -384,6 +387,20 @@ const PingClient = struct {
     pub fn onConnectionFinished(self: *PingClient) void {
         self.active_conns -= 1;
         const total = self.config.max_conns orelse 1;
+        const current_completed = self.next_conn_id - self.active_conns - 1;
+
+        const now = std.time.milliTimestamp();
+        if (now - self.last_report_time >= 1000) {
+            const diff_conns = current_completed - self.last_report_count;
+            const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
+            const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
+            const total_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+
+            std.debug.print("[ID: C] {d: >5.2}-{d: >5.2} sec  CPS: {d:.0}\n", .{ total_sec - diff_time_s, total_sec, current_cps });
+
+            self.last_report_time = now;
+            self.last_report_count = current_completed;
+        }
 
         if (self.next_conn_id <= total) {
             self.startConnection() catch {};

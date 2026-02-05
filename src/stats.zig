@@ -54,13 +54,19 @@ pub const LatencyMetric = struct {
 };
 
 pub const LatencyStats = struct {
+    link_layer: LatencyMetric = .{},
     network_layer: LatencyMetric = .{},
     transport_dispatch: LatencyMetric = .{},
     tcp_endpoint: LatencyMetric = .{},
     udp_endpoint: LatencyMetric = .{},
+    driver_rx: LatencyMetric = .{},
+    driver_tx: LatencyMetric = .{},
 
     pub fn dump(self: @This()) void {
         std.debug.print("\n--- Latency Statistics (ns) ---\n", .{});
+        self.printMetric("Driver RX       ", self.driver_rx);
+        self.printMetric("Driver TX       ", self.driver_tx);
+        self.printMetric("Link Layer      ", self.link_layer);
         self.printMetric("Network Layer   ", self.network_layer);
         self.printMetric("Transport Disp  ", self.transport_dispatch);
         self.printMetric("TCP Endpoint    ", self.tcp_endpoint);
@@ -134,6 +140,8 @@ pub const PoolStats = struct {
     cluster_fallback: usize = 0,
     buffer_fallback: usize = 0,
     generic_fallback: usize = 0,
+    cluster_exhausted: usize = 0,
+    view_exhausted: usize = 0,
 };
 
 pub const LinkStats = struct {
@@ -143,6 +151,8 @@ pub const LinkStats = struct {
     tx_bytes: usize = 0,
     rx_errors: usize = 0,
     tx_errors: usize = 0,
+    rx_syscalls: usize = 0,
+    tx_syscalls: usize = 0,
 };
 
 pub var global_stats: StackStats = .{};

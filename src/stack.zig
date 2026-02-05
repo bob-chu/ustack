@@ -323,10 +323,12 @@ pub const NIC = struct {
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+        const start_processing: i64 = @intCast(std.time.nanoTimestamp());
         defer {
             const end_processing: i64 = @intCast(std.time.nanoTimestamp());
             if (pkt.timestamp_ns != 0) {
-                stats.global_stats.latency.network_layer.record(end_processing - pkt.timestamp_ns);
+                stats.global_stats.latency.link_layer.record(@as(i64, @intCast(start_processing - pkt.timestamp_ns)));
+                stats.global_stats.latency.network_layer.record(@as(i64, @intCast(end_processing - start_processing)));
             }
         }
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));

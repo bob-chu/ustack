@@ -238,10 +238,12 @@ pub const UDPEndpoint = struct {
     }
 
     fn handlePacket(ptr: *anyopaque, r: *const stack.Route, id: stack.TransportEndpointID, pkt: tcpip.PacketBuffer) void {
+        const handle_start: i64 = @intCast(std.time.nanoTimestamp());
         defer {
-            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            const handle_end: i64 = @intCast(std.time.nanoTimestamp());
             if (pkt.timestamp_ns != 0) {
-                stats.global_stats.latency.udp_endpoint.record(end_processing - pkt.timestamp_ns);
+                stats.global_stats.latency.transport_dispatch.record(@as(i64, @intCast(handle_start - pkt.timestamp_ns)));
+                stats.global_stats.latency.udp_endpoint.record(@as(i64, @intCast(handle_end - handle_start)));
             }
         }
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));

@@ -3,6 +3,7 @@ const tcpip = @import("../tcpip.zig");
 const stack = @import("../stack.zig");
 const header = @import("../header.zig");
 const buffer = @import("../buffer.zig");
+const stats = @import("../stats.zig");
 
 pub const EthernetEndpoint = struct {
     lower: stack.LinkEndpoint,
@@ -36,7 +37,7 @@ pub const EthernetEndpoint = struct {
 
     fn writePackets(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
-        
+
         const dst = if (r) |route| (if (route.remote_link_address) |la| la.addr else [_]u8{0xff} ** 6) else [_]u8{0xff} ** 6;
         const src = if (r) |route| route.local_link_address.addr else self.addr.addr;
 
@@ -84,6 +85,11 @@ pub const EthernetEndpoint = struct {
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
+        const start = std.time.nanoTimestamp();
+        defer {
+            const end = std.time.nanoTimestamp();
+            stats.global_stats.latency.link_layer.record(@as(i64, @intCast(end - start)));
+        }
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
         _ = remote;
         _ = local;
