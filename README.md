@@ -1,10 +1,15 @@
 # ustack
 
-A robust, user-space TCP/IP network stack implemented in Zig, ported and adapted from the Go-based Netstack (gVisor).
+A high-performance, user-space TCP/IP network stack implemented in Zig (0.13.0), architecturally inspired by gVisor's Netstack but optimized for Zig's memory management and single-threaded concurrency models.
 
-## 1. High-Level Architecture
+## 🏗️ Architecture Overview
 
-The stack follows a modular, layered architecture closely mirroring the TCP/IP model.
+ustack is designed as a **single-process, single-threaded network stack** utilizing an event loop architecture. This approach eliminates locking overhead and context switching, achieving high performance through:
+
+- **Zero Context Switches**: All operations run on one CPU core.
+- **Cache Locality**: Critical data structures remain in L1/L2 cache.
+- **Lock-Free Execution**: Event loop serialization eliminates race conditions and lock contention.
+- **Zero-Copy Path**: Data is passed through layers using `VectorisedView` scatter-gather buffers.
 
 ```mermaid
 graph TD
@@ -13,15 +18,15 @@ graph TD
     subgraph "Transport Layer"
         UDP["UDP Endpoint"]
         TCP["TCP Endpoint"]
-        CC["Congestion Control (NewReno, CUBIC, BBR)"]
+        CC["Congestion Control (CUBIC, BBR, NewReno)"]
         TCP --> CC
     end
     
     Trans --> |"PacketBuffer"| Net[Network Layer]
     
     subgraph "Network Layer"
-        IPv4["IPv4 Protocol (Frag/Reassembly)"]
-        IPv6["IPv6 Protocol"]
+        IPv4["IPv4 (Frag/Reassembly)"]
+        IPv6["IPv6 (NDP, SLAAC, DAD)"]
         ICMP["ICMPv4 / ICMPv6"]
         ARP["ARP (Resolution & Caching)"]
         Routing["Routing Table"]
@@ -31,240 +36,119 @@ graph TD
     
     subgraph "Link Layer"
         Eth["Ethernet Endpoint"]
-        Loop["Loopback"]
-        MTU["MTU / Jumbo Frames"]
+        Driver["AF_PACKET / AF_XDP / TAP"]
     end
-    
-    Link --> |"Frames"| NIC["Network Interface Controller (NIC)"]
 ```
 
-## 2. Directory Structure
+---
 
-```
-ustack/src/
-├── buffer.zig          # Memory management (VectorisedView, Prependable)
-├── header.zig          # Protocol header parsing/encoding (Eth, IP, TCP, UDP, ICMP)
-├── main.zig            # Entry point and integration tests
-├── stack.zig           # Core Stack, NIC, Route, Dispatcher interfaces
-├── tcpip.zig           # Common types (Address, Endpoint, Error)
-├── waiter.zig          # WaitQueue mechanism for blocking I/O
-├── link/
-│   └── eth.zig         # Ethernet Link Endpoint implementation
-├── network/
-│   ├── ipv4.zig        # IPv4 Protocol, Fragmentation, Reassembly
-│   ├── ipv6.zig        # IPv6 Protocol
-│   ├── arp.zig         # Address Resolution Protocol
-│   ├── icmp.zig        # ICMPv4 (Echo)
-│   └── icmpv6.zig      # ICMPv6 (Echo)
-└── transport/
-    ├── udp.zig         # UDP Protocol & Endpoint
-    ├── tcp.zig         # TCP Protocol & Endpoint (State Machine)
-    └── congestion/     # Pluggable Congestion Control
-        ├── control.zig # Interface definition
-        ├── cubic.zig   # CUBIC implementation
-        └── bbr.zig     # BBR implementation
-```
+## ⚡ Performance Benchmarks
 
-## 3. Low-Level Implementation Details
+Optimized for Jumbo Frames (MTU 9000) and high-throughput scenarios using the `AF_PACKET` driver with mmap-based zero-copy transmission.
 
-### 3.1 Memory Management (`buffer.zig`)
-*   **VectorisedView**: A non-contiguous buffer abstraction (scatter-gather) used to hold packet data without unnecessary copying. It manages a slice of `View`s (byte slices).
-*   **Prependable**: A buffer designed to grow backwards, allowing headers (TCP -> IP -> Ethernet) to be prepended efficiently before transmission.
-*   **PacketBuffer**: The primary container passed between layers, holding the header (Prependable) and data (VectorisedView).
+### Throughput & CPS (veth pair, MTU 9000)
 
-### 3.2 Core Stack (`stack.zig`)
-*   **Stack**: The central object holding registries for protocols (Transport/Network), NICs, and the Link Address Cache (ARP table).
-*   **Scalability (High-Concurrency)**:
-    *   **Sharded Transport Table**: Connection management is partitioned into **256 independent shards**.
-    *   **Parallel Processing**: Lock contention is minimized, allowing the stack to handle **10M+ concurrent connections** efficiently on multi-core systems.
-    *   **Custom Hashing**: Uses the high-performance **Wyhash** algorithm for constant-time connection lookups.
-*   **NIC**: Represents a network interface. It demultiplexes incoming packets to the appropriate Network Protocol (IPv4, IPv6, ARP) based on EtherType.
-*   **Dispatcher**: A virtual table interface used to pass packets up the stack (Link -> Network -> Transport).
+| Protocol | MTU | Payload Size | Throughput / CPS |
+| :--- | :--- | :--- | :--- |
+| **UDP** | 9000 | 8900 bytes | **~9.6 Gbps** (Near line-rate) |
+| **TCP** | 9000 | 8000 bytes | **~4.7 Gbps** |
+| **TCP** | 1500 | 1400 bytes | **~1.0 Gbps** |
+| **TCP CPS** | 1500 | - | **~10,000 Connections/sec** |
+| **UDP PPS** | 1500 | 64 bytes | **~180,000 Packets/sec** |
 
-### 3.3 TCP Implementation (`transport/tcp.zig`)
-*   **State Machine**: Full implementation of the TCP State Machine (LISTEN, SYN-SENT, ESTABLISHED, CLOSE-WAIT, etc.).
-*   **Reliability**:
-    *   **Retransmission Queue**: Tracks unacknowledged segments.
-    *   **RTO Timer**: Triggers retransmission based on round-trip time.
-    *   **Fast Retransmit**: Detects 3 duplicate ACKs to retransmit immediately.
-*   **Performance Improvements**:
-    *   **Delayed ACKs**: Only ACKs every 2nd data segment to reduce network overhead.
-    *   **Piggybacked ACKs**: Attaches ACK numbers to outgoing data segments whenever possible.
-    *   **Syncache**: Efficiently manages half-open connections to mitigate SYN flood attacks.
-    *   **TCP Options**: Support for RFC 1323 **Timestamps** (PAWS, RTT estimation) and **MSS** negotiation (standard 1460 bytes).
-*   **Graceful Closure**: Full support for the TCP FIN/ACK teardown handshake.
-*   **Congestion Control**: Modular design supporting:
-    *   **NewReno**: Standard Slow Start and Congestion Avoidance with Fast Recovery.
-    *   **CUBIC**: High-bandwidth delay-product optimization using a cubic function.
-    *   **BBR**: Bandwidth-Bottleneck and Round-trip propagation time algorithm.
+---
 
-```mermaid
-stateDiagram-v2
-    [*] --> CLOSED
-    CLOSED --> LISTEN: Listen()
-    CLOSED --> SYN_SENT: Connect()
-    LISTEN --> SYN_RCVD: Receive SYN (Syncache)
-    SYN_SENT --> ESTABLISHED: Receive SYN+ACK
-    SYN_RCVD --> ESTABLISHED: Receive ACK
-    ESTABLISHED --> FIN_WAIT_1: Shutdown() / Close()
-    ESTABLISHED --> CLOSE_WAIT: Receive FIN
-    FIN_WAIT_1 --> FIN_WAIT_2: Receive ACK
-    FIN_WAIT_2 --> TIME_WAIT: Receive FIN
-    CLOSE_WAIT --> LAST_ACK: Shutdown()
-    LAST_ACK --> CLOSED: Receive ACK
-    TIME_WAIT --> CLOSED: Timeout
-```
+## 🛠️ Supported Features
 
-### 3.4 Network Layer (`network/`)
-*   **IPv4**: Supports packet validation, checksum calculation, and dispatching to transport.
-    *   **Fragmentation**: Checks MTU and returns error/fragments packets (logic in place).
-    *   **Reassembly**: `IPv4Endpoint` maintains a list of fragments and reassembles them upon arrival of the final fragment.
-*   **IPv6**: Full header parsing/encoding and dispatching.
-    *   **NDP (Neighbor Discovery Protocol)**: Full support for Neighbor Solicitation (NS) and Neighbor Advertisement (NA) with hardware address learning.
-    *   **SLAAC (Stateless Address Autoconfiguration)**: Automatically configures global IPv6 addresses and default gateways from Router Advertisements (RA).
-    *   **DAD (Duplicate Address Detection)**: Automatically verifies address uniqueness on assignment.
-    *   **RS (Router Solicitation)**: Pro-actively requests router information on startup.
-*   **ICMP**: Handles Echo Request/Reply (Ping) for both v4 and v6.
+### Core Stack Features
+- **Zero-Copy Architecture**: Uses `VectorisedView` (scatter-gather) and `Prependable` headers to avoid data copies.
+- **High Concurrency**: Connection management is partitioned into **256 independent shards**, supporting 10M+ concurrent endpoints.
+- **Wait Queue Mechanism**: Robust event notification system (`waiter.zig`) for non-blocking asynchronous I/O.
+- **Single-Threaded Event Loop**: Native integration with `libev` and `libuv`.
+- **Wyhash Implementation**: High-performance hashing for O(1) connection lookups.
 
-## 4. Feature Support
+### TCP (Transmission Control Protocol)
+- **RFC-Compliant State Machine**: Support for all states (LISTEN, SYN-SENT, SYN-RCVD, ESTABLISHED, FIN-WAIT-1/2, TIME-WAIT, etc.).
+- **High-Performance Extensions (RFC 7323)**:
+  - **Window Scaling**: Support for large windows via shift counts.
+  - **Timestamps**: PAWS (Protect Against Wrapped Sequences) and RTT estimation.
+- **Selective Acknowledgments (RFC 2018)**: Full **SACK** support for efficient recovery from multiple packet losses.
+- **Reliability & Recovery**:
+  - **Retransmission Queue (RTQ)**: Precise tracking of unacknowledged segments.
+  - **Fast Retransmit**: Detects 3 duplicate ACKs for immediate recovery.
+  - **RTO Timer**: Adaptive retransmission timeouts.
+- **Performance Optimizations**:
+  - **Delayed ACKs (RFC 1122)**: Reduces control traffic by up to 50%.
+  - **Piggybacked ACKs**: Attaches ACKs to outgoing data segments automatically.
+  - **Syncache**: Efficiently manages half-open connections to mitigate SYN flood attacks.
+  - **MSS Negotiation**: Dynamic Maximum Segment Size discovery.
+- **Modular Congestion Control**:
+  - **NewReno**: Standard RFC 5681 implementation.
+  - **CUBIC**: Optimized for high-bandwidth/high-latency networks.
+  - **BBR**: Bottleneck Bandwidth and Round-trip propagation time model.
 
-| Feature Category | Feature | Status | Implementation Details |
-|------------------|---------|--------|------------------------|
-| **Core Architecture** | Zero-Copy I/O | ✅ | `VectorisedView` scatter-gather buffers |
-| | High Concurrency | ✅ | 256-shard transport table (10M+ conns) |
-| | Wait Queues | ✅ | Blocking/Notification mechanism in `waiter.zig` |
-| | Thread Safety | ✅ | Shard-level locking and atomic refcounting |
-| **Link Layer** | Ethernet II | ✅ | Framing, Parsing, Encoding in `header.zig` |
-| | Loopback | ✅ | Supported via `LinkEndpointCapabilities` |
-| | MTU / Jumbo Frames | ✅ | Configurable MTU (up to 9KB+), Fragmentation checks |
-| | ARP | ✅ | Resolution, Caching, Request/Reply logic |
-| **Network Layer** | IPv4 | ✅ | Addressing, Checksums, Validation |
-| | IPv4 Fragmentation | ✅ | Detection, Header parsing |
-| | IPv4 Reassembly | ✅ | Reassembly list in `IPv4Endpoint` |
-| | IPv6 | ✅ | Header parsing, Addressing, Dispatching |
-| | NDP / SLAAC | ✅ | NS/NA/RA support, EUI-64 generation |
-| | DAD / RS | ✅ | Duplicate Detection, Router Solicitation |
-| | ICMPv4 | ✅ | Echo Request/Reply (Ping) |
-| | ICMPv6 | ✅ | Echo Request/Reply (Ping6), NDP handlers |
-| **Transport Layer** | UDP | ✅ | Bind, Connect, Read, Write (Datagrams) |
-| | TCP State Machine | ✅ | Handshake (SYN/ACK), TEARDOWN (FIN), ESTABLISHED |
-| | TCP Syncache | ✅ | Resource-efficient half-open connection handling |
-| | TCP Reliability | ✅ | Retransmission Queue, RTO Timer, Fast Retransmit |
-| | TCP Timestamp | ✅ | RFC 1323 negotiation, PAWS, RTT support |
-| | TCP Delayed ACK | ✅ | Optimization: ACK every 2nd segment |
-| | TCP Flow Control | ⚠️ | Window management (Basic) |
-| | Congestion Control | ✅ | Pluggable: NewReno (default), CUBIC, BBR |
-| **API** | Socket Interface | ✅ | `bind`, `listen`, `accept`, `connect`, `read`, `write`, `shutdown` |
-| | Socket Options | ✅ | `setOption`/`getOption` (e.g., enable timestamps) |
-| | Dual Stack | ✅ | Seamless IPv4/IPv6 support on same stack instance |
+### UDP & Network Layers
+- **UDP (User Datagram Protocol)**: Efficient datagram handling with zero-copy read/write.
+- **IPv4 Suite**: Header validation, checksums, **Fragmentation**, and **Reassembly**.
+- **IPv6 Suite**:
+  - **NDP (Neighbor Discovery)**: Support for NS/NA/RA.
+  - **SLAAC**: Stateless address autoconfiguration.
+  - **DAD**: Duplicate Address Detection.
+  - **RS**: Router Solicitation.
+- **ARP**: Dynamic address resolution with link-address caching.
+- **ICMPv4/v6**: Echo Request/Reply (Ping) and error notifications.
 
-## 5. Key Features
+### Drivers & Hardware Integration
+- **AF_PACKET**: Optimized for **Jumbo Frames (MTU 9000)** with a 16KB circular ring buffer and mmap-based zero-copy TX.
+- **AF_XDP**: High-speed Express Data Path integration (Linux).
+- **TAP Adapter**: Standard virtual ethernet interface support.
 
-*   **Scalability**: Optimized for high-concurrency (10M+ connections) using a sharded transport table and low-contention locking.
-*   **Jumbo Frames**: Configurable MTU support (up to 9000+ bytes) in Link/Ethernet layers.
-*   **Zero-Copy capable**: Designed with vectorised I/O principles using `VectorisedView`.
-*   **Modern TCP**: Supports Syncache, Timestamps (RFC 1323), MSS negotiation, and Graceful Closure.
-*   **Full IPv6 Suite**: Implements NDP, SLAAC, DAD, and RS for modern networking requirements.
-*   **Pluggable Congestion Control**: Switch between NewReno, CUBIC, and BBR at runtime per endpoint.
-*   **Dual Stack**: Simultaneous IPv4 and IPv6 support on the same NICs.
+### Application Services & Telemetry
+- **Built-in DNS**: Fully integrated resolver supporting A record lookups.
+- **Real-time Telemetry**: Granular latency tracking across Driver, Link, Network, and Transport layers.
+- **Resource Monitoring**: Real-time tracking of buffer pool utilization (Cluster/View pools).
 
-*   **DNS Resolver**: Built-in, robust DNS client (`ustack.dns`) supporting A record lookup, timeouts, and ephemeral port binding.
+---
 
-## 6. Building and Usage
+## 🚀 Getting Started
 
-### 6.1 Prerequisites
-*   **Zig 0.13.0** or newer.
-*   **libev** and **libuv** (development headers) for examples.
+### Prerequisites
+- **Zig 0.13.0**
+- **libev** development headers (for examples)
 
-### 6.2 Build Library
-The project builds both static (`libustack.a`) and dynamic (`libustack.so` / `.dylib`) libraries.
-
+### Building
 ```bash
+# Build the library (static and shared)
 zig build
-# Artifacts will be in zig-out/lib/
-```
 
-### 6.3 Run Tests
-Execute the comprehensive test suite (including unit tests for TCP, IPv6, DNS, etc.):
-```bash
-zig test src/main.zig
-```
-
-### 6.4 Build and Run Examples
-The examples demonstrate how to integrate the `ustack` library with system interfaces (TAP, AF_PACKET) and event loops (libev, libuv). They link against the built `libustack` static library.
-
-```bash
-# Build all examples
+# Build benchmarking and integration examples
 zig build example
-
-# Run the TAP example (requires root/CAP_NET_ADMIN for TAP device creation)
-sudo ./zig-out/bin/example_tap_libev
 ```
 
-## 7. API Usage Guide
+### Running Benchmarks
+```bash
+# Start uperf server
+./zig-out/bin/example_uperf_libev veth0 server 10.0.0.2/24 -m 9000
 
-### 7.1 Initialization and DNS Resolution
-```zig
-const ustack = @import("ustack");
+# Start uperf client (Throughput, PPS, 1s reporting)
+./zig-out/bin/example_uperf_libev veth1 client 10.0.0.1/24 10.0.0.2 -m 9000 -t 10
 
-// 1. Initialize Stack
-var s = try ustack.init(allocator);
-
-// 2. Initialize Resolver
-const dns_server = ustack.tcpip.Address{ .v4 = .{ 8, 8, 8, 8 } };
-var resolver = ustack.dns.Resolver.init(&s, dns_server);
-
-// 3. Resolve Hostname
-const ip = try resolver.resolve("example.com");
+# Start ping-pong client (CPS, 1s reporting)
+./zig-out/bin/example_ping_pong veth1 10.0.0.1/24 -c 10.0.0.2 -C 10 -n 100000
 ```
 
-### 7.2 TCP Client
-```zig
-// 1. Create Endpoint
-var wq = ustack.waiter.Queue{};
-const tcp_proto = s.transport_protocols.get(6).?; // TCP = 6
-var ep = try tcp_proto.newEndpoint(&s, ustack.network.ipv4.ProtocolNumber, &wq);
-defer ep.close();
+---
 
-// 2. Configure Options
-try ep.setOption(.{ .ts_enabled = true }); // Enable RFC 1323 Timestamps
+## 📂 Directory Structure
 
-// 3. Connect
-const dest = ustack.tcpip.FullAddress{ .nic = 0, .addr = ip, .port = 80 };
-try ep.connect(dest);
+- `src/stack.zig`: Central stack entry point and NIC management.
+- `src/transport/`: TCP/UDP protocol implementations and congestion control.
+- `src/network/`: IPv4, IPv6, ARP, and ICMP handlers.
+- `src/drivers/`: OS-specific interface adapters (Linux AF_PACKET, TAP).
+- `src/buffer.zig`: Memory-efficient packet and vectorised view abstractions.
+- `src/stats.zig`: Global statistics and latency metrics collection.
 
-// 4. Send Data
-const request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-var payload = MyPayloader{ .data = request };
-_ = try ep.write(payload.payloader(), .{});
-```
+---
 
-### 7.3 TCP Server
-```zig
-// 1. Bind and Listen
-const bind_addr = ustack.tcpip.FullAddress{ .nic = 1, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 8080 };
-try ep.bind(bind_addr);
-try ep.listen(128); // Backlog size
-
-// 2. Accept Loop
-while (true) {
-    const new_conn = try ep.accept();
-    // Handle new_conn.ep in a new task/thread
-}
-```
-
-The `examples/` directory contains reference implementations for integrating `ustack` with real-world I/O mechanisms:
-
-### Adapters (Layer 2)
-*   **`tun_tap_adapter.zig`**: Linux TUN/TAP device bridge.
-*   **`af_packet_adapter.zig`**: Linux `AF_PACKET` raw socket bridge.
-*   **`af_xdp_adapter.zig`**: High-performance `AF_XDP` (Express Data Path) conceptual bridge.
-
-### Event Loop Main Examples
-*   **`main_tap_libev.zig`**: TAP interface driven by `libev`.
-*   **`main_af_packet_libuv.zig`**: `AF_PACKET` raw sockets driven by `libuv`.
-*   **`main_af_packet_libev.zig`**: `AF_PACKET` raw sockets driven by `libev`.
-*   **`main_af_xdp_libuv.zig`**: `AF_XDP` zero-copy interface driven by `libuv`.
-*   **`main_af_xdp_libev.zig`**: `AF_XDP` zero-copy interface driven by `libev`.
-
-These examples demonstrate how to map `poll`/`io` events to packet ingestion and `timer` events to stack maintenance.
+## ⚖️ License
+Distributed under the MIT License. See `LICENSE` for more information.
