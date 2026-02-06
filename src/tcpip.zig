@@ -93,6 +93,7 @@ pub const Error = error{
     OutOfMemory,
     DestinationRequired,
     NotSupported,
+    AddressInUse,
 };
 
 const buffer = @import("buffer.zig");

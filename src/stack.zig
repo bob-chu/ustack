@@ -569,10 +569,15 @@ pub const Stack = struct {
     pub fn deinit(self: *Stack) void {
         var shard_idx: usize = 0;
         while (shard_idx < 256) : (shard_idx += 1) {
-            var it = self.endpoints.shards[shard_idx].valueIterator();
+            var shard = &self.endpoints.shards[shard_idx];
+            var it = shard.valueIterator();
             while (it.next()) |ep| {
+                // decRef might destroy the endpoint, but we clear the map after
+                // so we don't care about map corruption here.
+                // However, we MUST NOT use fetchRemove inside the loop.
                 ep.decRef();
             }
+            shard.clearAndFree();
         }
         self.endpoints.deinit();
         self.cluster_pool.deinit();

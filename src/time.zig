@@ -197,17 +197,6 @@ pub const TimerWheel = struct {
     pub fn tickTo(self: *TimerWheel, target_tick: u64) TickResult {
         var total_result = TickResult{};
         while (self.current_tick < target_tick) {
-            const next_rel = self.nextExpiration() orelse {
-                self.current_tick = target_tick;
-                break;
-            };
-
-            const jump = @min(next_rel, target_tick - self.current_tick);
-            if (jump > 1) {
-                // Jump to just before the next interesting tick
-                self.current_tick += (jump - 1);
-            }
-
             const res = self.tick();
             total_result.expired_count += res.expired_count;
             total_result.cascaded_count += res.cascaded_count;
@@ -218,12 +207,12 @@ pub const TimerWheel = struct {
 
     pub fn nextExpiration(self: TimerWheel) ?u64 {
         const next_proc_tick = self.current_tick + 1;
-        
+
         var level: usize = 0;
         while (level < LEVELS) : (level += 1) {
             const level_shift: u6 = @intCast(level * BITS_PER_LEVEL);
             const current_slot: u8 = @intCast((next_proc_tick >> level_shift) & SLOT_MASK);
-            
+
             if (self.slot_masks[level].findNext(current_slot)) |next_slot| {
                 if (level == 0) {
                     const diff: u64 = if (next_slot >= current_slot)
@@ -236,13 +225,13 @@ pub const TimerWheel = struct {
                     const abs_slot_idx_at_level = next_proc_tick >> level_shift;
                     const rotation_base_slot = abs_slot_idx_at_level & ~@as(u64, SLOT_MASK);
                     var next_abs_slot = rotation_base_slot + next_slot;
-                    
+
                     var next_tick = next_abs_slot << level_shift;
                     if (next_tick < next_proc_tick) {
                         next_abs_slot += SLOTS_PER_LEVEL;
                         next_tick = next_abs_slot << level_shift;
                     }
-                    
+
                     return next_tick - self.current_tick;
                 }
             }
@@ -347,10 +336,10 @@ test "TimerWheel nextExpiration" {
 
     var t3 = Timer.init(cb, undefined);
     wheel.schedule(&t3, 1000); // Should be in Level 1
-    
+
     _ = wheel.tickTo(wheel.current_tick + 5);
     try std.testing.expectEqual(@as(?u64, 5), wheel.nextExpiration());
-    
+
     _ = wheel.tickTo(wheel.current_tick + 5);
     // At current_tick = 10. t3 is at 1000. next_proc_tick = 11.
     // L1: current_slot = (11 >> 8) = 0. next_slot = (1000 >> 8) = 3.

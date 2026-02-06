@@ -30,6 +30,7 @@ const Config = struct {
     mtu: u32 = 1500,
     max_conns: ?u32 = null,
     concurrency: u32 = 1,
+    duration: ?u64 = null,
 };
 
 const MuxContext = union(enum) {
@@ -46,7 +47,7 @@ pub fn main() !void {
     const config = try parseArgs(args);
 
     global_stack = try ustack.init(allocator);
-    global_stack.tcp_msl = 10; // Set MSL to 10ms for benchmark recycling
+    global_stack.tcp_msl = 100; // Set MSL to 100ms for benchmark recycling
     global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
 
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
@@ -102,7 +103,6 @@ pub fn main() !void {
 
     my_ev_run(loop);
 
-    // Print stats BEFORE deinit to ensure pointers are valid if needed (though stats are global)
     std.debug.print("\n=== BENCHMARK STATS ===\n", .{});
     stats.global_stats.dump();
     stats.dumpLinkStats(&stats.global_link_stats);
@@ -126,6 +126,7 @@ fn parseArgs(args: []const []const u8) !Config {
     var port: u16 = 5201;
     var max_conns: ?u32 = null;
     var concurrency: u32 = 1;
+    var duration: ?u64 = null;
 
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -148,6 +149,10 @@ fn parseArgs(args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingConcurrency;
             concurrency = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "-t")) {
+            i += 1;
+            if (i >= args.len) return error.MissingDuration;
+            duration = try std.fmt.parseInt(u64, args[i], 10);
         }
     }
 
@@ -162,6 +167,7 @@ fn parseArgs(args: []const []const u8) !Config {
         .interface = interface,
         .max_conns = max_conns,
         .concurrency = concurrency,
+        .duration = duration,
     };
 }
 
@@ -183,6 +189,9 @@ extern fn my_ev_break(loop: ?*anyopaque) void;
 var global_loop: ?*anyopaque = null;
 var global_mark_done: bool = false;
 var global_done_time: i64 = 0;
+var global_start_time: i64 = 0;
+var last_tick_time: i64 = 0;
+var global_client: ?*PingClient = null;
 
 fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
@@ -197,13 +206,10 @@ fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callco
     }
 }
 
-var last_tick_time: i64 = 0;
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
     _ = revents;
-
-    perform_cleanup();
 
     const now = std.time.milliTimestamp();
     if (last_tick_time == 0) last_tick_time = now;
@@ -211,6 +217,10 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     if (diff > 0) {
         _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(diff)));
         last_tick_time = now;
+        perform_cleanup();
+        if (global_client) |client| {
+            client.refill();
+        }
     }
 
     if (global_mark_done) {
@@ -277,9 +287,6 @@ const PingServer = struct {
 
     fn onEvent(self: *PingServer) void {
         while (true) {
-            if (self.config.max_conns) |max| {
-                if (self.conn_count >= max) return;
-            }
             const res = self.listener.accept() catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
                 return;
@@ -289,16 +296,13 @@ const PingServer = struct {
             }
             self.conn_count += 1;
             self.active_conns += 1;
-            // std.debug.print("Accepted {}\n", .{self.conn_count});
 
             const now = std.time.milliTimestamp();
             if (now - self.last_report_time >= 1000) {
                 const diff_conns = self.conn_count - self.last_conn_count;
                 const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
                 const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
-                if (self.conn_count > 0) {
-                    std.debug.print("CPS: {d:.0}\n", .{current_cps});
-                }
+                std.debug.print("CPS: {d:.0}\n", .{current_cps});
                 self.last_report_time = now;
                 self.last_conn_count = self.conn_count;
             }
@@ -306,19 +310,6 @@ const PingServer = struct {
             const conn = PingConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config, self, self.conn_count) catch {
                 res.ep.close();
                 self.active_conns -= 1;
-                if (self.config.max_conns) |max| {
-                    if (self.conn_count >= max and self.active_conns == 0) {
-                        self.end_time = std.time.milliTimestamp();
-                        const duration_ms = @as(f64, @floatFromInt(self.end_time - self.start_time));
-                        const duration_s = duration_ms / 1000.0;
-                        const cps = @as(f64, @floatFromInt(self.conn_count)) / duration_s;
-
-                        std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ self.conn_count, cps });
-
-                        global_mark_done = true;
-                        global_done_time = std.time.milliTimestamp();
-                    }
-                }
                 continue;
             };
             conn.onEvent();
@@ -347,13 +338,15 @@ const PingClient = struct {
             .config = config,
             .active_conns = 0,
         };
+        global_client = self;
         return self;
     }
 
     pub fn start(self: *PingClient) !void {
         self.start_time = std.time.milliTimestamp();
+        global_start_time = self.start_time;
         self.last_report_time = self.start_time;
-        const total = self.config.max_conns orelse 1;
+        const total = self.config.max_conns orelse 1000000;
         const concurrency = self.config.concurrency;
         var i: u32 = 0;
         while (i < concurrency and i < total) : (i += 1) {
@@ -384,37 +377,69 @@ const PingClient = struct {
         conn.onEvent();
     }
 
+    pub fn refill(self: *PingClient) void {
+        const now = std.time.milliTimestamp();
+        const total = self.config.max_conns orelse 1000000;
+
+        var reached_limit = false;
+        if (self.next_conn_id > total) reached_limit = true;
+        if (self.config.duration) |d| {
+            if (now - self.start_time >= d * 1000) {
+                // std.debug.print("Duration reached: {} >= {}\n", .{now - self.start_time, d * 1000});
+                reached_limit = true;
+            }
+        }
+
+        if (!reached_limit) {
+            while (self.active_conns < self.config.concurrency) {
+                self.startConnection() catch |err| {
+                    if (err == tcpip.Error.AddressInUse) return;
+                    std.debug.print("startConnection error: {}\n", .{err});
+                    return;
+                };
+
+                if (self.next_conn_id > total) break;
+            }
+        } else if (self.active_conns == 0 and !global_mark_done) {
+            self.end_time = now;
+            const duration_ms = @as(f64, @floatFromInt(self.end_time - self.start_time));
+            const duration_s = duration_ms / 1000.0;
+            const total_completed = self.next_conn_id - self.active_conns - 1;
+            const cps = @as(f64, @floatFromInt(total_completed)) / duration_s;
+
+            std.debug.print("Benchmark finished: {d} connections, CPS: {d:.0}\n", .{ total_completed, cps });
+
+            global_mark_done = true;
+            global_done_time = now;
+        }
+    }
+
     pub fn onConnectionFinished(self: *PingClient) void {
         self.active_conns -= 1;
-        const total = self.config.max_conns orelse 1;
-        const current_completed = self.next_conn_id - self.active_conns - 1;
-
         const now = std.time.milliTimestamp();
+
+        // Advance stack timers frequently
+        if (now - last_tick_time > 0) {
+            _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(now - last_tick_time)));
+            last_tick_time = now;
+            perform_cleanup();
+        }
+
+        // Report CPS every second
         if (now - self.last_report_time >= 1000) {
-            const diff_conns = current_completed - self.last_report_count;
+            const completed = self.next_conn_id - self.active_conns - 1;
+            const diff_conns = completed - self.last_report_count;
             const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
             const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
             const total_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
 
-            std.debug.print("[ID: C] {d: >5.2}-{d: >5.2} sec  CPS: {d:.0}\n", .{ total_sec - diff_time_s, total_sec, current_cps });
+            std.debug.print("[ID: C] {d: >5.2}-{d: >5.2} sec  CPS: {d:.0}  ActiveEP: {}\n", .{ total_sec - diff_time_s, total_sec, current_cps, stats.global_stats.tcp.active_endpoints });
 
             self.last_report_time = now;
-            self.last_report_count = current_completed;
+            self.last_report_count = completed;
         }
 
-        if (self.next_conn_id <= total) {
-            self.startConnection() catch {};
-        }
-
-        if (self.active_conns == 0 and self.next_conn_id > total) {
-            self.end_time = std.time.milliTimestamp();
-            const duration_ms = @as(f64, @floatFromInt(self.end_time - self.start_time));
-            const duration_s = duration_ms / 1000.0;
-            const cps = @as(f64, @floatFromInt(total)) / duration_s;
-
-            std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ total, cps });
-            if (global_loop) |l| my_ev_break(l);
-        }
+        self.refill();
     }
 };
 
@@ -530,7 +555,6 @@ const PingConnection = struct {
 
     fn close(self: *PingConnection) void {
         if (self.closed) return;
-        // std.debug.print("Conn {}: closing\n", .{self.connection_id});
         self.closed = true;
         self.pending_cleanup = true;
 
@@ -543,22 +567,28 @@ const PingConnection = struct {
         } else {
             const server = @as(*PingServer, @ptrCast(@alignCast(self.parent)));
             server.active_conns -= 1;
+
+            var done = false;
             if (server.config.max_conns) |max| {
-                if (server.conn_count >= max and server.active_conns == 0) {
-                    server.end_time = std.time.milliTimestamp();
-                    const duration_ms = @as(f64, @floatFromInt(server.end_time - server.start_time));
-                    const duration_s = duration_ms / 1000.0;
-                    const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
+                if (server.conn_count >= max and server.active_conns == 0) done = true;
+            }
+            if (server.config.duration) |d| {
+                if (std.time.milliTimestamp() - server.start_time >= d * 1000 and server.active_conns == 0) done = true;
+            }
 
-                    std.debug.print("Benchmark: {} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
+            if (done) {
+                server.end_time = std.time.milliTimestamp();
+                const duration_ms = @as(f64, @floatFromInt(server.end_time - server.start_time));
+                const duration_s = duration_ms / 1000.0;
+                const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
 
-                    global_mark_done = true;
-                    global_done_time = std.time.milliTimestamp();
-                }
+                std.debug.print("Benchmark finished: {d} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
+
+                global_mark_done = true;
+                global_done_time = std.time.milliTimestamp();
             }
         }
 
-        // Defer destruction
         self.next_cleanup = global_cleanup_list;
         global_cleanup_list = self;
     }
