@@ -84,6 +84,108 @@ test "TCP Fast Retransmit" {
     try std.testing.expect(ep_client.state == .established);
 }
 
+test "TCP Keepalive" {
+    const allocator = std.testing.allocator;
+    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const tcp_proto = TCPProtocol.init(allocator);
+    var s = try stack.Stack.init(allocator);
+    defer s.deinit();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+    try s.registerTransportProtocol(tcp_proto.protocol());
+
+    var fake_ep = struct {
+        tx_count: u32 = 0,
+        allocator: std.mem.Allocator,
+        fn writePacket(ptr: *anyopaque, _: ?*const stack.Route, _: tcpip.NetworkProtocolNumber, _: tcpip.PacketBuffer) tcpip.Error!void {
+            const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            self.tx_count += 1;
+            return;
+        }
+        fn attach(_: *anyopaque, _: *stack.NetworkDispatcher) void {}
+        fn linkAddress(_: *anyopaque) tcpip.LinkAddress {
+            return .{ .addr = [_]u8{0} ** 6 };
+        }
+        fn mtu(_: *anyopaque) u32 {
+            return 1500;
+        }
+        fn setMTU(_: *anyopaque, _: u32) void {}
+        fn capabilities(_: *anyopaque) stack.LinkEndpointCapabilities {
+            return stack.CapabilityNone;
+        }
+    }{ .allocator = allocator };
+    const link_ep = stack.LinkEndpoint{ .ptr = &fake_ep, .vtable = &.{ .writePacket = @TypeOf(fake_ep).writePacket, .writePackets = null, .attach = @TypeOf(fake_ep).attach, .linkAddress = @TypeOf(fake_ep).linkAddress, .mtu = @TypeOf(fake_ep).mtu, .setMTU = @TypeOf(fake_ep).setMTU, .capabilities = @TypeOf(fake_ep).capabilities } };
+    try s.createNIC(1, link_ep);
+    const nic = s.nics.get(1).?;
+
+    var wq = waiter.Queue{};
+    const ep_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq);
+    const ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_res.ptr)));
+    defer ep.close();
+
+    ep.state = .established;
+    ep.local_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 1234 };
+    ep.remote_addr = .{ .nic = 1, .addr = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 80 };
+
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = ep.local_addr.?.addr, .prefix_len = 24 } });
+    try s.addLinkAddress(ep.remote_addr.?.addr, .{ .addr = [_]u8{0} ** 6 });
+
+    try ep.endpoint().setOption(.{ .keepalive_enabled = true });
+    try ep.endpoint().setOption(.{ .tcp_keepidle = 1 });
+    try ep.endpoint().setOption(.{ .tcp_keepintvl = 1 });
+    try ep.endpoint().setOption(.{ .tcp_keepcnt = 3 });
+
+    try std.testing.expect(ep.keepalive_timer.active);
+    try std.testing.expectEqual(@as(u64, 1000), ep.keepalive_timer.delay_ms);
+
+    // Tick to expire idle timer
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 1000);
+    try std.testing.expect(fake_ep.tx_count == 1);
+    try std.testing.expect(ep.keepalive_probes_sent == 1);
+
+    // Should be rescheduled for intvl
+    try std.testing.expect(ep.keepalive_timer.active);
+    try std.testing.expectEqual(@as(u64, 1000), ep.keepalive_timer.delay_ms);
+
+    // Tick again
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 1000);
+    try std.testing.expect(fake_ep.tx_count == 2);
+    try std.testing.expect(ep.keepalive_probes_sent == 2);
+
+    // Tick again (3rd probe)
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 1000);
+    try std.testing.expect(fake_ep.tx_count == 3);
+    try std.testing.expect(ep.keepalive_probes_sent == 3);
+
+    // Tick again (should timeout and transition to error_state)
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 1000);
+    try std.testing.expect(ep.state == .error_state);
+
+    // Reset test
+    ep.state = .established;
+    ep.keepalive_probes_sent = 0;
+    try ep.endpoint().setOption(.{ .keepalive_enabled = true });
+    _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 500);
+
+    // Simulate packet arrival
+    const la = ep.local_addr.?;
+    const ra = ep.remote_addr.?;
+    const r = stack.Route{ .local_address = la.addr, .remote_address = ra.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = s.nics.get(1).? };
+    const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+
+    const hdr_buf = try s.allocator.alloc(u8, 20);
+    defer s.allocator.free(hdr_buf);
+    @memset(hdr_buf, 0);
+    var h = header.TCP.init(hdr_buf);
+    h.encode(ra.port, la.port, 0, 0, header.TCPFlagAck, 1024);
+
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = hdr_buf }};
+    const pb = tcpip.PacketBuffer{ .header = buffer.Prependable.init(hdr_buf), .data = buffer.VectorisedView.init(20, &views) };
+    ep.handlePacket(&r, id, pb);
+
+    // Timer should have been reset to 1000ms from now
+    try std.testing.expect(ep.keepalive_timer.expire_tick == s.timer_queue.current_tick + 1000);
+}
+
 test "TCP Retransmission" {
     const allocator = std.testing.allocator;
     var ipv4_proto = ipv4.IPv4Protocol.init();

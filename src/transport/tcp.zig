@@ -204,6 +204,13 @@ pub const TCPEndpoint = struct {
     retransmit_timer: time.Timer = undefined,
     time_wait_timer: time.Timer = undefined,
     delayed_ack_timer: time.Timer = undefined,
+    keepalive_timer: time.Timer = undefined,
+
+    keepalive_enabled: bool = false,
+    keepalive_idle: u32 = 7200,
+    keepalive_intvl: u32 = 75,
+    keepalive_cnt: u32 = 9,
+    keepalive_probes_sent: u32 = 0,
 
     sack_enabled: bool = false,
     hint_sack_enabled: bool = false,
@@ -346,6 +353,12 @@ pub const TCPEndpoint = struct {
         self.retransmit_timer = time.Timer.init(handleRetransmitTimer, self);
         self.time_wait_timer = time.Timer.init(handleTimeWaitTimer, self);
         self.delayed_ack_timer = time.Timer.init(handleDelayedAckTimer, self);
+        self.keepalive_timer = time.Timer.init(handleKeepaliveTimer, self);
+        self.keepalive_enabled = false;
+        self.keepalive_idle = 7200;
+        self.keepalive_intvl = 75;
+        self.keepalive_cnt = 9;
+        self.keepalive_probes_sent = 0;
         self.sack_enabled = false;
         self.hint_sack_enabled = false;
         self.backlog = 0;
@@ -577,6 +590,20 @@ pub const TCPEndpoint = struct {
                     .bbr => try congestion.BBR.init(self.stack.allocator, self.max_segment_size),
                 };
             },
+            .keepalive_enabled => |v| {
+                self.keepalive_enabled = v;
+                if (v) {
+                    self.resetKeepaliveTimer();
+                } else {
+                    self.stack.timer_queue.cancel(&self.keepalive_timer);
+                }
+            },
+            .tcp_keepidle => |v| {
+                self.keepalive_idle = v;
+                if (self.keepalive_enabled) self.resetKeepaliveTimer();
+            },
+            .tcp_keepintvl => |v| self.keepalive_intvl = v,
+            .tcp_keepcnt => |v| self.keepalive_cnt = v,
         }
     }
 
@@ -586,6 +613,10 @@ pub const TCPEndpoint = struct {
             .ts_enabled => .{ .ts_enabled = self.ts_enabled },
             .reuse_address => .{ .reuse_address = false },
             .congestion_control => .{ .congestion_control = .new_reno }, // Default for now, tracking active CC would be better
+            .keepalive_enabled => .{ .keepalive_enabled = self.keepalive_enabled },
+            .tcp_keepidle => .{ .tcp_keepidle = self.keepalive_idle },
+            .tcp_keepintvl => .{ .tcp_keepintvl = self.keepalive_intvl },
+            .tcp_keepcnt => .{ .tcp_keepcnt = self.keepalive_cnt },
         };
     }
 
@@ -593,6 +624,64 @@ pub const TCPEndpoint = struct {
         if (!self.app_closed or (mask & (waiter.EventHUp | waiter.EventErr) != 0)) {
             self.waiter_queue.notify(mask);
         }
+    }
+
+    fn handleKeepaliveTimer(ptr: *anyopaque) void {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        self.incRef();
+        defer self.decRef();
+
+        if (self.state != .established and self.state != .close_wait) return;
+        if (!self.keepalive_enabled) return;
+
+        if (self.keepalive_probes_sent >= self.keepalive_cnt) {
+            self.state = .error_state;
+            self.notify(waiter.EventErr | waiter.EventHUp);
+            return;
+        }
+
+        // Send keepalive probe: ACK with seq = snd_nxt - 1
+        self.sendKeepaliveProbe() catch {};
+        self.keepalive_probes_sent += 1;
+
+        // Schedule next probe
+        self.stack.timer_queue.schedule(&self.keepalive_timer, @as(u64, self.keepalive_intvl) * 1000);
+    }
+
+    fn sendKeepaliveProbe(self: *TCPEndpoint) !void {
+        const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
+        const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
+        const net_proto: u16 = if (ra.addr == .v4) 0x0800 else 0x86dd;
+
+        if (self.cached_route == null or self.cached_route.?.net_proto != net_proto) {
+            self.cached_route = try self.stack.findRoute(ra.nic, la.addr, ra.addr, net_proto);
+        }
+        const r = &self.cached_route.?;
+
+        const hdr_buf = self.proto.header_pool.acquire() catch return tcpip.Error.NoBufferSpace;
+        var pre = buffer.Prependable.init(hdr_buf);
+        const tcp_hdr = pre.prepend(header.TCPMinimumSize).?;
+        @memset(tcp_hdr, 0);
+        var h = header.TCP.init(tcp_hdr);
+
+        // Sequence number is one less than next to be sent
+        h.encode(la.port, ra.port, self.snd_nxt -% 1, self.rcv_nxt, header.TCPFlagAck, @as(u16, @intCast(@min(self.rcv_wnd >> @as(u5, @intCast(self.rcv_wnd_scale)), 65535))));
+
+        const pb = tcpip.PacketBuffer{
+            .header = pre,
+            .data = buffer.VectorisedView.init(0, &[_]buffer.ClusterView{}),
+        };
+
+        var mut_r = r.*;
+        try mut_r.writePacket(ProtocolNumber, pb);
+        stats.global_stats.tcp.tx_segments += 1;
+        stats.global_stats.tcp.tx_ack += 1;
+    }
+
+    fn resetKeepaliveTimer(self: *TCPEndpoint) void {
+        if (!self.keepalive_enabled) return;
+        self.keepalive_probes_sent = 0;
+        self.stack.timer_queue.schedule(&self.keepalive_timer, @as(u64, self.keepalive_idle) * 1000);
     }
 
     fn handleRetransmitTimer(ptr: *anyopaque) void {
@@ -908,6 +997,7 @@ pub const TCPEndpoint = struct {
         self.stack.timer_queue.cancel(&self.retransmit_timer);
         self.stack.timer_queue.cancel(&self.time_wait_timer);
         self.stack.timer_queue.cancel(&self.delayed_ack_timer);
+        self.stack.timer_queue.cancel(&self.keepalive_timer);
 
         while (self.snd_queue.popFirst()) |node| {
             node.data.data.deinit();
@@ -1722,6 +1812,7 @@ pub const TCPEndpoint = struct {
             else => {},
         }
         _ = now;
+        self.resetKeepaliveTimer();
     }
 
     pub fn insertOOO(self: *TCPEndpoint, seq: u32, pkt_data: buffer.VectorisedView) !void {

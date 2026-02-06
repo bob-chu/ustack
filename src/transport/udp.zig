@@ -318,6 +318,10 @@ pub const UDPEndpoint = struct {
             .ts_enabled => {},
             .reuse_address => {},
             .congestion_control => {},
+            .keepalive_enabled => {},
+            .tcp_keepidle => {},
+            .tcp_keepintvl => {},
+            .tcp_keepcnt => {},
         }
         return;
     }
@@ -328,6 +332,10 @@ pub const UDPEndpoint = struct {
             .ts_enabled => .{ .ts_enabled = false },
             .reuse_address => .{ .reuse_address = false },
             .congestion_control => .{ .congestion_control = .new_reno },
+            .keepalive_enabled => .{ .keepalive_enabled = false },
+            .tcp_keepidle => .{ .tcp_keepidle = 0 },
+            .tcp_keepintvl => .{ .tcp_keepintvl = 0 },
+            .tcp_keepcnt => .{ .tcp_keepcnt = 0 },
         };
     }
 
