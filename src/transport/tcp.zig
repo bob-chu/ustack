@@ -62,6 +62,10 @@ pub const TCPProtocol = struct {
         self.endpoint_pool.prewarm(1024) catch {};
         self.waiter_queue_pool.prewarm(1024) catch {};
 
+        for (self.endpoint_pool.free_list.items) |ep| {
+            @memset(std.mem.asBytes(ep), 0);
+        }
+
         return self;
     }
 
@@ -109,6 +113,7 @@ pub const TCPProtocol = struct {
         const self = @as(*TCPProtocol, @ptrCast(@alignCast(ptr)));
         _ = net_proto;
         const ep = self.endpoint_pool.acquire() catch return tcpip.Error.OutOfMemory;
+        @memset(std.mem.asBytes(ep), 0);
         try ep.initialize_v2(s, self, wait_queue, 1460);
         return ep.endpoint();
     }
@@ -1728,7 +1733,7 @@ pub const TCPEndpoint = struct {
                                     self.proto.segment_node_pool.release(node);
                                     it_node = next;
                                 } else {
-                                    it_node = node.next;
+                                    break;
                                 }
                             }
                             if (self.snd_queue.first == null) {

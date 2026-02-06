@@ -220,6 +220,11 @@ const UperfPayloader = struct {
     }
 };
 
+fn noopConsumption(ptr: *anyopaque, size: usize) void {
+    _ = ptr;
+    _ = size;
+}
+
 const Connection = struct {
     ep: ustack.tcpip.Endpoint,
     wq: *waiter.Queue,
@@ -280,6 +285,11 @@ const Connection = struct {
                 const sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
                 std.debug.print("- - - - - - - - - - - - - - - - - - - - - - - - -\n", .{});
                 std.debug.print("[ID: 1] 0.00-{d: >5.2} sec {d: >7.2} Mbits/sec (Total: {} bytes)\n", .{ sec, (@as(f64, @floatFromInt(self.bytes)) * 8.0) / sec / 1000000.0, self.bytes });
+                std.debug.print("Stats: Fallback={}, ClusterEx={}, ViewEx={}\n", .{
+                    ustack.stats.global_stats.pool.generic_fallback,
+                    ustack.stats.global_stats.pool.cluster_exhausted,
+                    ustack.stats.global_stats.pool.view_exhausted,
+                });
                 std.process.exit(0);
             }
         }
@@ -309,10 +319,17 @@ const Connection = struct {
             var p = UperfPayloader{ .len = @min(slen, 65536) };
             var budget: usize = 1000;
             while (budget > 0) : (budget -= 1) {
-                const n = self.ep.write(.{ .ptr = &p, .vtable = &.{ .fullPayload = UperfPayloader.fullPayload } }, .{}) catch |err| {
-                    if (err == tcpip.Error.WouldBlock) return;
-                    return;
-                };
+                const sl = @min(slen, 65536);
+                const n = if (self.config.protocol == .tcp)
+                    self.ep.writeZeroCopy(StaticBuffer.buf[0..sl], .{ .ptr = self, .run = noopConsumption }, .{}) catch |err| {
+                        if (err == tcpip.Error.WouldBlock) return;
+                        return;
+                    }
+                else
+                    self.ep.write(.{ .ptr = &p, .vtable = &.{ .fullPayload = UperfPayloader.fullPayload } }, .{}) catch |err| {
+                        if (err == tcpip.Error.WouldBlock) return;
+                        return;
+                    };
                 self.bytes += n;
                 self.bytes_since_last_report += n;
                 self.packets_since_last_report += 1;
