@@ -73,13 +73,13 @@ pub const TCPProtocol = struct {
         self.accept_node_pool.deinit();
 
         // Drain endpoint pool and really deinit them
-        while (self.endpoint_pool.free_list) |ep| {
-            self.endpoint_pool.free_list = ep.next;
+        for (self.endpoint_pool.free_list.items) |ep| {
             ep.deinit();
-            self.allocator.destroy(ep);
+            // endpoint_pool.deinit() will destroy the pointer
         }
 
         self.endpoint_pool.deinit();
+        self.waiter_queue_pool.deinit();
         self.allocator.destroy(self);
     }
 
@@ -569,6 +569,14 @@ pub const TCPEndpoint = struct {
         switch (opt) {
             .ts_enabled => |v| self.ts_enabled = v,
             .reuse_address => {}, // TODO: Implement reuse_address logic if needed
+            .congestion_control => |alg| {
+                self.cc.deinit();
+                self.cc = switch (alg) {
+                    .new_reno => try congestion.NewReno.init(self.stack.allocator, self.max_segment_size),
+                    .cubic => try congestion.Cubic.init(self.stack.allocator, self.max_segment_size),
+                    .bbr => try congestion.BBR.init(self.stack.allocator, self.max_segment_size),
+                };
+            },
         }
     }
 
@@ -577,6 +585,7 @@ pub const TCPEndpoint = struct {
         return switch (opt_type) {
             .ts_enabled => .{ .ts_enabled = self.ts_enabled },
             .reuse_address => .{ .reuse_address = false },
+            .congestion_control => .{ .congestion_control = .new_reno }, // Default for now, tracking active CC would be better
         };
     }
 
@@ -843,6 +852,10 @@ pub const TCPEndpoint = struct {
         self.ref_count += 1;
     }
     pub fn decRef(self: *TCPEndpoint) void {
+        if (self.ref_count == 0) {
+            log.warn("decRef on endpoint with 0 ref", .{});
+            return;
+        }
         self.ref_count -= 1;
         if (self.ref_count == 0) {
             self.destroy();
@@ -939,6 +952,7 @@ pub const TCPEndpoint = struct {
         // Always try to unregister if closing/error/closed.
         // For Active Close, we stay in the table until TIME_WAIT expires.
         if (self.state == .closed or self.state == .error_state) {
+            self.decStackRef();
             if (self.local_addr) |la| {
                 if (self.remote_addr) |ra| {
                     const id = stack.TransportEndpointID{
@@ -1098,6 +1112,11 @@ pub const TCPEndpoint = struct {
         if (self.state != .initial and self.state != .bound) return;
         self.remote_addr = addr;
         const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
+
+        // Unregister the bound placeholder if it exists
+        const bound_id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } } };
+        self.stack.unregisterTransportEndpoint(bound_id);
+
         self.state = .syn_sent;
         self.incStackRef();
         const initial_seq = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF)));
@@ -1150,7 +1169,21 @@ pub const TCPEndpoint = struct {
         if (self.state != .initial) return tcpip.Error.InvalidEndpointState;
         var final_addr = addr;
         if (final_addr.port == 0) final_addr.port = self.stack.getNextEphemeralPort();
+
+        // Check for existing endpoint with the same ID
         const id = stack.TransportEndpointID{ .local_port = final_addr.port, .local_address = final_addr.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } } };
+        const shard = self.stack.endpoints.getShard(id);
+        if (shard.get(id)) |existing_ep| {
+            defer existing_ep.decRef();
+            const existing_tcp = @as(*TCPEndpoint, @ptrCast(@alignCast(existing_ep.ptr)));
+            if (existing_tcp.state != .time_wait and existing_tcp.state != .closed) {
+                return tcpip.Error.AddressInUse;
+            }
+            // If in TIME_WAIT or CLOSED, we'll unregister it to reuse the port
+            _ = self.stack.endpoints.fetchRemove(id);
+            existing_ep.decRef(); // decRef for the fetchRemove
+        }
+
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
         self.local_addr = final_addr;
         self.state = .bound;

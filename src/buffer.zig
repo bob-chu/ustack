@@ -97,19 +97,20 @@ pub fn Pool(comptime T: type) type {
     return struct {
         const Self = @This();
         allocator: Allocator,
-        free_list: ?*T = null,
-        count: usize = 0,
+        free_list: std.ArrayList(*T),
         capacity: usize,
 
         pub fn init(allocator: Allocator, capacity: usize) Self {
             return .{
                 .allocator = allocator,
+                .free_list = std.ArrayList(*T).init(allocator),
                 .capacity = capacity,
             };
         }
 
         pub fn prewarm(self: *Self, count: usize) !void {
             const to_warm = @min(count, self.capacity);
+            try self.free_list.ensureTotalCapacity(to_warm);
             for (0..to_warm) |_| {
                 const node = try self.allocator.create(T);
                 self.release(node);
@@ -117,45 +118,37 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            var it = self.free_list;
-            while (it) |node| {
-                const next = node.next;
+            for (self.free_list.items) |node| {
                 self.allocator.destroy(node);
-                it = next;
             }
-            self.free_list = null;
+            self.free_list.deinit();
         }
 
         pub fn acquire(self: *Self) !*T {
-            if (self.free_list) |node| {
-                self.free_list = node.next;
-                self.count -= 1;
-                @memset(std.mem.asBytes(node), 0);
+            if (self.free_list.popOrNull()) |node| {
                 return node;
             }
             stats.global_stats.pool.generic_fallback += 1;
-            const node = try self.allocator.create(T);
-            @memset(std.mem.asBytes(node), 0);
-            return node;
+            return try self.allocator.create(T);
         }
 
         pub fn release(self: *Self, node: *T) void {
-            if (self.count >= self.capacity) {
+            if (self.free_list.items.len >= self.capacity) {
                 self.allocator.destroy(node);
                 return;
             }
-            node.next = self.free_list;
-            self.free_list = node;
-            self.count += 1;
+            self.free_list.append(node) catch {
+                self.allocator.destroy(node);
+            };
         }
 
         pub fn tryRelease(self: *Self, node: *T) bool {
-            if (self.count >= self.capacity) {
+            if (self.free_list.items.len >= self.capacity) {
                 return false;
             }
-            node.next = self.free_list;
-            self.free_list = node;
-            self.count += 1;
+            self.free_list.append(node) catch {
+                return false;
+            };
             return true;
         }
     };

@@ -21,6 +21,19 @@ const MuxContext = union(enum) {
     connection: *Connection,
 };
 
+const Config = struct {
+    mode: []const u8 = "server",
+    protocol: enum { tcp, udp } = .tcp,
+    port: u16 = 5201,
+    target_ip: ?[4]u8 = null,
+    local_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    interface: []const u8 = "",
+    mtu: u32 = 1500,
+    packet_size: usize = 0,
+    duration: u64 = 5,
+    cc_alg: tcpip.CongestionControlAlgorithm = .new_reno,
+};
+
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
     const args = try std.process.argsAlloc(allocator);
@@ -41,42 +54,52 @@ pub fn main() !void {
     const mode = args[2];
     const ip_cidr = args[3];
 
-    var mtu: u32 = 1500;
-    var packet_size: usize = 0;
-    var duration: u64 = 5;
-    var protocol: enum { tcp, udp } = .tcp;
+    var config = Config{
+        .interface = ifname,
+        .mode = mode,
+    };
+    var parts = std.mem.split(u8, ip_cidr, "/");
+    config.local_ip = try parseIp(parts.first());
+    const prefix_len = try std.fmt.parseInt(u8, parts.next() orelse "24", 10);
 
     var idx: usize = 4;
     if (std.mem.eql(u8, mode, "client")) idx = 5;
     while (idx < args.len) : (idx += 1) {
         if (std.mem.eql(u8, args[idx], "-m")) {
             idx += 1;
-            mtu = try std.fmt.parseInt(u32, args[idx], 10);
+            config.mtu = try std.fmt.parseInt(u32, args[idx], 10);
         } else if (std.mem.eql(u8, args[idx], "-l")) {
             idx += 1;
-            packet_size = try std.fmt.parseInt(usize, args[idx], 10);
+            config.packet_size = try std.fmt.parseInt(usize, args[idx], 10);
         } else if (std.mem.eql(u8, args[idx], "-t")) {
             idx += 1;
-            duration = try std.fmt.parseInt(u64, args[idx], 10);
-        } else if (std.mem.eql(u8, args[idx], "-u")) protocol = .udp;
+            config.duration = try std.fmt.parseInt(u64, args[idx], 10);
+        } else if (std.mem.eql(u8, args[idx], "-u")) {
+            config.protocol = .udp;
+        } else if (std.mem.eql(u8, args[idx], "-C")) {
+            idx += 1;
+            if (std.mem.eql(u8, args[idx], "cubic")) {
+                config.cc_alg = .cubic;
+            } else if (std.mem.eql(u8, args[idx], "bbr")) {
+                config.cc_alg = .bbr;
+            } else if (std.mem.eql(u8, args[idx], "newreno")) {
+                config.cc_alg = .new_reno;
+            }
+        }
     }
 
     global_stack = try ustack.init(allocator);
-    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, ifname);
+    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
-    global_eth.linkEndpoint().setMTU(mtu);
+    global_eth.linkEndpoint().setMTU(config.mtu);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
-
-    var parts = std.mem.split(u8, ip_cidr, "/");
-    const addr_v4 = try parseIp(parts.first());
-    const prefix_len = try std.fmt.parseInt(u8, parts.next() orelse "24", 10);
 
     const nic = global_stack.nics.get(1).?;
     try nic.addAddress(.{ .protocol = 0x0806, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
-    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = addr_v4 }, .prefix_len = prefix_len } });
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = config.local_ip }, .prefix_len = prefix_len } });
 
-    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = addr_v4 }, .prefix = prefix_len }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = mtu });
-    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = mtu });
+    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = config.local_ip }, .prefix = prefix_len }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = config.mtu });
+    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = config.mtu });
 
     const mux = try EventMultiplexer.init(allocator);
     global_mux = mux;
@@ -95,10 +118,10 @@ pub fn main() !void {
     my_ev_io_start(loop, &mux_io);
 
     if (std.mem.eql(u8, mode, "server")) {
-        _ = try PerfServer.init(&global_stack, allocator, mux, protocol == .udp);
+        _ = try PerfServer.init(&global_stack, allocator, mux, config);
     } else {
         const target_ip = try parseIp(args[4]);
-        _ = try Connection.initClient(&global_stack, allocator, mux, target_ip, addr_v4, protocol == .udp, mtu, packet_size, duration);
+        _ = try Connection.initClient(&global_stack, allocator, mux, target_ip, config.local_ip, config);
     }
     my_ev_run(loop);
 }
@@ -149,22 +172,27 @@ const PerfServer = struct {
     mux: *EventMultiplexer,
     wait_entry: waiter.Entry,
     mux_ctx: MuxContext,
-    is_udp: bool,
+    config: Config,
 
-    pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, is_udp: bool) !*PerfServer {
+    pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*PerfServer {
         const self = try allocator.create(PerfServer);
         const wq = try allocator.create(waiter.Queue);
         wq.* = .{};
+        const is_udp = config.protocol == .udp;
         const ep = try s.transport_protocols.get(if (is_udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 5201 });
-        if (!is_udp) try ep.listen(128);
+        if (!is_udp) {
+            try ep.listen(128);
+        } else {
+            try ep.setOption(.{ .congestion_control = config.cc_alg });
+        }
 
-        self.* = .{ .listener = ep, .allocator = allocator, .mux = mux, .mux_ctx = .{ .server = self }, .wait_entry = undefined, .is_udp = is_udp };
+        self.* = .{ .listener = ep, .allocator = allocator, .mux = mux, .mux_ctx = .{ .server = self }, .wait_entry = undefined, .config = config };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn);
 
         if (is_udp) {
-            _ = try Connection.init(allocator, ep, wq, mux, false, 0, 0, 0);
+            _ = try Connection.init(allocator, ep, wq, mux, config, false);
         }
         return self;
     }
@@ -172,8 +200,23 @@ const PerfServer = struct {
     fn onAccept(self: *PerfServer) void {
         while (true) {
             const res = self.listener.accept() catch break;
-            _ = Connection.init(self.allocator, res.ep, res.wq, self.mux, false, 0, 0, 0) catch continue;
+            if (self.config.protocol == .tcp) {
+                res.ep.setOption(.{ .congestion_control = self.config.cc_alg }) catch {};
+            }
+            _ = Connection.init(self.allocator, res.ep, res.wq, self.mux, self.config, false) catch continue;
         }
+    }
+};
+
+const StaticBuffer = struct {
+    var buf = [_]u8{'A'} ** 65536;
+};
+
+const UperfPayloader = struct {
+    len: usize,
+    fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
+        const self = @as(*const UperfPayloader, @ptrCast(@alignCast(ptr)));
+        return StaticBuffer.buf[0..self.len];
     }
 };
 
@@ -182,36 +225,38 @@ const Connection = struct {
     wq: *waiter.Queue,
     allocator: std.mem.Allocator,
     mux: *EventMultiplexer,
+    config: Config,
     wait_entry: waiter.Entry,
     mux_ctx: MuxContext,
     is_client: bool,
+    closed: bool = false,
     start_time: i64 = 0,
     last_report_time: i64 = 0,
     bytes: u64 = 0,
     bytes_since_last_report: u64 = 0,
     packets_since_last_report: u64 = 0,
-    duration: u64 = 0,
-    packet_size: usize = 0,
-    mtu: u32 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, ep: ustack.tcpip.Endpoint, wq: *waiter.Queue, mux: *EventMultiplexer, is_client: bool, mtu: u32, pkt_size: usize, duration: u64) !*Connection {
+    pub fn init(allocator: std.mem.Allocator, ep: ustack.tcpip.Endpoint, wq: *waiter.Queue, mux: *EventMultiplexer, config: Config, is_client: bool) !*Connection {
         const self = try allocator.create(Connection);
-        self.* = .{ .ep = ep, .wq = wq, .allocator = allocator, .mux = mux, .mux_ctx = .{ .connection = self }, .wait_entry = undefined, .is_client = is_client, .start_time = std.time.milliTimestamp(), .last_report_time = std.time.milliTimestamp(), .mtu = mtu, .packet_size = pkt_size, .duration = duration };
+        self.* = .{ .ep = ep, .wq = wq, .allocator = allocator, .mux = mux, .config = config, .mux_ctx = .{ .connection = self }, .wait_entry = undefined, .is_client = is_client, .start_time = std.time.milliTimestamp(), .last_report_time = std.time.milliTimestamp() };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn | (if (is_client) waiter.EventOut else 0) | waiter.EventHUp | waiter.EventErr);
         return self;
     }
 
-    pub fn initClient(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, target: [4]u8, local: [4]u8, is_udp: bool, mtu: u32, pkt_size: usize, duration: u64) !*Connection {
+    pub fn initClient(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, target: [4]u8, local: [4]u8, config: Config) !*Connection {
         const wq = try allocator.create(waiter.Queue);
         wq.* = .{};
-        const ep = try s.transport_protocols.get(if (is_udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
-        const self = try Connection.init(allocator, ep, wq, mux, true, mtu, pkt_size, duration);
+        const ep = try s.transport_protocols.get(if (config.protocol == .udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
+        if (config.protocol == .tcp) {
+            try ep.setOption(.{ .congestion_control = config.cc_alg });
+        }
+        const self = try Connection.init(allocator, ep, wq, mux, config, true);
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = local }, .port = 0 });
         _ = ep.connect(.{ .nic = 1, .addr = .{ .v4 = target }, .port = 5201 }) catch |err| {
             if (err != tcpip.Error.WouldBlock) return err;
         };
-        if (is_udp) self.onEvent();
+        if (config.protocol == .udp) self.onEvent();
         return self;
     }
 
@@ -231,7 +276,7 @@ const Connection = struct {
                 self.last_report_time = now;
             }
 
-            if (now - self.start_time > self.duration * 1000) {
+            if (now - self.start_time > self.config.duration * 1000) {
                 const sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
                 std.debug.print("- - - - - - - - - - - - - - - - - - - - - - - - -\n", .{});
                 std.debug.print("[ID: 1] 0.00-{d: >5.2} sec {d: >7.2} Mbits/sec (Total: {} bytes)\n", .{ sec, (@as(f64, @floatFromInt(self.bytes)) * 8.0) / sec / 1000000.0, self.bytes });
@@ -240,41 +285,31 @@ const Connection = struct {
         }
 
         if (!self.is_client) {
-            if (now - self.last_report_time >= 1000) {
-                const elapsed_ms = now - self.last_report_time;
-                const total_elapsed_ms = now - self.start_time;
-                const sec = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
-                const total_sec = @as(f64, @floatFromInt(total_elapsed_ms)) / 1000.0;
-                const mbps = (@as(f64, @floatFromInt(self.bytes_since_last_report)) * 8.0) / sec / 1000000.0;
-                const pps = @as(f64, @floatFromInt(self.packets_since_last_report)) / sec;
-                std.debug.print("[ID: S] {d: >5.2}-{d: >5.2} sec {d: >7.2} Mbits/sec  {d: >9.2} pps\n", .{ total_sec - sec, total_sec, mbps, pps });
-                self.bytes_since_last_report = 0;
-                self.packets_since_last_report = 0;
-                self.last_report_time = now;
-            }
             while (true) {
                 var buf = self.ep.read(null) catch break;
                 defer buf.deinit();
-                if (buf.size == 0) return;
-                self.bytes += buf.size;
+                if (buf.size == 0) {
+                    self.close();
+                    break;
+                }
                 self.bytes_since_last_report += buf.size;
-                self.packets_since_last_report += 1;
+                self.bytes += buf.size;
             }
         } else {
-            const slen = if (self.packet_size > 0) self.packet_size else 1400;
-            const static_buf = struct {
-                var buf = [_]u8{'A'} ** 65536;
-            };
-            const Payloader = struct {
-                len: usize,
-                fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
-                    return static_buf.buf[0..@as(*@This(), @ptrCast(@alignCast(ptr))).len];
+            var slen: usize = 0;
+            if (self.config.packet_size > 0) {
+                slen = self.config.packet_size;
+            } else {
+                if (self.config.protocol == .udp) {
+                    slen = @as(usize, @intCast(self.config.mtu - 28)); // IP(20) + UDP(8)
+                } else {
+                    slen = 65536; // Default to 64KB for TCP to enable batching
                 }
-            };
-            var p = Payloader{ .len = @min(slen, 65536) };
+            }
+            var p = UperfPayloader{ .len = @min(slen, 65536) };
             var budget: usize = 1000;
             while (budget > 0) : (budget -= 1) {
-                const n = self.ep.write(.{ .ptr = &p, .vtable = &.{ .fullPayload = Payloader.fullPayload } }, .{}) catch |err| {
+                const n = self.ep.write(.{ .ptr = &p, .vtable = &.{ .fullPayload = UperfPayloader.fullPayload } }, .{}) catch |err| {
                     if (err == tcpip.Error.WouldBlock) return;
                     return;
                 };
@@ -284,6 +319,13 @@ const Connection = struct {
             }
             EventMultiplexer.upcall(&self.wait_entry);
         }
+    }
+
+    fn close(self: *Connection) void {
+        if (self.closed) return;
+        self.closed = true;
+        self.wq.eventUnregister(&self.wait_entry);
+        self.ep.close();
     }
 };
 

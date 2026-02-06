@@ -7,21 +7,21 @@ pub const BBR = struct {
     mss: u32,
     allocator: std.mem.Allocator,
 
-    // Simplified BBR state
-    min_rtt: u32,
-    bottleneck_bw: u64,
-    pacing_rate: u64,
+    // Simplified BBR-like state
+    min_rtt: u64 = 0,
+    max_bw: u64 = 0,
+    last_ack_time: i64 = 0,
+
+    // Gain values
+    const CWND_GAIN: f64 = 2.0;
 
     pub fn init(allocator: std.mem.Allocator, mss: u32) !CongestionControl {
         const self = try allocator.create(BBR);
         self.* = .{
-            .cwnd = mss,
-            .ssthresh = 65535,
+            .cwnd = 32 * mss,
+            .ssthresh = 1024 * 1024 * 4,
             .mss = mss,
             .allocator = allocator,
-            .min_rtt = 0,
-            .bottleneck_bw = 0,
-            .pacing_rate = 0,
         };
         return .{
             .ptr = self,
@@ -37,38 +37,55 @@ pub const BBR = struct {
         .getSsthresh = getSsthresh,
         .reset = reset,
         .deinit = deinit,
+        .setMss = setMss,
     };
 
     fn reset(ptr: *anyopaque, mss: u32) void {
         const self = @as(*BBR, @ptrCast(@alignCast(ptr)));
         self.* = .{
-            .cwnd = mss,
-            .ssthresh = 65535,
+            .cwnd = 32 * mss,
+            .ssthresh = 1024 * 1024 * 4,
             .mss = mss,
             .allocator = self.allocator,
-            .min_rtt = 0,
-            .bottleneck_bw = 0,
-            .pacing_rate = 0,
         };
+    }
+
+    fn setMss(ptr: *anyopaque, mss: u32) void {
+        const self = @as(*BBR, @ptrCast(@alignCast(ptr)));
+        const ratio = @as(f64, @floatFromInt(self.cwnd)) / @as(f64, @floatFromInt(self.mss));
+        self.mss = mss;
+        self.cwnd = @as(u32, @intFromFloat(ratio * @as(f64, @floatFromInt(mss))));
     }
 
     fn onAck(ptr: *anyopaque, bytes_acked: u32) void {
         const self = @as(*BBR, @ptrCast(@alignCast(ptr)));
-        _ = bytes_acked;
-        // Simplified BBR logic: grow window if bandwidth allows
-        self.cwnd += self.mss;
+        const now = std.time.milliTimestamp();
+
+        // Standard slow start growth
+        if (self.cwnd < self.ssthresh) {
+            self.cwnd += bytes_acked;
+        } else {
+            // Very simplified congestion avoidance for this "BBR" skeleton
+            const incr = (@as(u64, self.mss) * bytes_acked) / self.cwnd;
+            self.cwnd += @as(u32, @intCast(@max(1, incr)));
+        }
+
+        self.last_ack_time = now;
+
+        // Cap cwnd
+        if (self.cwnd > 64 * 1024 * 1024) self.cwnd = 64 * 1024 * 1024;
     }
 
     fn onLoss(ptr: *anyopaque) void {
         const self = @as(*BBR, @ptrCast(@alignCast(ptr)));
-        // BBR reduces window based on estimated bandwidth, not just loss
-        self.cwnd = @max(self.cwnd / 2, 4 * self.mss);
+        self.ssthresh = @max(self.cwnd / 2, 2 * self.mss);
+        self.cwnd = self.mss;
     }
 
     fn onRetransmit(ptr: *anyopaque) void {
         const self = @as(*BBR, @ptrCast(@alignCast(ptr)));
-        // Fast recovery
-        self.cwnd = self.cwnd / 2;
+        self.ssthresh = @max(self.cwnd / 2, 2 * self.mss);
+        self.cwnd = self.ssthresh;
     }
 
     fn getCwnd(ptr: *anyopaque) u32 {

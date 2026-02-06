@@ -93,6 +93,7 @@ pub const Error = error{
     OutOfMemory,
     DestinationRequired,
     NotSupported,
+    AddressInUse,
 };
 
 const buffer = @import("buffer.zig");
@@ -210,11 +211,19 @@ pub const Endpoint = struct {
 pub const EndpointOptionType = enum {
     ts_enabled,
     reuse_address,
+    congestion_control,
 };
 
 pub const EndpointOption = union(EndpointOptionType) {
     ts_enabled: bool,
     reuse_address: bool,
+    congestion_control: CongestionControlAlgorithm,
+};
+
+pub const CongestionControlAlgorithm = enum {
+    new_reno,
+    cubic,
+    bbr,
 };
 
 pub const AddressWithPrefix = struct {
