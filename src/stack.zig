@@ -829,6 +829,8 @@ pub const Stack = struct {
                     ep.decRef();
                 } else {
                     if (protocol == 17) {
+                        stats.global_stats.udp.no_port += 1;
+                        stats.global_stats.udp.dropped_packets += 1;
                         log.warn("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
                         log.debug("Exact: local={any}:{} remote={any}:{}", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
                         log.debug("Any: local={any}:{} remote={any}:{}", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });

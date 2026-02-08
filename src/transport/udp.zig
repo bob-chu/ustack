@@ -234,6 +234,7 @@ pub const UDPEndpoint = struct {
             .header = pre,
         };
 
+        stats.global_stats.udp.tx_packets += 1;
         return r.writePacket(ProtocolNumber, pb);
     }
 
@@ -249,14 +250,20 @@ pub const UDPEndpoint = struct {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         var mut_pkt = pkt;
 
+        stats.global_stats.udp.rx_packets += 1;
+
         const h = header.UDP.init(mut_pkt.data.first() orelse return);
         mut_pkt.data.trimFront(header.UDPMinimumSize);
 
         // We MUST clone the data because the underlying views (from onReadable)
         // are stack-allocated or temporary and will be invalid after this function returns.
-        const cloned_data = mut_pkt.data.cloneInPool(&self.proto.view_pool) catch return;
+        const cloned_data = mut_pkt.data.cloneInPool(&self.proto.view_pool) catch {
+            stats.global_stats.udp.dropped_packets += 1;
+            return;
+        };
 
         const node = self.proto.packet_node_pool.acquire() catch {
+            stats.global_stats.udp.dropped_packets += 1;
             var tmp = cloned_data;
             tmp.deinit();
             return;

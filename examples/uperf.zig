@@ -15,6 +15,8 @@ var global_stack: stack.Stack = undefined;
 var global_af_packet: AfPacket = undefined;
 var global_eth: ustack.link.eth.EthernetEndpoint = undefined;
 var global_mux: ?*EventMultiplexer = null;
+var global_connections: std.ArrayList(*Connection) = undefined;
+var global_config: Config = .{};
 
 const MuxContext = union(enum) {
     server: *PerfServer,
@@ -54,12 +56,11 @@ pub fn main() !void {
     const mode = args[2];
     const ip_cidr = args[3];
 
-    var config = Config{
-        .interface = ifname,
-        .mode = mode,
-    };
+    global_config.interface = ifname;
+    global_config.mode = mode;
+
     var parts = std.mem.split(u8, ip_cidr, "/");
-    config.local_ip = try parseIp(parts.first());
+    global_config.local_ip = try parseIp(parts.first());
     const prefix_len = try std.fmt.parseInt(u8, parts.next() orelse "24", 10);
 
     var idx: usize = 4;
@@ -67,42 +68,44 @@ pub fn main() !void {
     while (idx < args.len) : (idx += 1) {
         if (std.mem.eql(u8, args[idx], "-m")) {
             idx += 1;
-            config.mtu = try std.fmt.parseInt(u32, args[idx], 10);
+            global_config.mtu = try std.fmt.parseInt(u32, args[idx], 10);
         } else if (std.mem.eql(u8, args[idx], "-l")) {
             idx += 1;
-            config.packet_size = try std.fmt.parseInt(usize, args[idx], 10);
+            global_config.packet_size = try std.fmt.parseInt(usize, args[idx], 10);
         } else if (std.mem.eql(u8, args[idx], "-t")) {
             idx += 1;
-            config.duration = try std.fmt.parseInt(u64, args[idx], 10);
+            global_config.duration = try std.fmt.parseInt(u64, args[idx], 10);
         } else if (std.mem.eql(u8, args[idx], "-u")) {
-            config.protocol = .udp;
+            global_config.protocol = .udp;
         } else if (std.mem.eql(u8, args[idx], "-C")) {
             idx += 1;
             if (std.mem.eql(u8, args[idx], "cubic")) {
-                config.cc_alg = .cubic;
+                global_config.cc_alg = .cubic;
             } else if (std.mem.eql(u8, args[idx], "bbr")) {
-                config.cc_alg = .bbr;
+                global_config.cc_alg = .bbr;
             } else if (std.mem.eql(u8, args[idx], "newreno")) {
-                config.cc_alg = .new_reno;
+                global_config.cc_alg = .new_reno;
             }
         }
     }
 
     global_stack = try ustack.init(allocator);
-    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
+    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, global_config.interface);
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
-    global_eth.linkEndpoint().setMTU(config.mtu);
+    global_eth.linkEndpoint().setMTU(global_config.mtu);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
 
     const nic = global_stack.nics.get(1).?;
     try nic.addAddress(.{ .protocol = 0x0806, .address_with_prefix = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix_len = 0 } });
-    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = config.local_ip }, .prefix_len = prefix_len } });
+    try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = global_config.local_ip }, .prefix_len = prefix_len } });
 
-    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = config.local_ip }, .prefix = prefix_len }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = config.mtu });
-    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = config.mtu });
+    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = global_config.local_ip }, .prefix = prefix_len }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = global_config.mtu });
+    try global_stack.addRoute(.{ .destination = .{ .address = .{ .v4 = .{ 0, 0, 0, 0 } }, .prefix = 0 }, .gateway = .{ .v4 = .{ 0, 0, 0, 0 } }, .nic = 1, .mtu = global_config.mtu });
 
     const mux = try EventMultiplexer.init(allocator);
     global_mux = mux;
+    global_connections = std.ArrayList(*Connection).init(allocator);
+
     const loop = my_ev_default_loop();
 
     var io_watcher = std.mem.zeroInit(c.ev_io, .{});
@@ -113,15 +116,19 @@ pub fn main() !void {
     my_ev_timer_init(&timer_watcher, libev_timer_cb, 0.001, 0.001);
     my_ev_timer_start(loop, &timer_watcher);
 
+    var stats_watcher = std.mem.zeroInit(c.ev_timer, .{});
+    my_ev_timer_init(&stats_watcher, libev_stats_cb, 1.0, 1.0);
+    my_ev_timer_start(loop, &stats_watcher);
+
     var mux_io = std.mem.zeroInit(c.ev_io, .{});
     my_ev_io_init(&mux_io, libev_mux_cb, mux.fd(), 0x01);
     my_ev_io_start(loop, &mux_io);
 
     if (std.mem.eql(u8, mode, "server")) {
-        _ = try PerfServer.init(&global_stack, allocator, mux, config);
+        _ = try PerfServer.init(&global_stack, allocator, mux);
     } else {
         const target_ip = try parseIp(args[4]);
-        _ = try Connection.initClient(&global_stack, allocator, mux, target_ip, config.local_ip, config);
+        _ = try Connection.initClient(&global_stack, allocator, mux, target_ip, global_config.local_ip);
     }
     my_ev_run(loop);
 }
@@ -149,6 +156,56 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     global_stack.flush();
 }
 
+fn libev_stats_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
+    _ = watcher;
+    _ = revents;
+    const now = std.time.milliTimestamp();
+
+    var total_rx_bytes: u64 = 0;
+    var total_rx_pkts: u64 = 0;
+    var total_tx_bytes: u64 = 0;
+    var total_tx_pkts: u64 = 0;
+
+    for (global_connections.items) |conn| {
+        if (conn.is_client) {
+            total_tx_bytes += conn.bytes_since_last_report;
+            total_tx_pkts += conn.packets_since_last_report;
+        } else {
+            total_rx_bytes += conn.bytes_since_last_report;
+            total_rx_pkts += conn.packets_since_last_report;
+        }
+        conn.bytes_since_last_report = 0;
+        conn.packets_since_last_report = 0;
+        const elapsed = now - conn.start_time;
+        if (elapsed > global_config.duration * 1000) {
+            const sec = @as(f64, @floatFromInt(elapsed)) / 1000.0;
+            const role = if (conn.is_client) "TX" else "RX";
+            std.debug.print("- - - - - - - - - - - - - - - - - - - - - - - - -\n", .{});
+            std.debug.print("[{s}] 0.00-{d: >5.2} sec {d: >7.2} Mbits/sec (Total: {} bytes)\n", .{ role, sec, (@as(f64, @floatFromInt(conn.bytes)) * 8.0) / sec / 1000000.0, conn.bytes });
+
+            ustack.stats.global_stats.dump();
+            ustack.stats.dumpLinkStats(&ustack.stats.global_link_stats);
+
+            // Stop the libev loop cleanly
+            my_ev_break(loop, 2); // EVBREAK_ALL = 2
+            return;
+        }
+    }
+
+    if (total_rx_bytes > 0 or total_rx_pkts > 0) {
+        const mbps = (@as(f64, @floatFromInt(total_rx_bytes)) * 8.0) / 1000000.0;
+        const pps = @as(f64, @floatFromInt(total_rx_pkts));
+        const avg_size = if (total_rx_pkts > 0) total_rx_bytes / total_rx_pkts else 0;
+        std.debug.print("[RX ] 1.00 sec {d: >7.2} Mbits/sec  {d: >9.2} pps (avg: {} bytes)\n", .{ mbps, pps, avg_size });
+    }
+    if (total_tx_bytes > 0 or total_tx_pkts > 0) {
+        const mbps = (@as(f64, @floatFromInt(total_tx_bytes)) * 8.0) / 1000000.0;
+        const pps = @as(f64, @floatFromInt(total_tx_pkts));
+        const avg_size = if (total_tx_pkts > 0) total_tx_bytes / total_tx_pkts else 0;
+        std.debug.print("[TX ] 1.00 sec {d: >7.2} Mbits/sec  {d: >9.2} pps (avg: {} bytes)\n", .{ mbps, pps, avg_size });
+    }
+}
+
 fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
@@ -172,27 +229,26 @@ const PerfServer = struct {
     mux: *EventMultiplexer,
     wait_entry: waiter.Entry,
     mux_ctx: MuxContext,
-    config: Config,
 
-    pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*PerfServer {
+    pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer) !*PerfServer {
         const self = try allocator.create(PerfServer);
         const wq = try allocator.create(waiter.Queue);
         wq.* = .{};
-        const is_udp = config.protocol == .udp;
+        const is_udp = global_config.protocol == .udp;
         const ep = try s.transport_protocols.get(if (is_udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
-        try ep.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = 5201 });
+        try ep.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = global_config.port });
         if (!is_udp) {
             try ep.listen(128);
         } else {
-            try ep.setOption(.{ .congestion_control = config.cc_alg });
+            try ep.setOption(.{ .congestion_control = global_config.cc_alg });
         }
 
-        self.* = .{ .listener = ep, .allocator = allocator, .mux = mux, .mux_ctx = .{ .server = self }, .wait_entry = undefined, .config = config };
+        self.* = .{ .listener = ep, .allocator = allocator, .mux = mux, .mux_ctx = .{ .server = self }, .wait_entry = undefined };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn);
 
         if (is_udp) {
-            _ = try Connection.init(allocator, ep, wq, mux, config, false);
+            _ = try Connection.init(allocator, ep, wq, mux, false);
         }
         return self;
     }
@@ -200,10 +256,10 @@ const PerfServer = struct {
     fn onAccept(self: *PerfServer) void {
         while (true) {
             const res = self.listener.accept() catch break;
-            if (self.config.protocol == .tcp) {
-                res.ep.setOption(.{ .congestion_control = self.config.cc_alg }) catch {};
+            if (global_config.protocol == .tcp) {
+                res.ep.setOption(.{ .congestion_control = global_config.cc_alg }) catch {};
             }
-            _ = Connection.init(self.allocator, res.ep, res.wq, self.mux, self.config, false) catch continue;
+            _ = Connection.init(self.allocator, res.ep, res.wq, self.mux, false) catch continue;
         }
     }
 };
@@ -230,7 +286,6 @@ const Connection = struct {
     wq: *waiter.Queue,
     allocator: std.mem.Allocator,
     mux: *EventMultiplexer,
-    config: Config,
     wait_entry: waiter.Entry,
     mux_ctx: MuxContext,
     is_client: bool,
@@ -241,57 +296,35 @@ const Connection = struct {
     bytes_since_last_report: u64 = 0,
     packets_since_last_report: u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, ep: ustack.tcpip.Endpoint, wq: *waiter.Queue, mux: *EventMultiplexer, config: Config, is_client: bool) !*Connection {
+    pub fn init(allocator: std.mem.Allocator, ep: ustack.tcpip.Endpoint, wq: *waiter.Queue, mux: *EventMultiplexer, is_client: bool) !*Connection {
         const self = try allocator.create(Connection);
-        self.* = .{ .ep = ep, .wq = wq, .allocator = allocator, .mux = mux, .config = config, .mux_ctx = .{ .connection = self }, .wait_entry = undefined, .is_client = is_client, .start_time = std.time.milliTimestamp(), .last_report_time = std.time.milliTimestamp() };
+        self.* = .{ .ep = ep, .wq = wq, .allocator = allocator, .mux = mux, .mux_ctx = .{ .connection = self }, .wait_entry = undefined, .is_client = is_client, .start_time = std.time.milliTimestamp(), .last_report_time = std.time.milliTimestamp() };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn | (if (is_client) waiter.EventOut else 0) | waiter.EventHUp | waiter.EventErr);
+        try global_connections.append(self);
         return self;
     }
 
-    pub fn initClient(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, target: [4]u8, local: [4]u8, config: Config) !*Connection {
+    pub fn initClient(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, target: [4]u8, local: [4]u8) !*Connection {
         const wq = try allocator.create(waiter.Queue);
         wq.* = .{};
-        const ep = try s.transport_protocols.get(if (config.protocol == .udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
-        if (config.protocol == .tcp) {
-            try ep.setOption(.{ .congestion_control = config.cc_alg });
+        const ep = try s.transport_protocols.get(if (global_config.protocol == .udp) @as(u8, 17) else 6).?.newEndpoint(s, 0x0800, wq);
+        if (global_config.protocol == .tcp) {
+            try ep.setOption(.{ .congestion_control = global_config.cc_alg });
         }
-        const self = try Connection.init(allocator, ep, wq, mux, config, true);
+        const self = try Connection.init(allocator, ep, wq, mux, true);
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = local }, .port = 0 });
-        _ = ep.connect(.{ .nic = 1, .addr = .{ .v4 = target }, .port = 5201 }) catch |err| {
+        _ = ep.connect(.{ .nic = 1, .addr = .{ .v4 = target }, .port = global_config.port }) catch |err| {
             if (err != tcpip.Error.WouldBlock) return err;
         };
-        if (config.protocol == .udp) self.onEvent();
+        if (global_config.protocol == .udp) self.onEvent();
         return self;
     }
 
     fn onEvent(self: *Connection) void {
-        const now = std.time.milliTimestamp();
+        _ = std.time.milliTimestamp();
         if (self.is_client) {
-            if (now - self.last_report_time >= 1000) {
-                const elapsed_ms = now - self.last_report_time;
-                const total_elapsed_ms = now - self.start_time;
-                const sec = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
-                const total_sec = @as(f64, @floatFromInt(total_elapsed_ms)) / 1000.0;
-                const mbps = (@as(f64, @floatFromInt(self.bytes_since_last_report)) * 8.0) / sec / 1000000.0;
-                const pps = @as(f64, @floatFromInt(self.packets_since_last_report)) / sec;
-                std.debug.print("[ID: 1] {d: >5.2}-{d: >5.2} sec {d: >7.2} Mbits/sec  {d: >9.2} pps\n", .{ total_sec - sec, total_sec, mbps, pps });
-                self.bytes_since_last_report = 0;
-                self.packets_since_last_report = 0;
-                self.last_report_time = now;
-            }
-
-            if (now - self.start_time > self.config.duration * 1000) {
-                const sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
-                std.debug.print("- - - - - - - - - - - - - - - - - - - - - - - - -\n", .{});
-                std.debug.print("[ID: 1] 0.00-{d: >5.2} sec {d: >7.2} Mbits/sec (Total: {} bytes)\n", .{ sec, (@as(f64, @floatFromInt(self.bytes)) * 8.0) / sec / 1000000.0, self.bytes });
-                std.debug.print("Stats: Fallback={}, ClusterEx={}, ViewEx={}\n", .{
-                    ustack.stats.global_stats.pool.generic_fallback,
-                    ustack.stats.global_stats.pool.cluster_exhausted,
-                    ustack.stats.global_stats.pool.view_exhausted,
-                });
-                std.process.exit(0);
-            }
+            // Stats moved to libev_stats_cb
         }
 
         if (!self.is_client) {
@@ -304,14 +337,15 @@ const Connection = struct {
                 }
                 self.bytes_since_last_report += buf.size;
                 self.bytes += buf.size;
+                self.packets_since_last_report += 1; // Assuming 1 buf = 1 packet, roughly correct for UDP
             }
         } else {
             var slen: usize = 0;
-            if (self.config.packet_size > 0) {
-                slen = self.config.packet_size;
+            if (global_config.packet_size > 0) {
+                slen = global_config.packet_size;
             } else {
-                if (self.config.protocol == .udp) {
-                    slen = @as(usize, @intCast(self.config.mtu - 28)); // IP(20) + UDP(8)
+                if (global_config.protocol == .udp) {
+                    slen = @as(usize, @intCast(global_config.mtu - 28)); // IP(20) + UDP(8)
                 } else {
                     slen = 65536; // Default to 64KB for TCP to enable batching
                 }
@@ -320,7 +354,7 @@ const Connection = struct {
             var budget: usize = 1000;
             while (budget > 0) : (budget -= 1) {
                 const sl = @min(slen, 65536);
-                const n = if (self.config.protocol == .tcp)
+                const n = if (global_config.protocol == .tcp)
                     self.ep.writeZeroCopy(StaticBuffer.buf[0..sl], .{ .ptr = self, .run = noopConsumption }, .{}) catch |err| {
                         if (err == tcpip.Error.WouldBlock) return;
                         return;
@@ -359,3 +393,4 @@ extern fn my_ev_timer_init(w: *c.ev_timer, cb: *const fn (?*anyopaque, *c.ev_tim
 extern fn my_ev_io_start(loop: ?*anyopaque, w: *c.ev_io) void;
 extern fn my_ev_timer_start(loop: ?*anyopaque, w: *c.ev_timer) void;
 extern fn my_ev_run(loop: ?*anyopaque) void;
+extern fn my_ev_break(loop: ?*anyopaque, how: i32) void;
