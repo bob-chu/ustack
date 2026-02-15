@@ -483,6 +483,13 @@ pub const UDPEndpoint = struct {
             },
         };
 
+        // Check for existing endpoint on this port
+        if (self.stack.endpoints.get(id)) |existing_ep| {
+            existing_ep.decRef();
+            self.local_addr = null;
+            return tcpip.Error.AddressInUse;
+        }
+
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
     }
 
