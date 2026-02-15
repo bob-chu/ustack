@@ -136,6 +136,7 @@ pub const TCPProtocol = struct {
                 .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                 .v6 => .{ .v6 = [_]u8{0} ** 16 },
             },
+            .transport_protocol = ProtocolNumber,
         };
         if (r.nic.stack.endpoints.get(listener_id)) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
@@ -155,6 +156,7 @@ pub const TCPProtocol = struct {
                 .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                 .v6 => .{ .v6 = [_]u8{0} ** 16 },
             },
+            .transport_protocol = ProtocolNumber,
         };
         if (r.nic.stack.endpoints.get(any_id)) |ep| {
             const tcp_ep = @as(*TCPEndpoint, @ptrCast(@alignCast(ep.ptr)));
@@ -709,6 +711,7 @@ pub const TCPEndpoint = struct {
                     .local_address = la.addr,
                     .remote_port = ra.port,
                     .remote_address = ra.addr,
+                    .transport_protocol = ProtocolNumber,
                 };
                 self.stack.unregisterTransportEndpoint(term_id);
             }
@@ -1030,7 +1033,7 @@ pub const TCPEndpoint = struct {
         } else if (self.state == .listen) {
             self.state = .closed;
             if (self.local_addr) |la| {
-                const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } } };
+                const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
                 self.stack.unregisterTransportEndpoint(id);
             }
         } else if (self.state == .syn_sent or self.state == .syn_recv) {
@@ -1038,7 +1041,7 @@ pub const TCPEndpoint = struct {
             // Optionally send RST here, but for now just unregister
             if (self.local_addr) |la| {
                 if (self.remote_addr) |ra| {
-                    const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+                    const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr, .transport_protocol = ProtocolNumber };
                     self.stack.unregisterTransportEndpoint(id);
                 }
             }
@@ -1055,6 +1058,7 @@ pub const TCPEndpoint = struct {
                         .local_address = la.addr,
                         .remote_port = ra.port,
                         .remote_address = ra.addr,
+                        .transport_protocol = ProtocolNumber,
                     };
                     const shard = self.stack.endpoints.getShard(id);
                     if (shard.get(id)) |ep| {
@@ -1209,7 +1213,7 @@ pub const TCPEndpoint = struct {
         const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
 
         // Unregister the bound placeholder if it exists
-        const bound_id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } } };
+        const bound_id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
         self.stack.unregisterTransportEndpoint(bound_id);
 
         self.state = .syn_sent;
@@ -1219,7 +1223,7 @@ pub const TCPEndpoint = struct {
         self.last_ack = initial_seq;
         self.snd_nxt +%= 1;
 
-        const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = addr.port, .remote_address = addr.addr };
+        const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = addr.port, .remote_address = addr.addr, .transport_protocol = ProtocolNumber };
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
 
         const node = self.proto.segment_node_pool.acquire() catch return tcpip.Error.OutOfMemory;
@@ -1244,7 +1248,7 @@ pub const TCPEndpoint = struct {
         self.backlog = if (backlog > 0) backlog else 128;
         self.state = .listen;
         if (self.local_addr) |la| {
-            const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } } };
+            const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
             self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
         }
     }
@@ -1266,7 +1270,7 @@ pub const TCPEndpoint = struct {
         if (final_addr.port == 0) final_addr.port = self.stack.getNextEphemeralPort();
 
         // Check for existing endpoint with the same ID
-        const id = stack.TransportEndpointID{ .local_port = final_addr.port, .local_address = final_addr.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } } };
+        const id = stack.TransportEndpointID{ .local_port = final_addr.port, .local_address = final_addr.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
         const shard = self.stack.endpoints.getShard(id);
         if (shard.get(id)) |existing_ep| {
             defer existing_ep.decRef();

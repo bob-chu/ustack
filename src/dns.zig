@@ -360,6 +360,7 @@ test "DNS Query and Response Parsing" {
         .local_address = .{ .v4 = .{ 10, 0, 0, 1 } },
         .remote_port = 0,
         .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } },
+        .transport_protocol = 17,
     };
     _ = udp_ep_id;
 

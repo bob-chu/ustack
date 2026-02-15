@@ -152,6 +152,7 @@ pub const UDPEndpoint = struct {
                 .local_address = la.addr,
                 .remote_port = ra.port,
                 .remote_address = ra.addr,
+                .transport_protocol = ProtocolNumber,
             };
             self.stack.unregisterTransportEndpoint(id);
         }
@@ -176,6 +177,7 @@ pub const UDPEndpoint = struct {
                     .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                     .v6 => .{ .v6 = [_]u8{0} ** 16 },
                 },
+                .transport_protocol = ProtocolNumber,
             };
             self.stack.unregisterTransportEndpoint(id);
         }
@@ -481,6 +483,7 @@ pub const UDPEndpoint = struct {
                 .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                 .v6 => .{ .v6 = [_]u8{0} ** 16 },
             },
+            .transport_protocol = ProtocolNumber,
         };
 
         // Check for existing endpoint on this port
@@ -604,6 +607,7 @@ test "UDP handlePacket" {
         .local_address = r.local_address,
         .remote_port = 1234,
         .remote_address = r.remote_address,
+        .transport_protocol = ProtocolNumber,
     };
 
     ep.transportEndpoint().handlePacket(&r, id, pkt);

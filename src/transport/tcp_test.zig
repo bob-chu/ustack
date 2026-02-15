@@ -72,13 +72,13 @@ test "TCP Fast Retransmit" {
     var mut_syn = syn_pkt;
     defer mut_syn.data.deinit();
     const r_to_server = stack.Route{ .local_address = sa.addr, .remote_address = ca.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
-    const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = sa.addr, .remote_port = 1234, .remote_address = ca.addr };
+    const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = sa.addr, .remote_port = 1234, .remote_address = ca.addr, .transport_protocol = 6 };
     ep_server.handlePacket(&r_to_server, id_to_server, mut_syn);
     const syn_ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_syn_ack = syn_ack_pkt;
     defer mut_syn_ack.data.deinit();
     const r_to_client = stack.Route{ .local_address = ca.addr, .remote_address = sa.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
-    const id_to_client = stack.TransportEndpointID{ .local_port = 1234, .local_address = ca.addr, .remote_port = 80, .remote_address = sa.addr };
+    const id_to_client = stack.TransportEndpointID{ .local_port = 1234, .local_address = ca.addr, .remote_port = 80, .remote_address = sa.addr, .transport_protocol = 6 };
     ep_client.handlePacket(&r_to_client, id_to_client, mut_syn_ack);
 
     try std.testing.expect(ep_client.state == .established);
@@ -170,7 +170,7 @@ test "TCP Keepalive" {
     const la = ep.local_addr.?;
     const ra = ep.remote_addr.?;
     const r = stack.Route{ .local_address = la.addr, .remote_address = ra.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = s.nics.get(1).? };
-    const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr };
+    const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = ra.port, .remote_address = ra.addr, .transport_protocol = 6 };
 
     const hdr_buf = try s.allocator.alloc(u8, 20);
     defer s.allocator.free(hdr_buf);
@@ -250,7 +250,7 @@ test "TCP Retransmission" {
     var mut_syn = syn_pkt;
     defer mut_syn.data.deinit();
     const r_to_server = stack.Route{ .local_address = sa.addr, .remote_address = ca.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
-    const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = sa.addr, .remote_port = 1234, .remote_address = ca.addr };
+    const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = sa.addr, .remote_port = 1234, .remote_address = ca.addr, .transport_protocol = 6 };
     ep_server.handlePacket(&r_to_server, id_to_server, mut_syn);
     const ack_buf = try allocator.alloc(u8, header.TCPMinimumSize);
     defer allocator.free(ack_buf);

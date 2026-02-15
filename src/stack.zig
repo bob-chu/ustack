@@ -159,9 +159,11 @@ pub const TransportEndpointID = struct {
     local_address: tcpip.Address,
     remote_port: u16,
     remote_address: tcpip.Address,
+    transport_protocol: tcpip.TransportProtocolNumber = 0,
 
     pub fn hash(self: TransportEndpointID) u64 {
         var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&self.transport_protocol));
         h.update(std.mem.asBytes(&self.local_port));
         switch (self.local_address) {
             .v4 => |v| h.update(&v),
@@ -176,7 +178,8 @@ pub const TransportEndpointID = struct {
     }
 
     pub fn eq(self: TransportEndpointID, other: TransportEndpointID) bool {
-        return self.local_port == other.local_port and
+        return self.transport_protocol == other.transport_protocol and
+            self.local_port == other.local_port and
             self.local_address.eq(other.local_address) and
             self.remote_port == other.remote_port and
             self.remote_address.eq(other.remote_address);
@@ -777,6 +780,7 @@ pub const Stack = struct {
             .local_address = r.local_address,
             .remote_port = ports.src,
             .remote_address = r.remote_address,
+            .transport_protocol = protocol,
         };
 
         const ep_opt = self.endpoints.get(id);
@@ -800,6 +804,7 @@ pub const Stack = struct {
                     .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                     .v6 => .{ .v6 = [_]u8{0} ** 16 },
                 },
+                .transport_protocol = protocol,
             };
 
             const listener_opt = self.endpoints.get(listener_id);
@@ -822,6 +827,7 @@ pub const Stack = struct {
                         .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                         .v6 => .{ .v6 = [_]u8{0} ** 16 },
                     },
+                    .transport_protocol = protocol,
                 };
 
                 if (self.endpoints.get(any_id)) |ep| {
@@ -1035,6 +1041,7 @@ test "Stack Transport Demux" {
         .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
         .remote_port = 1234,
         .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
+        .transport_protocol = 17,
     };
     try s.registerTransportEndpoint(id, ep);
 
