@@ -53,7 +53,7 @@ pub const NetworkInterface = struct {
                 self.driver = .{ .af_xdp = try AfXdp.init(allocator, cfg.name, cfg.queue_id) };
             },
             .tap => {
-                self.driver = .{ .tap = try Tap.init(cfg.name) };
+                self.driver = .{ .tap = try Tap.init(allocator, cfg.name) };
             },
         }
 
@@ -89,7 +89,7 @@ pub const NetworkInterface = struct {
                 .v4 => 0x0800,
                 .v6 => 0x86dd,
             };
-            
+
             try nic.addAddress(.{
                 .protocol = protocol,
                 .address_with_prefix = .{ .address = addr, .prefix_len = cfg.prefix },
