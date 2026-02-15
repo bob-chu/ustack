@@ -113,7 +113,6 @@ pub const TCPProtocol = struct {
         const self = @as(*TCPProtocol, @ptrCast(@alignCast(ptr)));
         _ = net_proto;
         const ep = self.endpoint_pool.acquire() catch return tcpip.Error.OutOfMemory;
-        @memset(std.mem.asBytes(ep), 0);
         try ep.initialize_v2(s, self, wait_queue, 1460);
         return ep.endpoint();
     }
@@ -236,6 +235,12 @@ pub const TCPEndpoint = struct {
     ts_recent: u32 = 0,
     max_segment_size: u16 = 1460,
 
+    // RFC 6298 RTT estimation
+    srtt: i64 = 0, // Smoothed RTT (microseconds)
+    rttvar: i64 = 0, // RTT variance (microseconds)
+    rto: i64 = 1000, // Retransmission timeout (milliseconds), initial 1s per RFC 6298
+    rtt_measured: bool = false, // Whether first RTT sample has been taken
+
     pub const SackBlock = struct {
         start: u32,
         end: u32,
@@ -318,15 +323,16 @@ pub const TCPEndpoint = struct {
             self.sack_blocks = std.ArrayList(SackBlock).init(s.allocator);
             self.peer_sack_blocks = std.ArrayList(SackBlock).init(s.allocator);
             self.syncache = SyncacheMap.init(s.allocator);
+            self.retransmit_timer = time.Timer.init(handleRetransmitTimer, self);
+            self.time_wait_timer = time.Timer.init(handleTimeWaitTimer, self);
+            self.delayed_ack_timer = time.Timer.init(handleDelayedAckTimer, self);
+            self.keepalive_timer = time.Timer.init(handleKeepaliveTimer, self);
             self.pooled = true;
         } else {
             try self.cc.reset(mss);
             self.sack_blocks.clearRetainingCapacity();
             self.peer_sack_blocks.clearRetainingCapacity();
-            // Only clear syncache if it was actually used (listeners)
-            if (self.state == .listen) {
-                self.syncache.clearRetainingCapacity();
-            }
+            self.syncache.clearRetainingCapacity();
         }
 
         stats.global_stats.tcp.active_endpoints += 1;
@@ -352,29 +358,27 @@ pub const TCPEndpoint = struct {
         self.stack_ref = false;
         self.cached_route = null;
         self.app_closed = false;
+        self.retransmit_count = 0;
+        self.ts_enabled = false;
+        self.ts_recent = 0;
+        self.max_segment_size = mss;
         self.owns_waiter_queue = false;
-        self.accepted_queue = .{};
-        self.rcv_list = .{};
-        self.ooo_list = .{};
-        self.snd_queue = .{};
-        self.retransmit_timer = time.Timer.init(handleRetransmitTimer, self);
-        self.time_wait_timer = time.Timer.init(handleTimeWaitTimer, self);
-        self.delayed_ack_timer = time.Timer.init(handleDelayedAckTimer, self);
-        self.keepalive_timer = time.Timer.init(handleKeepaliveTimer, self);
+
+        self.srtt = 0;
+        self.rttvar = 0;
+        self.rto = 1000; // 1 second initial RTO per RFC 6298
+        self.rtt_measured = false;
+
         self.keepalive_enabled = false;
         self.keepalive_idle = 7200;
         self.keepalive_intvl = 75;
         self.keepalive_cnt = 9;
         self.keepalive_probes_sent = 0;
-        self.sack_enabled = false;
-        self.hint_sack_enabled = false;
-        self.backlog = 0;
-        self.dup_ack_count = 0;
-        self.rcv_packets_since_ack = 0;
-        self.retransmit_count = 0;
-        self.ts_enabled = false;
-        self.ts_recent = 0;
-        self.max_segment_size = mss;
+
+        self.rcv_list = .{};
+        self.ooo_list = .{};
+        self.accepted_queue = .{};
+        self.snd_queue = .{};
     }
 
     pub fn transportEndpoint(self: *TCPEndpoint) stack.TransportEndpoint {
@@ -559,7 +563,7 @@ pub const TCPEndpoint = struct {
         }
         if (total_sent > 0) try self.flushSendQueue();
         if (total_sent == 0) return tcpip.Error.WouldBlock;
-        if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, 10);
+        if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, @as(u64, @intCast(self.rto)));
         return total_sent;
     }
 
@@ -691,13 +695,38 @@ pub const TCPEndpoint = struct {
         self.stack.timer_queue.schedule(&self.keepalive_timer, @as(u64, self.keepalive_idle) * 1000);
     }
 
+    fn updateRTT(self: *TCPEndpoint, rtt_ms: i64) void {
+        if (!self.rtt_measured) {
+            // RFC 6298 Section 2.2: First measurement
+            self.srtt = rtt_ms;
+            self.rttvar = @divFloor(rtt_ms, 2);
+            self.rtt_measured = true;
+        } else {
+            // RFC 6298 Section 2.3: Subsequent measurements
+            // RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R|
+            // SRTT = (1 - alpha) * SRTT + alpha * R
+            // alpha = 1/8, beta = 1/4
+            const diff = if (self.srtt > rtt_ms) self.srtt - rtt_ms else rtt_ms - self.srtt;
+            self.rttvar = @divFloor(3 * self.rttvar + diff, 4);
+            self.srtt = @divFloor(7 * self.srtt + rtt_ms, 8);
+        }
+        // RTO = SRTT + max(G, 4 * RTTVAR)
+        // G = clock granularity = 1ms for our timer wheel
+        const k_rttvar = 4 * self.rttvar;
+        self.rto = self.srtt + @max(1, k_rttvar);
+        // RFC 6298 Section 2.4: RTO minimum 1 second (relaxed to 10ms for LAN performance)
+        self.rto = @max(self.rto, 10);
+        // RFC 6298 Section 2.5: RTO maximum 60 seconds
+        self.rto = @min(self.rto, 60_000);
+    }
+
     fn handleRetransmitTimer(ptr: *anyopaque) void {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
         self.incRef();
         defer self.decRef();
         self.checkRetransmit(false) catch {};
         if (self.snd_queue.first != null and self.state != .error_state and self.state != .closed) {
-            self.stack.timer_queue.schedule(&self.retransmit_timer, 10);
+            self.stack.timer_queue.schedule(&self.retransmit_timer, @as(u64, @intCast(self.rto)));
         }
     }
 
@@ -875,8 +904,11 @@ pub const TCPEndpoint = struct {
                 it = node.next;
                 continue;
             }
-            if (force or node.data.timestamp == 0 or (now - node.data.timestamp > 10)) {
-                if (!force and node.data.timestamp != 0) self.cc.onLoss();
+            if (force or node.data.timestamp == 0 or (now - node.data.timestamp > self.rto)) {
+                if (!force and node.data.timestamp != 0) {
+                    self.cc.onLoss();
+                    self.rto = @min(self.rto * 2, 60_000); // Exponential backoff
+                }
                 const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
                 const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
                 const net_proto: u16 = if (ra.addr == .v4) 0x0800 else 0x86dd;
@@ -1229,7 +1261,7 @@ pub const TCPEndpoint = struct {
         const node = self.proto.segment_node_pool.acquire() catch return tcpip.Error.OutOfMemory;
         node.data = .{ .data = buffer.VectorisedView.empty(), .seq = initial_seq, .len = 0, .flags = header.TCPFlagSyn, .timestamp = 0 };
         self.snd_queue.append(node);
-        if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, 10);
+        if (!self.retransmit_timer.active) self.stack.timer_queue.schedule(&self.retransmit_timer, @as(u64, @intCast(self.rto)));
         try self.flushSendQueue();
     }
 
@@ -1719,6 +1751,10 @@ pub const TCPEndpoint = struct {
                                 const seg_end = node.data.seq +% node.data.len +% flag_len;
                                 if (seqBeforeEq(seg_end, ack)) {
                                     const next = node.next;
+                                    if (node.data.timestamp != 0 and self.retransmit_count == 0) {
+                                        const rtt_ms = now - node.data.timestamp;
+                                        if (rtt_ms > 0) self.updateRTT(rtt_ms);
+                                    }
                                     _ = self.snd_queue.remove(node);
                                     node.data.data.deinit();
                                     self.proto.segment_node_pool.release(node);
@@ -1730,7 +1766,7 @@ pub const TCPEndpoint = struct {
                             if (self.snd_queue.first == null) {
                                 self.stack.timer_queue.cancel(&self.retransmit_timer);
                             } else {
-                                self.stack.timer_queue.schedule(&self.retransmit_timer, 10);
+                                self.stack.timer_queue.schedule(&self.retransmit_timer, @as(u64, @intCast(self.rto)));
                             }
                             self.cc.onAck(diff);
                             notify_mask |= waiter.EventOut;
@@ -1807,7 +1843,6 @@ pub const TCPEndpoint = struct {
             },
             else => {},
         }
-        _ = now;
         self.resetKeepaliveTimer();
     }
 
