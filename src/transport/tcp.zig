@@ -1423,20 +1423,8 @@ pub const TCPEndpoint = struct {
 
         if (self.state == .time_wait) {
             if (fl & header.TCPFlagRst != 0) {
-                self.state = .closed;
-                if (self.local_addr) |la| {
-                    if (self.remote_addr) |ra| {
-                        const term_id = stack.TransportEndpointID{
-                            .local_port = la.port,
-                            .local_address = la.addr,
-                            .remote_port = ra.port,
-                            .remote_address = ra.addr,
-                        };
-                        self.stack.unregisterTransportEndpoint(term_id);
-                    }
-                }
-                self.decStackRef();
-                notify_mask |= waiter.EventErr;
+                // RFC 1337: Ignore RST segments in TIME_WAIT to prevent
+                // TIME_WAIT assassination and premature port reuse.
                 return;
             }
             if (fl & header.TCPFlagSyn != 0 and fl & header.TCPFlagAck == 0) {
@@ -1683,7 +1671,6 @@ pub const TCPEndpoint = struct {
                         self.processOOO();
                         // Use delayed ACKs for data to improve throughput
                         self.maybeSendDelayedAck(data_len);
-                        stats.global_stats.tcp.rx_segments += 1;
                         notify_mask |= waiter.EventIn;
                     }
                     if (fl & header.TCPFlagFin != 0) {
