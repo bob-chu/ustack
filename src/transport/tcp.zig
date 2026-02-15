@@ -735,7 +735,7 @@ pub const TCPEndpoint = struct {
             }
         }
 
-        if (self.state == .listen) {
+        if (self.state == .listen and self.syncache.count() > 0) {
             self.stack.timer_queue.schedule(&self.syncache_timer, 5000);
         }
     }
@@ -1326,7 +1326,6 @@ pub const TCPEndpoint = struct {
     fn listen_internal(self: *TCPEndpoint, backlog: i32) tcpip.Error!void {
         self.backlog = if (backlog > 0) backlog else 128;
         self.state = .listen;
-        self.stack.timer_queue.schedule(&self.syncache_timer, 5000); // Check every 5s
         if (self.local_addr) |la| {
             const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
             self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
@@ -1629,6 +1628,9 @@ pub const TCPEndpoint = struct {
                         log.err("Syncache put failed", .{});
                         return;
                     };
+                    if (!self.syncache_timer.active) {
+                        self.stack.timer_queue.schedule(&self.syncache_timer, 5000);
+                    }
                     self.sendSynAck(r, id, entry) catch |err| {
                         log.err("sendSynAck failed: {}", .{err});
                     };
