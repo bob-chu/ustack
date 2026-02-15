@@ -212,6 +212,9 @@ pub const TCPEndpoint = struct {
     delayed_ack_timer: time.Timer = undefined,
     keepalive_timer: time.Timer = undefined,
     syncache_timer: time.Timer = undefined,
+    persist_timer: time.Timer = undefined,
+    persist_interval: u64 = 1000, // Start at 1 second
+    persist_max_interval: u64 = 60_000, // Cap at 60 seconds
 
     keepalive_enabled: bool = false,
     keepalive_idle: u32 = 7200,
@@ -330,6 +333,7 @@ pub const TCPEndpoint = struct {
             self.delayed_ack_timer = time.Timer.init(handleDelayedAckTimer, self);
             self.keepalive_timer = time.Timer.init(handleKeepaliveTimer, self);
             self.syncache_timer = time.Timer.init(handleSyncacheTimer, self);
+            self.persist_timer = time.Timer.init(handlePersistTimer, self);
             self.pooled = true;
         } else {
             try self.cc.reset(mss);
@@ -337,6 +341,8 @@ pub const TCPEndpoint = struct {
             self.peer_sack_blocks.clearRetainingCapacity();
             self.syncache.clearRetainingCapacity();
         }
+
+        self.persist_interval = 1000;
 
         stats.global_stats.tcp.active_endpoints += 1;
 
@@ -696,6 +702,19 @@ pub const TCPEndpoint = struct {
         if (!self.keepalive_enabled) return;
         self.keepalive_probes_sent = 0;
         self.stack.timer_queue.schedule(&self.keepalive_timer, @as(u64, self.keepalive_idle) * 1000);
+    }
+
+    fn handlePersistTimer(ptr: *anyopaque) void {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        if (self.state != .established and self.state != .close_wait) return;
+        if (self.snd_wnd > 0) return; // Window opened, no need to probe
+
+        // Send a 1-byte zero-window probe (ACK with sequence snd_nxt-1)
+        self.sendControl(header.TCPFlagAck) catch {};
+
+        // Exponential backoff
+        self.persist_interval = @min(self.persist_interval * 2, self.persist_max_interval);
+        self.stack.timer_queue.schedule(&self.persist_timer, self.persist_interval);
     }
 
     const SYNCACHE_TIMEOUT_MS: i64 = 75_000; // 75 seconds
@@ -1061,6 +1080,7 @@ pub const TCPEndpoint = struct {
         self.stack.timer_queue.cancel(&self.delayed_ack_timer);
         self.stack.timer_queue.cancel(&self.keepalive_timer);
         self.stack.timer_queue.cancel(&self.syncache_timer);
+        self.stack.timer_queue.cancel(&self.persist_timer);
 
         while (self.snd_queue.popFirst()) |node| {
             node.data.data.deinit();
@@ -1758,6 +1778,18 @@ pub const TCPEndpoint = struct {
                     const ack = h.ackNumber();
                     if (seqBeforeEq(ack, self.snd_nxt) and seqAfterEq(ack, self.last_ack)) {
                         self.snd_wnd = @as(u32, h.windowSize()) << @as(u5, @intCast(self.snd_wnd_scale));
+
+                        // Update persist timer
+                        if (self.persist_timer.active) {
+                            if (self.snd_wnd > 0) {
+                                self.stack.timer_queue.cancel(&self.persist_timer);
+                                self.persist_interval = 1000;
+                            }
+                        } else if (self.snd_wnd == 0 and self.snd_queue.first != null) {
+                            self.persist_interval = 1000;
+                            self.stack.timer_queue.schedule(&self.persist_timer, self.persist_interval);
+                        }
+
                         if (ack == self.last_ack) {
                             self.dup_ack_count += 1;
                             if (self.dup_ack_count == 3) {
