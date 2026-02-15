@@ -184,7 +184,7 @@ extern fn my_ev_timer_init(w: *c.ev_timer, cb: *const fn (?*anyopaque, *c.ev_tim
 extern fn my_ev_io_start(loop: ?*anyopaque, w: *c.ev_io) void;
 extern fn my_ev_timer_start(loop: ?*anyopaque, w: *c.ev_timer) void;
 extern fn my_ev_run(loop: ?*anyopaque) void;
-extern fn my_ev_break(loop: ?*anyopaque) void;
+extern fn my_ev_break(loop: ?*anyopaque, how: i32) void;
 
 var global_loop: ?*anyopaque = null;
 var global_mark_done: bool = false;
@@ -225,7 +225,7 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
 
     if (global_mark_done) {
         if (std.time.milliTimestamp() - global_done_time >= 1000) {
-            if (global_loop) |l| my_ev_break(l);
+            if (global_loop) |l| my_ev_break(l, 2); // EVBREAK_ALL = 2
         }
     }
 }
