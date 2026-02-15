@@ -4,6 +4,7 @@ const tcpip = @import("../../tcpip.zig");
 const buffer = @import("../../buffer.zig");
 const xdp = @import("xdp_defs.zig");
 const log = @import("../../log.zig").scoped(.af_xdp);
+const stats = @import("../../stats.zig");
 
 /// A LinkEndpoint implementation for Linux AF_XDP (Express Data Path).
 pub const AfXdp = struct {
@@ -23,6 +24,9 @@ pub const AfXdp = struct {
     comp_ring: Ring,
 
     dispatcher: ?*stack.NetworkDispatcher = null,
+    cluster_pool: ?*buffer.ClusterPool = null,
+    view_pool: buffer.BufferPool,
+    header_pool: buffer.BufferPool,
     frame_manager: FrameManager,
 
     const FrameManager = struct {
@@ -69,7 +73,7 @@ pub const AfXdp = struct {
     const FRAME_SIZE = 2048;
     const RING_SIZE = 1024;
 
-    pub fn init(allocator: std.mem.Allocator, if_name: []const u8, queue_id: u32) !AfXdp {
+    pub fn init(allocator: std.mem.Allocator, pool: *buffer.ClusterPool, if_name: []const u8, queue_id: u32) !AfXdp {
         const fd = try std.posix.socket(std.posix.AF.XDP, std.posix.SOCK.RAW, 0);
         errdefer std.posix.close(fd);
 
@@ -134,6 +138,9 @@ pub const AfXdp = struct {
             .comp_ring = initRing(comp_map, off.cr, RING_SIZE, true),
             .rx_ring = initRing(rx_map, off.rx, RING_SIZE, false),
             .tx_ring = initRing(tx_map, off.tx, RING_SIZE, false),
+            .cluster_pool = pool,
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 16, 4096),
+            .header_pool = buffer.BufferPool.init(allocator, 128, 4096),
             .frame_manager = fm,
         };
 
@@ -154,6 +161,8 @@ pub const AfXdp = struct {
         std.posix.close(self.fd);
         self.allocator.free(self.umem_area);
         self.frame_manager.deinit(self.allocator);
+        self.view_pool.deinit();
+        self.header_pool.deinit();
     }
 
     fn initRing(map: []u8, off: xdp.xdp_ring_offset, size: u32, is_addr: bool) Ring {
@@ -179,8 +188,14 @@ pub const AfXdp = struct {
                 .mtu = mtu,
                 .setMTU = setMTU,
                 .capabilities = capabilities,
+                .close = close_external,
             },
         };
+    }
+
+    fn close_external(ptr: *anyopaque) void {
+        const self = @as(*AfXdp, @ptrCast(@alignCast(ptr)));
+        self.deinit();
     }
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
@@ -258,17 +273,42 @@ pub const AfXdp = struct {
             const desc = self.rx_ring.desc[cons & self.rx_ring.mask];
             const data = self.umem_area[desc.addr .. desc.addr + desc.len];
 
-            // Dispatch
-            var views = [1]buffer.ClusterView{.{ .cluster = null, .view = data }};
-            const pkt = tcpip.PacketBuffer{
-                .data = buffer.VectorisedView.init(data.len, &views),
-                .header = buffer.Prependable.init(&[_]u8{}),
+            // Copy data to Cluster to ensure lifetime
+            const cp = self.cluster_pool orelse break;
+            const c = cp.acquire() catch {
+                break;
             };
+            @memcpy(c.data[0..desc.len], data);
+
+            const h_buf = self.header_pool.acquire() catch {
+                c.release();
+                break;
+            };
+
+            const view_mem = self.view_pool.acquire() catch {
+                self.header_pool.release(h_buf);
+                c.release();
+                break;
+            };
+            const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
+            original_views[0] = .{ .cluster = c, .view = c.data[0..desc.len] };
+
+            const pkt = tcpip.PacketBuffer{
+                .data = buffer.VectorisedView.init(desc.len, original_views[0..1]),
+                .header = buffer.Prependable.init(h_buf),
+                .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+            };
+            var mut_pkt = pkt;
+            mut_pkt.data.original_views = original_views;
+            mut_pkt.data.view_pool = &self.view_pool;
 
             if (self.dispatcher) |d| {
                 const dummy = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
-                d.deliverNetworkPacket(&dummy, &dummy, 0, pkt);
+                d.deliverNetworkPacket(&dummy, &dummy, 0, mut_pkt);
             }
+
+            self.header_pool.release(h_buf);
+            mut_pkt.data.deinit();
 
             // Recycle frame to Fill Ring
             const fill_prod = self.fill_ring.producer.*;
@@ -299,6 +339,8 @@ pub const AfXdp = struct {
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
         const self = @as(*AfXdp, @ptrCast(@alignCast(ptr)));
         self.dispatcher = dispatcher;
+        const nic = @as(*stack.NIC, @ptrCast(@alignCast(dispatcher.ptr)));
+        self.cluster_pool = &nic.stack.cluster_pool;
     }
 
     fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
