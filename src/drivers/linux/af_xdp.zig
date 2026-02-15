@@ -276,19 +276,22 @@ pub const AfXdp = struct {
             // Copy data to Cluster to ensure lifetime
             const cp = self.cluster_pool orelse break;
             const c = cp.acquire() catch {
-                break;
+                cons +%= 1;
+                continue;
             };
             @memcpy(c.data[0..desc.len], data);
 
             const h_buf = self.header_pool.acquire() catch {
                 c.release();
-                break;
+                cons +%= 1;
+                continue;
             };
 
             const view_mem = self.view_pool.acquire() catch {
                 self.header_pool.release(h_buf);
                 c.release();
-                break;
+                cons +%= 1;
+                continue;
             };
             const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
             original_views[0] = .{ .cluster = c, .view = c.data[0..desc.len] };
@@ -320,7 +323,7 @@ pub const AfXdp = struct {
                 self.frame_manager.free(@as(u32, @intCast(desc.addr / FRAME_SIZE)));
             }
 
-            cons += 1;
+            cons +%= 1;
         }
         self.rx_ring.consumer.* = cons;
 
