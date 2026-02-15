@@ -185,8 +185,14 @@ pub const ARPEndpoint = struct {
         const sender_proto_addr = tcpip.Address{ .v4 = h.protocolAddressSender() };
         const sender_hw_addr = h.hardwareAddressSender();
 
-        _ = self.pending_requests.remove(sender_proto_addr);
-        self.nic.stack.addLinkAddress(sender_proto_addr, .{ .addr = sender_hw_addr }) catch {};
+        const had_pending = self.pending_requests.remove(sender_proto_addr);
+
+        // Only update link-address cache if:
+        // 1. We had an outstanding ARP request for this address (solicited reply), OR
+        // 2. The entry already exists in the cache (gratuitous update for known hosts)
+        if (had_pending or self.nic.stack.link_addr_cache.get(sender_proto_addr) != null) {
+            self.nic.stack.addLinkAddress(sender_proto_addr, .{ .addr = sender_hw_addr }) catch {};
+        }
 
         const target_proto_addr = tcpip.Address{ .v4 = h.protocolAddressTarget() };
         if (h.op() == 1) { // Request
