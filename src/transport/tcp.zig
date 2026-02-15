@@ -211,6 +211,7 @@ pub const TCPEndpoint = struct {
     time_wait_timer: time.Timer = undefined,
     delayed_ack_timer: time.Timer = undefined,
     keepalive_timer: time.Timer = undefined,
+    syncache_timer: time.Timer = undefined,
 
     keepalive_enabled: bool = false,
     keepalive_idle: u32 = 7200,
@@ -256,6 +257,7 @@ pub const TCPEndpoint = struct {
         ws_negotiated: bool,
         snd_wnd_scale: u8,
         mss: u16,
+        created_at: i64 = 0,
 
         pub fn hash(self: SyncacheEntry) u64 {
             var h = std.hash.Wyhash.init(0);
@@ -327,6 +329,7 @@ pub const TCPEndpoint = struct {
             self.time_wait_timer = time.Timer.init(handleTimeWaitTimer, self);
             self.delayed_ack_timer = time.Timer.init(handleDelayedAckTimer, self);
             self.keepalive_timer = time.Timer.init(handleKeepaliveTimer, self);
+            self.syncache_timer = time.Timer.init(handleSyncacheTimer, self);
             self.pooled = true;
         } else {
             try self.cc.reset(mss);
@@ -695,6 +698,25 @@ pub const TCPEndpoint = struct {
         self.stack.timer_queue.schedule(&self.keepalive_timer, @as(u64, self.keepalive_idle) * 1000);
     }
 
+    const SYNCACHE_TIMEOUT_MS: i64 = 75_000; // 75 seconds
+
+    fn handleSyncacheTimer(ptr: *anyopaque) void {
+        const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
+        if (self.state != .listen) return;
+
+        const now = std.time.milliTimestamp();
+        var it = self.syncache.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.created_at >= SYNCACHE_TIMEOUT_MS) {
+                self.syncache.removeByPtr(entry.key_ptr);
+            }
+        }
+
+        if (self.state == .listen) {
+            self.stack.timer_queue.schedule(&self.syncache_timer, 5000);
+        }
+    }
+
     fn updateRTT(self: *TCPEndpoint, rtt_ms: i64) void {
         if (!self.rtt_measured) {
             // RFC 6298 Section 2.2: First measurement
@@ -1038,6 +1060,7 @@ pub const TCPEndpoint = struct {
         self.stack.timer_queue.cancel(&self.time_wait_timer);
         self.stack.timer_queue.cancel(&self.delayed_ack_timer);
         self.stack.timer_queue.cancel(&self.keepalive_timer);
+        self.stack.timer_queue.cancel(&self.syncache_timer);
 
         while (self.snd_queue.popFirst()) |node| {
             node.data.data.deinit();
@@ -1279,6 +1302,7 @@ pub const TCPEndpoint = struct {
     fn listen_internal(self: *TCPEndpoint, backlog: i32) tcpip.Error!void {
         self.backlog = if (backlog > 0) backlog else 128;
         self.state = .listen;
+        self.stack.timer_queue.schedule(&self.syncache_timer, 5000); // Check every 5s
         if (self.local_addr) |la| {
             const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
             self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
@@ -1548,6 +1572,7 @@ pub const TCPEndpoint = struct {
                         .ws_negotiated = false,
                         .snd_wnd_scale = 0,
                         .mss = self.max_segment_size,
+                        .created_at = now,
                     };
 
                     // Parse options from SYN
