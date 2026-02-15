@@ -276,6 +276,7 @@ pub const AfXdp = struct {
             // Copy data to Cluster to ensure lifetime
             const cp = self.cluster_pool orelse break;
             const c = cp.acquire() catch {
+                self.frame_manager.free(@as(u32, @intCast(desc.addr / FRAME_SIZE)));
                 cons +%= 1;
                 continue;
             };
@@ -283,6 +284,7 @@ pub const AfXdp = struct {
 
             const h_buf = self.header_pool.acquire() catch {
                 c.release();
+                self.frame_manager.free(@as(u32, @intCast(desc.addr / FRAME_SIZE)));
                 cons +%= 1;
                 continue;
             };
@@ -290,6 +292,7 @@ pub const AfXdp = struct {
             const view_mem = self.view_pool.acquire() catch {
                 self.header_pool.release(h_buf);
                 c.release();
+                self.frame_manager.free(@as(u32, @intCast(desc.addr / FRAME_SIZE)));
                 cons +%= 1;
                 continue;
             };
