@@ -6,8 +6,13 @@ const log = @import("../log.zig").scoped(.ipv4);
 const stats = @import("../stats.zig");
 
 const buffer = @import("../buffer.zig");
+const time = @import("../time.zig");
 
 pub const ProtocolNumber = 0x0800;
+
+const MAX_REASSEMBLY_ENTRIES = 256;
+const MAX_FRAGMENTS_PER_DATAGRAM = 64;
+const REASSEMBLY_TIMEOUT_MS: i64 = 30_000; // 30 seconds
 
 pub const IPv4Protocol = struct {
     pub fn init() IPv4Protocol {
@@ -71,7 +76,29 @@ pub const IPv4Protocol = struct {
             .dispatcher = dispatcher,
             .reassembly_list = std.AutoHashMap(ReassemblyKey, ReassemblyContext).init(nic.stack.allocator),
         };
+        ep.reassembly_timer = time.Timer.init(handleReassemblyTimer, ep);
         return ep.networkEndpoint();
+    }
+
+    fn handleReassemblyTimer(ptr: *anyopaque) void {
+        const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
+        const now = std.time.milliTimestamp();
+        var it = self.reassembly_list.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.created_at >= REASSEMBLY_TIMEOUT_MS) {
+                // Free all fragment data
+                for (entry.value_ptr.fragments.items) |f| {
+                    var mut_data = f.data.data;
+                    mut_data.deinit();
+                }
+                entry.value_ptr.deinit();
+                self.reassembly_list.removeByPtr(entry.key_ptr);
+            }
+        }
+        // Reschedule if there are still entries
+        if (self.reassembly_list.count() > 0) {
+            self.nic.stack.timer_queue.schedule(&self.reassembly_timer, 1000);
+        }
     }
 };
 
@@ -93,9 +120,13 @@ const ReassemblyKey = struct {
 
 const ReassemblyContext = struct {
     fragments: std.ArrayList(Fragment),
+    created_at: i64,
 
     pub fn init(allocator: std.mem.Allocator) ReassemblyContext {
-        return .{ .fragments = std.ArrayList(Fragment).init(allocator) };
+        return .{
+            .fragments = std.ArrayList(Fragment).init(allocator),
+            .created_at = std.time.milliTimestamp(),
+        };
     }
 
     pub fn deinit(self: *ReassemblyContext) void {
@@ -110,6 +141,7 @@ pub const IPv4Endpoint = struct {
     dispatcher: stack.TransportDispatcher,
 
     reassembly_list: std.AutoHashMap(ReassemblyKey, ReassemblyContext),
+    reassembly_timer: time.Timer = undefined,
 
     pub fn networkEndpoint(self: *IPv4Endpoint) stack.NetworkEndpoint {
         return .{
@@ -133,6 +165,7 @@ pub const IPv4Endpoint = struct {
 
     fn close(ptr: *anyopaque) void {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
+        self.nic.stack.timer_queue.cancel(&self.reassembly_timer);
         var it = self.reassembly_list.valueIterator();
         while (it.next()) |ctx| {
             ctx.deinit();
@@ -227,11 +260,25 @@ pub const IPv4Endpoint = struct {
 
             var ctx_ptr = self.reassembly_list.getPtr(key);
             if (ctx_ptr == null) {
+                if (self.reassembly_list.count() >= MAX_REASSEMBLY_ENTRIES) {
+                    stats.global_stats.ip.dropped_packets += 1;
+                    return;
+                }
                 const ctx = ReassemblyContext.init(self.nic.stack.allocator);
                 self.reassembly_list.put(key, ctx) catch return;
                 ctx_ptr = self.reassembly_list.getPtr(key);
+                // Start timer if not already running
+                if (!self.reassembly_timer.active) {
+                    self.nic.stack.timer_queue.schedule(&self.reassembly_timer, 1000);
+                }
             }
             const ctx = ctx_ptr.?;
+
+            // Enforce max fragments per datagram
+            if (ctx.fragments.items.len >= MAX_FRAGMENTS_PER_DATAGRAM) {
+                stats.global_stats.ip.dropped_packets += 1;
+                return;
+            }
 
             var payload_pkt = pkt;
             payload_pkt.data.trimFront(hlen);
