@@ -340,6 +340,10 @@ pub const TCPEndpoint = struct {
             self.sack_blocks.clearRetainingCapacity();
             self.peer_sack_blocks.clearRetainingCapacity();
             self.syncache.clearRetainingCapacity();
+            self.sack_enabled = false;
+            self.hint_sack_enabled = false;
+            self.dup_ack_count = 0;
+            self.rcv_packets_since_ack = 0;
         }
 
         self.persist_interval = 1000;
@@ -1519,6 +1523,7 @@ pub const TCPEndpoint = struct {
                             .local_address = la.addr,
                             .remote_port = ra.port,
                             .remote_address = ra.addr,
+                            .transport_protocol = ProtocolNumber,
                         };
                         const shard = self.stack.endpoints.getShard(term_id);
                         if (shard.get(term_id)) |ep| {
@@ -1669,6 +1674,7 @@ pub const TCPEndpoint = struct {
                                 .local_address = new_ep.local_addr.?.addr,
                                 .remote_port = new_ep.remote_addr.?.port,
                                 .remote_address = new_ep.remote_addr.?.addr,
+                                .transport_protocol = ProtocolNumber,
                             };
                             self.stack.registerTransportEndpoint(new_id, new_ep.transportEndpoint()) catch {
                                 new_ep.decRef();
@@ -1875,6 +1881,7 @@ pub const TCPEndpoint = struct {
                                 .local_address = la.addr,
                                 .remote_port = ra.port,
                                 .remote_address = ra.addr,
+                                .transport_protocol = ProtocolNumber,
                             };
                             self.stack.unregisterTransportEndpoint(term_id);
                         }
@@ -1892,6 +1899,7 @@ pub const TCPEndpoint = struct {
                                 .local_address = la.addr,
                                 .remote_port = ra.port,
                                 .remote_address = ra.addr,
+                                .transport_protocol = ProtocolNumber,
                             };
                             self.stack.unregisterTransportEndpoint(term_id);
                         }
