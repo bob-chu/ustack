@@ -352,7 +352,7 @@ pub const NIC = struct {
         const addrs = proto.parseAddresses(pkt);
         if (!addrs.src.isAny()) {
             if (self.stack.link_addr_cache.get(addrs.src)) |prev| {
-                if (!prev.eq(remote.*)) {
+                if (!prev.link_addr.eq(remote.*)) {
                     self.stack.addLinkAddress(addrs.src, remote.*) catch {};
                 }
             } else {
@@ -389,7 +389,7 @@ pub const Route = struct {
         const next_hop = self.next_hop orelse self.remote_address;
 
         if (self.remote_link_address == null) {
-            const link_addr_opt = self.nic.stack.link_addr_cache.get(next_hop);
+            const link_addr_opt = if (self.nic.stack.link_addr_cache.get(next_hop)) |entry| entry.link_addr else null;
 
             if (link_addr_opt) |link_addr| {
                 self.remote_link_address = link_addr;
@@ -678,13 +678,26 @@ pub const Stack = struct {
     fn arpGcTimer(ptr: *anyopaque) void {
         const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
         const now = std.time.milliTimestamp();
+
+        // Phase 1: Collect expired keys (max 64 per GC cycle to bound stack usage)
+        var expired_keys: [64]tcpip.Address = undefined;
+        var expired_count: usize = 0;
+
         var it = self.link_addr_cache.iterator();
         while (it.next()) |entry| {
+            if (expired_count >= 64) break; // Process rest next cycle
             const ttl = if (entry.value_ptr.confirmed) self.arp_confirmed_ttl else self.arp_unconfirmed_ttl;
             if (now - entry.value_ptr.timestamp >= ttl) {
-                self.link_addr_cache.removeByPtr(entry.key_ptr);
+                expired_keys[expired_count] = entry.key_ptr.*;
+                expired_count += 1;
             }
         }
+
+        // Phase 2: Remove after iteration completes
+        for (expired_keys[0..expired_count]) |key| {
+            _ = self.link_addr_cache.remove(key);
+        }
+
         // Reschedule if cache not empty
         if (self.link_addr_cache.count() > 0) {
             self.timer_queue.schedule(&self.arp_gc_timer, 10_000); // Every 10s
@@ -713,7 +726,6 @@ pub const Stack = struct {
         return port;
     }
 
-    // Find route using longest-prefix matching in routing table
     // Find route using longest-prefix matching in routing table
     pub fn findRoute(self: *Stack, nic_id: tcpip.NICID, local_addr: tcpip.Address, remote_addr: tcpip.Address, net_proto: tcpip.NetworkProtocolNumber) !Route {
         if (nic_id != 0) {

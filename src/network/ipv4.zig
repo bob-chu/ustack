@@ -83,18 +83,33 @@ pub const IPv4Protocol = struct {
     fn handleReassemblyTimer(ptr: *anyopaque) void {
         const self = @as(*IPv4Endpoint, @ptrCast(@alignCast(ptr)));
         const now = std.time.milliTimestamp();
+
+        // Phase 1: Collect expired keys and free their resources
+        // (Freeing heap memory owned by values is safe during iteration —
+        //  only HashMap structural changes like add/remove are UB.)
+        var expired_keys: [64]ReassemblyKey = undefined;
+        var expired_count: usize = 0;
+
         var it = self.reassembly_list.iterator();
         while (it.next()) |entry| {
+            if (expired_count >= 64) break; // Process rest next cycle
             if (now - entry.value_ptr.created_at >= REASSEMBLY_TIMEOUT_MS) {
-                // Free all fragment data
+                // Free all fragment data while we still have access to the value
                 for (entry.value_ptr.fragments.items) |f| {
                     var mut_data = f.data.data;
                     mut_data.deinit();
                 }
                 entry.value_ptr.deinit();
-                self.reassembly_list.removeByPtr(entry.key_ptr);
+                expired_keys[expired_count] = entry.key_ptr.*;
+                expired_count += 1;
             }
         }
+
+        // Phase 2: Remove after iteration completes
+        for (expired_keys[0..expired_count]) |key| {
+            _ = self.reassembly_list.remove(key);
+        }
+
         // Reschedule if there are still entries
         if (self.reassembly_list.count() > 0) {
             self.nic.stack.timer_queue.schedule(&self.reassembly_timer, 1000);

@@ -677,7 +677,7 @@ pub const TCPEndpoint = struct {
         const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
         const net_proto: u16 = if (ra.addr == .v4) 0x0800 else 0x86dd;
 
-        if (self.cached_route == null or self.cached_route.?.net_proto != net_proto) {
+        if (self.cached_route == null or self.cached_route.?.net_proto != net_proto or self.cached_route.?.generation != self.stack.route_generation) {
             self.cached_route = try self.stack.findRoute(ra.nic, la.addr, ra.addr, net_proto);
         }
         const r = &self.cached_route.?;
@@ -728,11 +728,23 @@ pub const TCPEndpoint = struct {
         if (self.state != .listen) return;
 
         const now = std.time.milliTimestamp();
+
+        // Phase 1: Collect expired keys (max 64 per GC cycle to bound stack usage)
+        var expired_keys: [64]SyncacheKey = undefined;
+        var expired_count: usize = 0;
+
         var it = self.syncache.iterator();
         while (it.next()) |entry| {
+            if (expired_count >= 64) break; // Process rest next cycle
             if (now - entry.value_ptr.created_at >= SYNCACHE_TIMEOUT_MS) {
-                self.syncache.removeByPtr(entry.key_ptr);
+                expired_keys[expired_count] = entry.key_ptr.*;
+                expired_count += 1;
             }
+        }
+
+        // Phase 2: Remove after iteration completes
+        for (expired_keys[0..expired_count]) |key| {
+            _ = self.syncache.remove(key);
         }
 
         if (self.state == .listen and self.syncache.count() > 0) {
@@ -957,15 +969,15 @@ pub const TCPEndpoint = struct {
                 const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
                 const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
                 const net_proto: u16 = if (ra.addr == .v4) 0x0800 else 0x86dd;
-                if (self.cached_route == null or self.cached_route.?.net_proto != net_proto) {
+                if (self.cached_route == null or self.cached_route.?.net_proto != net_proto or self.cached_route.?.generation != self.stack.route_generation) {
                     self.cached_route = try self.stack.findRoute(ra.nic, la.addr, ra.addr, net_proto);
                 }
                 var r = self.cached_route.?;
                 const next_hop = r.next_hop orelse ra.addr;
                 if (r.remote_link_address == null) {
-                    if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
-                        r.remote_link_address = link_addr;
-                        self.cached_route.?.remote_link_address = link_addr;
+                    if (self.stack.link_addr_cache.get(next_hop)) |entry| {
+                        r.remote_link_address = entry.link_addr;
+                        self.cached_route.?.remote_link_address = entry.link_addr;
                     }
                 }
                 const hdr_buf = self.proto.header_pool.acquire() catch return;

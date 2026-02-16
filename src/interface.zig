@@ -27,7 +27,7 @@ pub const InterfaceConfig = struct {
 pub const NetworkInterface = struct {
     allocator: std.mem.Allocator,
     stack: *stack.Stack,
-    nic_id: u16,
+    nic_id: tcpip.NICID,
 
     driver: union(DriverType) {
         af_packet: AfPacket,
