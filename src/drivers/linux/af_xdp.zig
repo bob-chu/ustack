@@ -29,6 +29,12 @@ pub const AfXdp = struct {
     header_pool: buffer.BufferPool,
     frame_manager: FrameManager,
 
+    // Ring mmap tracking for cleanup
+    fill_map_slice: []align(std.mem.page_size) u8,
+    comp_map_slice: []align(std.mem.page_size) u8,
+    rx_map_slice: []align(std.mem.page_size) u8,
+    tx_map_slice: []align(std.mem.page_size) u8,
+
     const FrameManager = struct {
         free_frames: []u32,
         top: usize,
@@ -142,6 +148,10 @@ pub const AfXdp = struct {
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * 16, 4096),
             .header_pool = buffer.BufferPool.init(allocator, 128, 4096),
             .frame_manager = fm,
+            .fill_map_slice = fill_map,
+            .comp_map_slice = comp_map,
+            .rx_map_slice = rx_map,
+            .tx_map_slice = tx_map,
         };
 
         // 8. Populate Fill Ring
@@ -158,6 +168,10 @@ pub const AfXdp = struct {
     }
 
     pub fn deinit(self: *AfXdp) void {
+        std.posix.munmap(self.tx_map_slice);
+        std.posix.munmap(self.rx_map_slice);
+        std.posix.munmap(self.comp_map_slice);
+        std.posix.munmap(self.fill_map_slice);
         std.posix.close(self.fd);
         self.allocator.free(self.umem_area);
         self.frame_manager.deinit(self.allocator);

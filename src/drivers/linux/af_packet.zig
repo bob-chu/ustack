@@ -128,6 +128,8 @@ pub const AfPacket = struct {
         const total_ring_size = self.frame_size * self.frame_nr * 2;
         const mmap_ptr = @as([*]align(std.mem.page_size) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
         std.posix.munmap(mmap_ptr[0..total_ring_size]);
+        self.view_pool.deinit();
+        self.header_pool.deinit();
         std.posix.close(self.fd);
     }
 
