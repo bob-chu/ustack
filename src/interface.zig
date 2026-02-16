@@ -40,9 +40,7 @@ pub const NetworkInterface = struct {
         const self = try allocator.create(NetworkInterface);
         self.allocator = allocator;
         self.stack = s;
-        // Use a simple ID strategy: assume nic_id 1 is primary.
-        // In a real multi-nic setup, this would need to be dynamic.
-        self.nic_id = 1;
+        self.nic_id = s.allocNicId();
 
         // 1. Init Driver
         switch (cfg.driver) {

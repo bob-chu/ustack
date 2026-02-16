@@ -541,6 +541,7 @@ pub const Stack = struct {
     cluster_pool: buffer.ClusterPool,
     ephemeral_port: u16,
     tcp_msl: u64 = 30000,
+    next_nic_id: tcpip.NICID = 1,
 
     pub const AddressContext = struct {
         pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
@@ -566,7 +567,14 @@ pub const Stack = struct {
             .cluster_pool = cluster_pool,
             .ephemeral_port = 32768,
             .tcp_msl = 30000,
+            .next_nic_id = 1,
         };
+    }
+
+    pub fn allocNicId(self: *Stack) tcpip.NICID {
+        const id = self.next_nic_id;
+        self.next_nic_id += 1;
+        return id;
     }
 
     pub fn deinit(self: *Stack) void {
