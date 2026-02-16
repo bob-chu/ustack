@@ -23,6 +23,10 @@ test "AfXdp basic properties" {
         .view_pool = undefined,
         .header_pool = undefined,
         .frame_manager = undefined,
+        .fill_map_slice = undefined,
+        .comp_map_slice = undefined,
+        .rx_map_slice = undefined,
+        .tx_map_slice = undefined,
     };
 
     try std.testing.expectEqual(@as(u32, 1500), xdp.mtu_val);
