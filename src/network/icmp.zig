@@ -60,28 +60,103 @@ pub const ICMPv4PacketHandler = struct {
         const v = mut_pkt.data.first() orelse return;
         var h = header.ICMPv4.init(v);
 
-        if (h.@"type"() == header.ICMPv4EchoType) {
-            const payload = mut_pkt.data.toView(s.allocator) catch return;
-            defer s.allocator.free(payload);
+        switch (h.type()) {
+            header.ICMPv4EchoType => {
+                const payload = mut_pkt.data.toView(s.allocator) catch return;
+                defer s.allocator.free(payload);
 
-            var reply_hdr = [_]u8{0} ** header.ICMPv4MinimumSize;
-            @memcpy(&reply_hdr, payload[0..header.ICMPv4MinimumSize]);
-            var reply_h = header.ICMPv4.init(&reply_hdr);
-            reply_h.data[0] = header.ICMPv4EchoReplyType;
-            reply_h.setChecksum(0);
-            const c = reply_h.calculateChecksum(payload[header.ICMPv4MinimumSize..]);
-            reply_h.setChecksum(c);
+                var reply_hdr = [_]u8{0} ** header.ICMPv4MinimumSize;
+                @memcpy(&reply_hdr, payload[0..header.ICMPv4MinimumSize]);
+                var reply_h = header.ICMPv4.init(&reply_hdr);
+                reply_h.data[0] = header.ICMPv4EchoReplyType;
+                reply_h.setChecksum(0);
+                const c = reply_h.calculateChecksum(payload[header.ICMPv4MinimumSize..]);
+                reply_h.setChecksum(c);
 
-            var views = [_]buffer.ClusterView{.{ .cluster = null, .view = payload[header.ICMPv4MinimumSize..] }};
-            const reply_pkt = tcpip.PacketBuffer{
-                .data = buffer.VectorisedView.init(payload.len - header.ICMPv4MinimumSize, &views),
-                .header = buffer.Prependable.initFull(&reply_hdr),
-            };
+                var views = [_]buffer.ClusterView{.{ .cluster = null, .view = payload[header.ICMPv4MinimumSize..] }};
+                const reply_pkt = tcpip.PacketBuffer{
+                    .data = buffer.VectorisedView.init(payload.len - header.ICMPv4MinimumSize, &views),
+                    .header = buffer.Prependable.initFull(&reply_hdr),
+                };
 
-            var reply_route = r.*;
-            if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
-                ip_ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
-            }
+                var reply_route = r.*;
+                if (r.nic.network_endpoints.get(0x0800)) |ip_ep| {
+                    ip_ep.writePacket(&reply_route, ProtocolNumber, reply_pkt) catch {};
+                }
+            },
+            3 => { // Destination Unreachable
+                handleDestUnreachable(s, v);
+            },
+            11 => { // Time Exceeded
+                handleTimeExceeded(s, v);
+            },
+            else => {},
+        }
+    }
+
+    /// Handle ICMP Destination Unreachable (Type 3).
+    /// Extracts the embedded IP header + first 8 bytes of transport header
+    /// to identify and notify the affected transport endpoint.
+    fn handleDestUnreachable(s: *stack.Stack, data: []const u8) void {
+        // ICMP header (8 bytes) + original IP header (≥20 bytes) + first 8 bytes of transport
+        if (data.len < header.ICMPv4MinimumSize + header.IPv4MinimumSize + 8) return;
+
+        const embedded_ip = data[header.ICMPv4MinimumSize..];
+        const embedded_h = header.IPv4.init(embedded_ip);
+        const protocol = embedded_h.protocol();
+        const src_addr = tcpip.Address{ .v4 = embedded_h.sourceAddress() };
+        const dst_addr = tcpip.Address{ .v4 = embedded_h.destinationAddress() };
+
+        // First 8 bytes after IP header = src_port (2) + dst_port (2) + ... (4)
+        const transport_data = embedded_ip[embedded_h.headerLength()..];
+        if (transport_data.len < 8) return;
+
+        const src_port = std.mem.readInt(u16, transport_data[0..2], .big);
+        const dst_port = std.mem.readInt(u16, transport_data[2..4], .big);
+
+        const id = stack.TransportEndpointID{
+            .local_port = src_port,
+            .local_address = src_addr,
+            .remote_port = dst_port,
+            .remote_address = dst_addr,
+            .transport_protocol = protocol,
+        };
+
+        // Notify the transport endpoint of the error
+        if (s.endpoints.get(id)) |ep| {
+            defer ep.decRef();
+            ep.notify(waiter.EventErr);
+        }
+    }
+
+    /// Handle ICMP Time Exceeded (Type 11).
+    /// Same structure as Destination Unreachable — extract embedded IP + ports.
+    fn handleTimeExceeded(s: *stack.Stack, data: []const u8) void {
+        if (data.len < header.ICMPv4MinimumSize + header.IPv4MinimumSize + 8) return;
+
+        const embedded_ip = data[header.ICMPv4MinimumSize..];
+        const embedded_h = header.IPv4.init(embedded_ip);
+        const protocol = embedded_h.protocol();
+        const src_addr = tcpip.Address{ .v4 = embedded_h.sourceAddress() };
+        const dst_addr = tcpip.Address{ .v4 = embedded_h.destinationAddress() };
+
+        const transport_data = embedded_ip[embedded_h.headerLength()..];
+        if (transport_data.len < 8) return;
+
+        const src_port = std.mem.readInt(u16, transport_data[0..2], .big);
+        const dst_port = std.mem.readInt(u16, transport_data[2..4], .big);
+
+        const id = stack.TransportEndpointID{
+            .local_port = src_port,
+            .local_address = src_addr,
+            .remote_port = dst_port,
+            .remote_address = dst_addr,
+            .transport_protocol = protocol,
+        };
+
+        if (s.endpoints.get(id)) |ep| {
+            defer ep.decRef();
+            ep.notify(waiter.EventErr);
         }
     }
 };
