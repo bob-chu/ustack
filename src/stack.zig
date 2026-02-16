@@ -382,6 +382,7 @@ pub const Route = struct {
     net_proto: tcpip.NetworkProtocolNumber,
     nic: *NIC,
     route_entry: ?*const RouteEntry = null,
+    generation: u64 = 0,
 
     pub fn writePacket(self: *Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         // Determine next hop (gateway if route has one, otherwise destination)
@@ -551,6 +552,7 @@ pub const Stack = struct {
     arp_confirmed_ttl: i64 = 60_000, // 60s for confirmed entries (Linux default)
     arp_unconfirmed_ttl: i64 = 3_000, // 3s for unconfirmed entries (Linux default)
     arp_gc_timer: time.Timer = undefined,
+    route_generation: u64 = 0,
 
     pub const AddressContext = struct {
         pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
@@ -577,6 +579,7 @@ pub const Stack = struct {
             .ephemeral_port = 32768,
             .tcp_msl = 30000,
             .next_nic_id = 1,
+            .route_generation = 0,
         };
     }
 
@@ -711,6 +714,7 @@ pub const Stack = struct {
     }
 
     // Find route using longest-prefix matching in routing table
+    // Find route using longest-prefix matching in routing table
     pub fn findRoute(self: *Stack, nic_id: tcpip.NICID, local_addr: tcpip.Address, remote_addr: tcpip.Address, net_proto: tcpip.NetworkProtocolNumber) !Route {
         if (nic_id != 0) {
             const nic_opt = self.nics.get(nic_id);
@@ -728,6 +732,7 @@ pub const Stack = struct {
                 .nic = nic,
                 .next_hop = null,
                 .route_entry = null,
+                .generation = self.route_generation,
             };
         }
 
@@ -760,12 +765,14 @@ pub const Stack = struct {
             .nic = nic,
             .next_hop = if (next_hop.isAny()) null else next_hop,
             .route_entry = route_entry,
+            .generation = self.route_generation,
         };
     }
 
     // Add a route to the routing table
     pub fn addRoute(self: *Stack, route: RouteEntry) !void {
         try self.route_table.addRoute(route);
+        self.route_generation += 1;
     }
 
     // Set entire route table (replaces existing)
@@ -774,11 +781,14 @@ pub const Stack = struct {
         for (routes) |route| {
             try self.route_table.routes.append(route);
         }
+        self.route_generation += 1;
     }
 
     // Remove routes matching a predicate
     pub fn removeRoutes(self: *Stack, match: *const fn (route: RouteEntry) bool) usize {
-        return self.route_table.removeRoutes(match);
+        const removed = self.route_table.removeRoutes(match);
+        if (removed > 0) self.route_generation += 1;
+        return removed;
     }
 
     pub fn getRouteTable(self: *Stack) []const RouteEntry {

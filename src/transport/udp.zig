@@ -440,7 +440,11 @@ pub const UDPEndpoint = struct {
             .v6 => @as(u16, 0x86dd),
         };
 
-        if (self.cached_route == null or !self.cached_route.?.remote_address.eq(to.addr) or self.cached_route.?.net_proto != net_proto) {
+        if (self.cached_route == null or
+            !self.cached_route.?.remote_address.eq(to.addr) or
+            self.cached_route.?.net_proto != net_proto or
+            self.cached_route.?.generation != self.stack.route_generation)
+        {
             self.cached_route = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
         }
 
@@ -448,8 +452,8 @@ pub const UDPEndpoint = struct {
         const next_hop = r.next_hop orelse to.addr;
 
         if (r.remote_link_address == null) {
-            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
-                r.remote_link_address = link_addr;
+            if (self.stack.link_addr_cache.get(next_hop)) |entry| {
+                r.remote_link_address = entry.link_addr;
             } else {
                 if (!self.retry_timer.active) {
                     self.stack.timer_queue.schedule(&self.retry_timer, 10);
