@@ -677,7 +677,7 @@ pub const TCPEndpoint = struct {
         const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
         const net_proto: u16 = if (ra.addr == .v4) 0x0800 else 0x86dd;
 
-        if (self.cached_route == null or self.cached_route.?.net_proto != net_proto) {
+        if (self.cached_route == null or self.cached_route.?.net_proto != net_proto or self.cached_route.?.generation != self.stack.route_generation) {
             self.cached_route = try self.stack.findRoute(ra.nic, la.addr, ra.addr, net_proto);
         }
         const r = &self.cached_route.?;
@@ -957,15 +957,15 @@ pub const TCPEndpoint = struct {
                 const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
                 const ra = self.remote_addr orelse return tcpip.Error.InvalidEndpointState;
                 const net_proto: u16 = if (ra.addr == .v4) 0x0800 else 0x86dd;
-                if (self.cached_route == null or self.cached_route.?.net_proto != net_proto) {
+                if (self.cached_route == null or self.cached_route.?.net_proto != net_proto or self.cached_route.?.generation != self.stack.route_generation) {
                     self.cached_route = try self.stack.findRoute(ra.nic, la.addr, ra.addr, net_proto);
                 }
                 var r = self.cached_route.?;
                 const next_hop = r.next_hop orelse ra.addr;
                 if (r.remote_link_address == null) {
-                    if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
-                        r.remote_link_address = link_addr;
-                        self.cached_route.?.remote_link_address = link_addr;
+                    if (self.stack.link_addr_cache.get(next_hop)) |entry| {
+                        r.remote_link_address = entry.link_addr;
+                        self.cached_route.?.remote_link_address = entry.link_addr;
                     }
                 }
                 const hdr_buf = self.proto.header_pool.acquire() catch return;
