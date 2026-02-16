@@ -210,7 +210,7 @@ pub fn main() !void {
     var s = try ustack.init(allocator);
     global_stack = &s;
 
-    var tap = try ustack.drivers.tap.Tap.init("tap_mux");
+    var tap = try ustack.drivers.tap.Tap.init(allocator, "tap_mux");
     global_tap = &tap;
 
     // Set interface UP and IP (Gateway) from program

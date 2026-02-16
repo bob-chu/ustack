@@ -159,9 +159,11 @@ pub const TransportEndpointID = struct {
     local_address: tcpip.Address,
     remote_port: u16,
     remote_address: tcpip.Address,
+    transport_protocol: tcpip.TransportProtocolNumber = 0,
 
     pub fn hash(self: TransportEndpointID) u64 {
         var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&self.transport_protocol));
         h.update(std.mem.asBytes(&self.local_port));
         switch (self.local_address) {
             .v4 => |v| h.update(&v),
@@ -176,7 +178,8 @@ pub const TransportEndpointID = struct {
     }
 
     pub fn eq(self: TransportEndpointID, other: TransportEndpointID) bool {
-        return self.local_port == other.local_port and
+        return self.transport_protocol == other.transport_protocol and
+            self.local_port == other.local_port and
             self.local_address.eq(other.local_address) and
             self.remote_port == other.remote_port and
             self.remote_address.eq(other.remote_address);
@@ -379,6 +382,7 @@ pub const Route = struct {
     net_proto: tcpip.NetworkProtocolNumber,
     nic: *NIC,
     route_entry: ?*const RouteEntry = null,
+    generation: u64 = 0,
 
     pub fn writePacket(self: *Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
         // Determine next hop (gateway if route has one, otherwise destination)
@@ -526,11 +530,17 @@ pub const TransportTable = struct {
     }
 };
 
+pub const LinkCacheEntry = struct {
+    link_addr: tcpip.LinkAddress,
+    timestamp: i64, // milliTimestamp() when entry was last confirmed
+    confirmed: bool = false, // true = solicited reply or traffic seen from this host
+};
+
 pub const Stack = struct {
     allocator: std.mem.Allocator,
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
     endpoints: TransportTable,
-    link_addr_cache: std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80),
+    link_addr_cache: std.HashMap(tcpip.Address, LinkCacheEntry, AddressContext, 80),
     transport_protocols: std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol),
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
@@ -538,6 +548,11 @@ pub const Stack = struct {
     cluster_pool: buffer.ClusterPool,
     ephemeral_port: u16,
     tcp_msl: u64 = 30000,
+    next_nic_id: tcpip.NICID = 1,
+    arp_confirmed_ttl: i64 = 60_000, // 60s for confirmed entries (Linux default)
+    arp_unconfirmed_ttl: i64 = 3_000, // 3s for unconfirmed entries (Linux default)
+    arp_gc_timer: time.Timer = undefined,
+    route_generation: u64 = 0,
 
     pub const AddressContext = struct {
         pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
@@ -555,7 +570,7 @@ pub const Stack = struct {
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
             .endpoints = TransportTable.init(allocator),
-            .link_addr_cache = std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80).init(allocator),
+            .link_addr_cache = std.HashMap(tcpip.Address, LinkCacheEntry, AddressContext, 80).init(allocator),
             .transport_protocols = std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol).init(allocator),
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
@@ -563,7 +578,15 @@ pub const Stack = struct {
             .cluster_pool = cluster_pool,
             .ephemeral_port = 32768,
             .tcp_msl = 30000,
+            .next_nic_id = 1,
+            .route_generation = 0,
         };
+    }
+
+    pub fn allocNicId(self: *Stack) tcpip.NICID {
+        const id = self.next_nic_id;
+        self.next_nic_id += 1;
+        return id;
     }
 
     pub fn deinit(self: *Stack) void {
@@ -613,19 +636,35 @@ pub const Stack = struct {
     }
 
     pub fn getLinkAddress(self: *Stack, addr: tcpip.Address) ?tcpip.LinkAddress {
-        return self.link_addr_cache.get(addr);
+        const entry = self.link_addr_cache.get(addr) orelse return null;
+        return entry.link_addr;
     }
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
         var is_new = false;
         if (self.link_addr_cache.get(addr)) |prev| {
-            if (prev.eq(link_addr)) return;
+            if (prev.link_addr.eq(link_addr)) {
+                // Same MAC — just refresh timestamp
+                const entry_ptr = self.link_addr_cache.getPtr(addr).?;
+                entry_ptr.timestamp = std.time.milliTimestamp();
+                entry_ptr.confirmed = true;
+                return;
+            }
         } else {
             is_new = true;
         }
-        try self.link_addr_cache.put(addr, link_addr);
+        try self.link_addr_cache.put(addr, .{
+            .link_addr = link_addr,
+            .timestamp = std.time.milliTimestamp(),
+            .confirmed = true,
+        });
 
-        // Only notify if this is a NEW address or it CHANGED.
+        // Start GC timer if first entry
+        if (self.link_addr_cache.count() == 1) {
+            self.arp_gc_timer = time.Timer.init(arpGcTimer, self);
+            self.timer_queue.schedule(&self.arp_gc_timer, 10_000);
+        }
+
         if (is_new) {
             for (&self.endpoints.shards) |*shard| {
                 var it = shard.valueIterator();
@@ -633,6 +672,22 @@ pub const Stack = struct {
                     ep.notify(waiter.EventOut);
                 }
             }
+        }
+    }
+
+    fn arpGcTimer(ptr: *anyopaque) void {
+        const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
+        const now = std.time.milliTimestamp();
+        var it = self.link_addr_cache.iterator();
+        while (it.next()) |entry| {
+            const ttl = if (entry.value_ptr.confirmed) self.arp_confirmed_ttl else self.arp_unconfirmed_ttl;
+            if (now - entry.value_ptr.timestamp >= ttl) {
+                self.link_addr_cache.removeByPtr(entry.key_ptr);
+            }
+        }
+        // Reschedule if cache not empty
+        if (self.link_addr_cache.count() > 0) {
+            self.timer_queue.schedule(&self.arp_gc_timer, 10_000); // Every 10s
         }
     }
 
@@ -659,11 +714,12 @@ pub const Stack = struct {
     }
 
     // Find route using longest-prefix matching in routing table
+    // Find route using longest-prefix matching in routing table
     pub fn findRoute(self: *Stack, nic_id: tcpip.NICID, local_addr: tcpip.Address, remote_addr: tcpip.Address, net_proto: tcpip.NetworkProtocolNumber) !Route {
         if (nic_id != 0) {
             const nic_opt = self.nics.get(nic_id);
             const next_hop = remote_addr;
-            const link_addr_opt = self.link_addr_cache.get(next_hop);
+            const link_addr_opt = if (self.link_addr_cache.get(next_hop)) |entry| entry.link_addr else null;
 
             const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
@@ -676,6 +732,7 @@ pub const Stack = struct {
                 .nic = nic,
                 .next_hop = null,
                 .route_entry = null,
+                .generation = self.route_generation,
             };
         }
 
@@ -684,7 +741,7 @@ pub const Stack = struct {
 
         const nic_opt = self.nics.get(route_entry.nic);
         const next_hop = route_entry.gateway;
-        const link_addr_opt = if (next_hop.isAny()) self.link_addr_cache.get(remote_addr) else self.link_addr_cache.get(next_hop);
+        const link_addr_opt = if (next_hop.isAny()) (if (self.link_addr_cache.get(remote_addr)) |entry| entry.link_addr else null) else (if (self.link_addr_cache.get(next_hop)) |entry| entry.link_addr else null);
 
         const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
@@ -708,12 +765,14 @@ pub const Stack = struct {
             .nic = nic,
             .next_hop = if (next_hop.isAny()) null else next_hop,
             .route_entry = route_entry,
+            .generation = self.route_generation,
         };
     }
 
     // Add a route to the routing table
     pub fn addRoute(self: *Stack, route: RouteEntry) !void {
         try self.route_table.addRoute(route);
+        self.route_generation += 1;
     }
 
     // Set entire route table (replaces existing)
@@ -722,11 +781,14 @@ pub const Stack = struct {
         for (routes) |route| {
             try self.route_table.routes.append(route);
         }
+        self.route_generation += 1;
     }
 
     // Remove routes matching a predicate
     pub fn removeRoutes(self: *Stack, match: *const fn (route: RouteEntry) bool) usize {
-        return self.route_table.removeRoutes(match);
+        const removed = self.route_table.removeRoutes(match);
+        if (removed > 0) self.route_generation += 1;
+        return removed;
     }
 
     pub fn getRouteTable(self: *Stack) []const RouteEntry {
@@ -777,6 +839,7 @@ pub const Stack = struct {
             .local_address = r.local_address,
             .remote_port = ports.src,
             .remote_address = r.remote_address,
+            .transport_protocol = protocol,
         };
 
         const ep_opt = self.endpoints.get(id);
@@ -800,6 +863,7 @@ pub const Stack = struct {
                     .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                     .v6 => .{ .v6 = [_]u8{0} ** 16 },
                 },
+                .transport_protocol = protocol,
             };
 
             const listener_opt = self.endpoints.get(listener_id);
@@ -822,6 +886,7 @@ pub const Stack = struct {
                         .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                         .v6 => .{ .v6 = [_]u8{0} ** 16 },
                     },
+                    .transport_protocol = protocol,
                 };
 
                 if (self.endpoints.get(any_id)) |ep| {
@@ -829,6 +894,8 @@ pub const Stack = struct {
                     ep.decRef();
                 } else {
                     if (protocol == 17) {
+                        stats.global_stats.udp.no_port += 1;
+                        stats.global_stats.udp.dropped_packets += 1;
                         log.warn("Stack: No endpoint for UDP port {}. Looked for exact: {}, listener: {}, any: {}", .{ ports.dst, id.hash(), listener_id.hash(), any_id.hash() });
                         log.debug("Exact: local={any}:{} remote={any}:{}", .{ id.local_address, id.local_port, id.remote_address, id.remote_port });
                         log.debug("Any: local={any}:{} remote={any}:{}", .{ any_id.local_address, any_id.local_port, any_id.remote_address, any_id.remote_port });
@@ -1033,6 +1100,7 @@ test "Stack Transport Demux" {
         .local_address = .{ .v4 = .{ 127, 0, 0, 1 } },
         .remote_port = 1234,
         .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } },
+        .transport_protocol = 17,
     };
     try s.registerTransportEndpoint(id, ep);
 

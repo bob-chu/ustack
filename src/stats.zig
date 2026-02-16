@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const StackStats = struct {
     ip: IPStats = .{},
+    udp: UDPStats = .{},
     tcp: TCPStats = .{},
     arp: ARPStats = .{},
     latency: LatencyStats = .{},
@@ -9,6 +10,7 @@ pub const StackStats = struct {
 
     pub fn reset(self: *StackStats) void {
         self.ip = .{};
+        self.udp = .{};
         self.tcp = .{};
         self.arp = .{};
         self.latency = .{};
@@ -21,6 +23,8 @@ pub const StackStats = struct {
         std.debug.print("  Rx: {d}, Tx: {d}, Dropped: {d}\n", .{ self.ip.rx_packets, self.ip.tx_packets, self.ip.dropped_packets });
         std.debug.print("ARP:\n", .{});
         std.debug.print("  Rx Req: {d}, Rx Rep: {d}, Tx Req: {d}, Tx Rep: {d}\n", .{ self.arp.rx_requests, self.arp.rx_replies, self.arp.tx_requests, self.arp.tx_replies });
+        std.debug.print("UDP:\n", .{});
+        std.debug.print("  Rx: {d}, Tx: {d}, Dropped: {d}, NoPort: {d}\n", .{ self.udp.rx_packets, self.udp.tx_packets, self.udp.dropped_packets, self.udp.no_port });
         std.debug.print("TCP:\n", .{});
         std.debug.print("  Rx Seg: {d}, Tx Seg: {d}, Retrans: {d}\n", .{ self.tcp.rx_segments, self.tcp.tx_segments, self.tcp.retransmits });
         std.debug.print("  Active: {d}, Passive: {d}, Failed: {d}, Resets: {d}, ActiveEP: {d}, PoolEx: {d}, SynDrop: {d}\n", .{ self.tcp.active_opens, self.tcp.passive_opens, self.tcp.failed_connections, self.tcp.resets_sent, self.tcp.active_endpoints, self.tcp.pool_exhausted, self.tcp.syncache_dropped });
@@ -98,6 +102,13 @@ pub const IPStats = struct {
     dropped_packets: usize = 0,
     invalid_checksum: usize = 0,
     no_route: usize = 0,
+};
+
+pub const UDPStats = struct {
+    rx_packets: usize = 0,
+    tx_packets: usize = 0,
+    dropped_packets: usize = 0,
+    no_port: usize = 0,
 };
 
 pub const TCPStats = struct {

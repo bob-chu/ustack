@@ -67,6 +67,7 @@ test "TCP 2MSL TIME_WAIT Expiration" {
         .local_address = ca.addr,
         .remote_port = sa.port,
         .remote_address = sa.addr,
+        .transport_protocol = 6,
     };
     try s.registerTransportEndpoint(id, ep_client.transportEndpoint());
 
@@ -150,6 +151,7 @@ test "TCP RFC 1337 RST in TIME_WAIT" {
         .local_address = ca.addr,
         .remote_port = sa.port,
         .remote_address = sa.addr,
+        .transport_protocol = 6,
     };
     try s.registerTransportEndpoint(id, ep_client.transportEndpoint());
     s.timer_queue.schedule(&ep_client.time_wait_timer, 60000);

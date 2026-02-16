@@ -526,7 +526,7 @@ test "POSIX upoll basic" {
     // Inject packet to make it readable
     const udp_ep = @as(*@import("transport/udp.zig").UDPEndpoint, @ptrCast(@alignCast(sock.endpoint.ptr)));
     const r = stack.Route{ .local_address = .{ .v4 = .{ 127, 0, 0, 1 } }, .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } }, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = s.nics.get(1).? };
-    const id = stack.TransportEndpointID{ .local_port = 0, .local_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .remote_port = 1234, .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } } };
+    const id = stack.TransportEndpointID{ .local_port = 0, .local_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .remote_port = 1234, .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } }, .transport_protocol = 17 };
 
     // We need to bind first to receive? UDP handlePacket doesn't check bind if injected directly to EP logic?
     // Wait, we need to inject to the endpoint instance.

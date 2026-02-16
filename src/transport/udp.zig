@@ -152,6 +152,7 @@ pub const UDPEndpoint = struct {
                 .local_address = la.addr,
                 .remote_port = ra.port,
                 .remote_address = ra.addr,
+                .transport_protocol = ProtocolNumber,
             };
             self.stack.unregisterTransportEndpoint(id);
         }
@@ -176,6 +177,7 @@ pub const UDPEndpoint = struct {
                     .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                     .v6 => .{ .v6 = [_]u8{0} ** 16 },
                 },
+                .transport_protocol = ProtocolNumber,
             };
             self.stack.unregisterTransportEndpoint(id);
         }
@@ -208,32 +210,44 @@ pub const UDPEndpoint = struct {
         h.setLength(@as(u16, @intCast(header.UDPMinimumSize + data.size)));
         h.setChecksum(0);
 
-        // Benchmark optimization: Skip software checksum calculation for IPv4 UDP
-        // IPv4 UDP checksum is optional and can be 0.
-        // if (local_address.addr == .v4 and r.remote_address == .v4) {
-        //     var sum: u32 = 0;
-        //     const src = local_address.addr.v4;
-        //     const dst = r.remote_address.v4;
-        //     sum += std.mem.readInt(u16, src[0..2], .big);
-        //     sum += std.mem.readInt(u16, src[2..4], .big);
-        //     sum += std.mem.readInt(u16, dst[0..2], .big);
-        //     sum += std.mem.readInt(u16, dst[2..4], .big);
-        //     sum += 17; // UDP
-        //     sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
-        //
-        //     sum = header.internetChecksum(h.data, sum);
-        //     for (data.views) |v| {
-        //         sum = header.internetChecksum(v.view, sum);
-        //     }
-        //     const csum = header.finishChecksum(sum);
-        //     h.setChecksum(if (csum == 0) 0xffff else csum);
-        // }
+        // Compute UDP checksum (mandatory for IPv6 per RFC 2460, recommended for IPv4)
+        {
+            var sum: u32 = 0;
+            switch (local_address.addr) {
+                .v4 => |src| {
+                    const dst = r.remote_address.v4;
+                    sum += std.mem.readInt(u16, src[0..2], .big);
+                    sum += std.mem.readInt(u16, src[2..4], .big);
+                    sum += std.mem.readInt(u16, dst[0..2], .big);
+                    sum += std.mem.readInt(u16, dst[2..4], .big);
+                    sum += 17; // UDP protocol number in pseudo-header
+                },
+                .v6 => |src| {
+                    const dst = r.remote_address.v6;
+                    var i: usize = 0;
+                    while (i < 16) : (i += 2) {
+                        sum += std.mem.readInt(u16, src[i..][0..2], .big);
+                        sum += std.mem.readInt(u16, dst[i..][0..2], .big);
+                    }
+                    sum += 17; // UDP protocol number
+                },
+            }
+            sum += @as(u16, @intCast(header.UDPMinimumSize + data.size));
+
+            sum = header.internetChecksum(h.data, sum);
+            for (data.views) |v| {
+                sum = header.internetChecksum(v.view, sum);
+            }
+            const csum = header.finishChecksum(sum);
+            h.setChecksum(if (csum == 0) 0xffff else csum);
+        }
 
         const pb = tcpip.PacketBuffer{
             .data = data,
             .header = pre,
         };
 
+        stats.global_stats.udp.tx_packets += 1;
         return r.writePacket(ProtocolNumber, pb);
     }
 
@@ -249,14 +263,20 @@ pub const UDPEndpoint = struct {
         const self = @as(*UDPEndpoint, @ptrCast(@alignCast(ptr)));
         var mut_pkt = pkt;
 
+        stats.global_stats.udp.rx_packets += 1;
+
         const h = header.UDP.init(mut_pkt.data.first() orelse return);
         mut_pkt.data.trimFront(header.UDPMinimumSize);
 
         // We MUST clone the data because the underlying views (from onReadable)
         // are stack-allocated or temporary and will be invalid after this function returns.
-        const cloned_data = mut_pkt.data.cloneInPool(&self.proto.view_pool) catch return;
+        const cloned_data = mut_pkt.data.cloneInPool(&self.proto.view_pool) catch {
+            stats.global_stats.udp.dropped_packets += 1;
+            return;
+        };
 
         const node = self.proto.packet_node_pool.acquire() catch {
+            stats.global_stats.udp.dropped_packets += 1;
             var tmp = cloned_data;
             tmp.deinit();
             return;
@@ -318,6 +338,10 @@ pub const UDPEndpoint = struct {
             .ts_enabled => {},
             .reuse_address => {},
             .congestion_control => {},
+            .keepalive_enabled => {},
+            .tcp_keepidle => {},
+            .tcp_keepintvl => {},
+            .tcp_keepcnt => {},
         }
         return;
     }
@@ -328,6 +352,10 @@ pub const UDPEndpoint = struct {
             .ts_enabled => .{ .ts_enabled = false },
             .reuse_address => .{ .reuse_address = false },
             .congestion_control => .{ .congestion_control = .new_reno },
+            .keepalive_enabled => .{ .keepalive_enabled = false },
+            .tcp_keepidle => .{ .tcp_keepidle = 0 },
+            .tcp_keepintvl => .{ .tcp_keepintvl = 0 },
+            .tcp_keepcnt => .{ .tcp_keepcnt = 0 },
         };
     }
 
@@ -412,7 +440,11 @@ pub const UDPEndpoint = struct {
             .v6 => @as(u16, 0x86dd),
         };
 
-        if (self.cached_route == null or !self.cached_route.?.remote_address.eq(to.addr) or self.cached_route.?.net_proto != net_proto) {
+        if (self.cached_route == null or
+            !self.cached_route.?.remote_address.eq(to.addr) or
+            self.cached_route.?.net_proto != net_proto or
+            self.cached_route.?.generation != self.stack.route_generation)
+        {
             self.cached_route = try self.stack.findRoute(to.nic, local_addr.addr, to.addr, net_proto);
         }
 
@@ -420,8 +452,8 @@ pub const UDPEndpoint = struct {
         const next_hop = r.next_hop orelse to.addr;
 
         if (r.remote_link_address == null) {
-            if (self.stack.link_addr_cache.get(next_hop)) |link_addr| {
-                r.remote_link_address = link_addr;
+            if (self.stack.link_addr_cache.get(next_hop)) |entry| {
+                r.remote_link_address = entry.link_addr;
             } else {
                 if (!self.retry_timer.active) {
                     self.stack.timer_queue.schedule(&self.retry_timer, 10);
@@ -466,7 +498,15 @@ pub const UDPEndpoint = struct {
                 .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
                 .v6 => .{ .v6 = [_]u8{0} ** 16 },
             },
+            .transport_protocol = ProtocolNumber,
         };
+
+        // Check for existing endpoint on this port
+        if (self.stack.endpoints.get(id)) |existing_ep| {
+            existing_ep.decRef();
+            self.local_addr = null;
+            return tcpip.Error.AddressInUse;
+        }
 
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
     }
@@ -582,6 +622,7 @@ test "UDP handlePacket" {
         .local_address = r.local_address,
         .remote_port = 1234,
         .remote_address = r.remote_address,
+        .transport_protocol = ProtocolNumber,
     };
 
     ep.transportEndpoint().handlePacket(&r, id, pkt);

@@ -4,26 +4,32 @@ const tcpip = @import("../../tcpip.zig");
 const header = @import("../../header.zig");
 const buffer = @import("../../buffer.zig");
 const log = @import("../../log.zig").scoped(.tap);
+const stats = @import("../../stats.zig");
 
 extern fn my_tuntap_init(fd: i32, name: [*:0]const u8) i32;
 
 /// A LinkEndpoint implementation for Linux TUN/TAP devices.
 pub const Tap = struct {
     fd: std.posix.fd_t,
+    allocator: std.mem.Allocator,
     mtu_val: u32 = 1500,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 } }, // Default fake MAC
 
     // To be set by stack.NIC.attach()
     dispatcher: ?*stack.NetworkDispatcher = null,
+    cluster_pool: ?*buffer.ClusterPool = null,
+    view_pool: buffer.BufferPool,
+    header_pool: buffer.BufferPool,
+    tx_buf: [16384]u8 = undefined, // Max jumbo frame + headers
 
     /// Initialize a TAP device by name (e.g., "tap0").
     /// Note: This requires CAP_NET_ADMIN privileges.
-    pub fn init(dev_name: []const u8) !Tap {
+    pub fn init(allocator: std.mem.Allocator, dev_name: []const u8) !Tap {
         const fd = try std.posix.open("/dev/net/tun", .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0);
 
         // Use C wrapper to avoid struct layout issues
-        const name_c = try std.heap.page_allocator.dupeZ(u8, dev_name);
-        defer std.heap.page_allocator.free(name_c);
+        const name_c = try allocator.dupeZ(u8, dev_name);
+        defer allocator.free(name_c);
 
         const rc = my_tuntap_init(fd, name_c);
         if (rc < 0) {
@@ -38,6 +44,9 @@ pub const Tap = struct {
 
         return Tap{
             .fd = fd,
+            .allocator = allocator,
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 4096),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 4096),
         };
     }
 
@@ -46,9 +55,12 @@ pub const Tap = struct {
 
     /// Initialize from an existing file descriptor.
     /// Useful if the FD is passed from a privileged parent process.
-    pub fn initFromFd(fd: std.posix.fd_t) Tap {
+    pub fn initFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) Tap {
         return Tap{
             .fd = fd,
+            .allocator = allocator,
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 4096),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 4096),
         };
     }
 
@@ -63,8 +75,16 @@ pub const Tap = struct {
                 .mtu = mtu,
                 .setMTU = setMTU,
                 .capabilities = capabilities,
+                .close = close,
             },
         };
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self = @as(*Tap, @ptrCast(@alignCast(ptr)));
+        self.view_pool.deinit();
+        self.header_pool.deinit();
+        std.posix.close(self.fd);
     }
 
     fn writePacket(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
@@ -72,21 +92,21 @@ pub const Tap = struct {
         _ = r;
         _ = protocol;
 
-        // We need to linearize the packet for write().
         const total_len = pkt.header.usedLength() + pkt.data.size;
+        if (total_len > self.tx_buf.len) return tcpip.Error.MessageTooLong;
 
-        var buf = std.heap.page_allocator.alloc(u8, total_len) catch return tcpip.Error.NoBufferSpace;
-        defer std.heap.page_allocator.free(buf);
-
+        // Copy header into tx_buf
         const hdr_len = pkt.header.usedLength();
-        @memcpy(buf[0..hdr_len], pkt.header.view());
+        @memcpy(self.tx_buf[0..hdr_len], pkt.header.view());
 
-        // Copy data
-        const view = pkt.data.toView(std.heap.page_allocator) catch return tcpip.Error.NoBufferSpace;
-        defer std.heap.page_allocator.free(view);
-        @memcpy(buf[hdr_len..], view);
+        // Copy data views directly (avoid toView allocation)
+        var offset: usize = hdr_len;
+        for (pkt.data.views) |v| {
+            @memcpy(self.tx_buf[offset..][0..v.view.len], v.view);
+            offset += v.view.len;
+        }
 
-        const rc = std.os.linux.write(self.fd, buf.ptr, buf.len);
+        const rc = std.os.linux.write(self.fd, &self.tx_buf, total_len);
         if (std.posix.errno(rc) != .SUCCESS) {
             log.err("writePacket failed: fd={}, rc={}, err={}", .{ self.fd, rc, std.posix.errno(rc) });
             return tcpip.Error.UnknownDevice;
@@ -96,6 +116,8 @@ pub const Tap = struct {
     fn attach(ptr: *anyopaque, dispatcher: *stack.NetworkDispatcher) void {
         const self = @as(*Tap, @ptrCast(@alignCast(ptr)));
         self.dispatcher = dispatcher;
+        const nic = @as(*stack.NIC, @ptrCast(@alignCast(dispatcher.ptr)));
+        self.cluster_pool = &nic.stack.cluster_pool;
     }
 
     fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {
@@ -119,25 +141,52 @@ pub const Tap = struct {
     }
 
     pub fn readPacket(self: *Tap) !bool {
-        var buf: [9000]u8 = undefined; // Support up to Jumbo
-        const len = std.posix.read(self.fd, &buf) catch |err| {
+        const cp = self.cluster_pool orelse return false;
+        const c = cp.acquire() catch {
+            stats.global_stats.pool.cluster_exhausted += 1;
+            return false;
+        };
+
+        const len = std.posix.read(self.fd, &c.data) catch |err| {
+            c.release();
             if (err == error.WouldBlock) return false;
             return err;
         };
-        if (len == 0) return false; // EOF
+        if (len == 0) {
+            c.release();
+            return false;
+        }
 
-        var views = [1]buffer.ClusterView{.{ .cluster = null, .view = buf[0..len] }};
-        const pkt = tcpip.PacketBuffer{
-            .data = buffer.VectorisedView.init(len, &views),
-            .header = buffer.Prependable.init(&[_]u8{}),
-            .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+        const h_buf = self.header_pool.acquire() catch {
+            c.release();
+            return false;
         };
 
+        const view_mem = self.view_pool.acquire() catch {
+            self.header_pool.release(h_buf);
+            c.release();
+            return false;
+        };
+        const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
+        original_views[0] = .{ .cluster = c, .view = c.data[0..len] };
+
+        const pkt = tcpip.PacketBuffer{
+            .data = buffer.VectorisedView.init(len, original_views[0..1]),
+            .header = buffer.Prependable.init(h_buf),
+            .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+        };
+        var mut_pkt = pkt;
+        mut_pkt.data.original_views = original_views;
+        mut_pkt.data.view_pool = &self.view_pool;
+
         if (self.dispatcher) |d| {
-            const dst_mac = tcpip.LinkAddress{ .addr = buf[0..6].* };
-            const src_mac = tcpip.LinkAddress{ .addr = buf[6..12].* };
-            d.deliverNetworkPacket(&src_mac, &dst_mac, 0, pkt);
+            const dst_mac = tcpip.LinkAddress{ .addr = c.data[0..6].* };
+            const src_mac = tcpip.LinkAddress{ .addr = c.data[6..12].* };
+            d.deliverNetworkPacket(&src_mac, &dst_mac, 0, mut_pkt);
         }
+
+        self.header_pool.release(h_buf);
+        mut_pkt.data.deinit();
 
         return true;
     }

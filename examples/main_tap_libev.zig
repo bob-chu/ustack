@@ -81,7 +81,7 @@ pub fn main() !void {
     var s = try ustack.init(allocator);
     global_stack = &s;
 
-    var tap = try ustack.drivers.tap.Tap.init("tap0");
+    var tap = try ustack.drivers.tap.Tap.init(allocator, "tap0");
     global_tap = &tap;
 
     var eth_ep = ustack.link.eth.EthernetEndpoint.init(tap.linkEndpoint(), tap.address);

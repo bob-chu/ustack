@@ -18,8 +18,8 @@ pub const Address = union(enum) {
 
     pub fn hash(self: Address) u64 {
         var h = std.hash.Wyhash.init(0);
-        const tag = std.meta.activeTag(self);
-        h.update(std.mem.asBytes(&tag));
+        const tag_val = @intFromEnum(std.meta.activeTag(self));
+        h.update(std.mem.asBytes(&tag_val));
         switch (self) {
             .v4 => |v| h.update(&v),
             .v6 => |v| h.update(&v),
@@ -212,12 +212,20 @@ pub const EndpointOptionType = enum {
     ts_enabled,
     reuse_address,
     congestion_control,
+    keepalive_enabled,
+    tcp_keepidle,
+    tcp_keepintvl,
+    tcp_keepcnt,
 };
 
 pub const EndpointOption = union(EndpointOptionType) {
     ts_enabled: bool,
     reuse_address: bool,
     congestion_control: CongestionControlAlgorithm,
+    keepalive_enabled: bool,
+    tcp_keepidle: u32,
+    tcp_keepintvl: u32,
+    tcp_keepcnt: u32,
 };
 
 pub const CongestionControlAlgorithm = enum {

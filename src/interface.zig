@@ -40,9 +40,7 @@ pub const NetworkInterface = struct {
         const self = try allocator.create(NetworkInterface);
         self.allocator = allocator;
         self.stack = s;
-        // Use a simple ID strategy: assume nic_id 1 is primary.
-        // In a real multi-nic setup, this would need to be dynamic.
-        self.nic_id = 1;
+        self.nic_id = s.allocNicId();
 
         // 1. Init Driver
         switch (cfg.driver) {
@@ -50,10 +48,10 @@ pub const NetworkInterface = struct {
                 self.driver = .{ .af_packet = try AfPacket.init(allocator, &s.cluster_pool, cfg.name) };
             },
             .af_xdp => {
-                self.driver = .{ .af_xdp = try AfXdp.init(allocator, cfg.name, cfg.queue_id) };
+                self.driver = .{ .af_xdp = try AfXdp.init(allocator, &s.cluster_pool, cfg.name, cfg.queue_id) };
             },
             .tap => {
-                self.driver = .{ .tap = try Tap.init(cfg.name) };
+                self.driver = .{ .tap = try Tap.init(allocator, cfg.name) };
             },
         }
 
@@ -89,7 +87,7 @@ pub const NetworkInterface = struct {
                 .v4 => 0x0800,
                 .v6 => 0x86dd,
             };
-            
+
             try nic.addAddress(.{
                 .protocol = protocol,
                 .address_with_prefix = .{ .address = addr, .prefix_len = cfg.prefix },
