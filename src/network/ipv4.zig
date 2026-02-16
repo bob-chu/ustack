@@ -186,7 +186,7 @@ pub const IPv4Endpoint = struct {
         var remote_link_address = r.remote_link_address;
         if (remote_link_address == null) {
             const next_hop = r.next_hop orelse r.remote_address;
-            remote_link_address = self.nic.stack.link_addr_cache.get(next_hop);
+            remote_link_address = if (self.nic.stack.link_addr_cache.get(next_hop)) |entry| entry.link_addr else null;
         }
 
         if (remote_link_address == null) {

@@ -529,11 +529,17 @@ pub const TransportTable = struct {
     }
 };
 
+pub const LinkCacheEntry = struct {
+    link_addr: tcpip.LinkAddress,
+    timestamp: i64, // milliTimestamp() when entry was last confirmed
+    confirmed: bool = false, // true = solicited reply or traffic seen from this host
+};
+
 pub const Stack = struct {
     allocator: std.mem.Allocator,
     nics: std.AutoHashMap(tcpip.NICID, *NIC),
     endpoints: TransportTable,
-    link_addr_cache: std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80),
+    link_addr_cache: std.HashMap(tcpip.Address, LinkCacheEntry, AddressContext, 80),
     transport_protocols: std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol),
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
@@ -542,6 +548,9 @@ pub const Stack = struct {
     ephemeral_port: u16,
     tcp_msl: u64 = 30000,
     next_nic_id: tcpip.NICID = 1,
+    arp_confirmed_ttl: i64 = 60_000, // 60s for confirmed entries (Linux default)
+    arp_unconfirmed_ttl: i64 = 3_000, // 3s for unconfirmed entries (Linux default)
+    arp_gc_timer: time.Timer = undefined,
 
     pub const AddressContext = struct {
         pub fn hash(_: AddressContext, key: tcpip.Address) u64 {
@@ -559,7 +568,7 @@ pub const Stack = struct {
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
             .endpoints = TransportTable.init(allocator),
-            .link_addr_cache = std.HashMap(tcpip.Address, tcpip.LinkAddress, AddressContext, 80).init(allocator),
+            .link_addr_cache = std.HashMap(tcpip.Address, LinkCacheEntry, AddressContext, 80).init(allocator),
             .transport_protocols = std.AutoHashMap(tcpip.TransportProtocolNumber, TransportProtocol).init(allocator),
             .network_protocols = std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol).init(allocator),
             .route_table = RouteTable.init(allocator),
@@ -624,19 +633,35 @@ pub const Stack = struct {
     }
 
     pub fn getLinkAddress(self: *Stack, addr: tcpip.Address) ?tcpip.LinkAddress {
-        return self.link_addr_cache.get(addr);
+        const entry = self.link_addr_cache.get(addr) orelse return null;
+        return entry.link_addr;
     }
 
     pub fn addLinkAddress(self: *Stack, addr: tcpip.Address, link_addr: tcpip.LinkAddress) !void {
         var is_new = false;
         if (self.link_addr_cache.get(addr)) |prev| {
-            if (prev.eq(link_addr)) return;
+            if (prev.link_addr.eq(link_addr)) {
+                // Same MAC — just refresh timestamp
+                const entry_ptr = self.link_addr_cache.getPtr(addr).?;
+                entry_ptr.timestamp = std.time.milliTimestamp();
+                entry_ptr.confirmed = true;
+                return;
+            }
         } else {
             is_new = true;
         }
-        try self.link_addr_cache.put(addr, link_addr);
+        try self.link_addr_cache.put(addr, .{
+            .link_addr = link_addr,
+            .timestamp = std.time.milliTimestamp(),
+            .confirmed = true,
+        });
 
-        // Only notify if this is a NEW address or it CHANGED.
+        // Start GC timer if first entry
+        if (self.link_addr_cache.count() == 1) {
+            self.arp_gc_timer = time.Timer.init(arpGcTimer, self);
+            self.timer_queue.schedule(&self.arp_gc_timer, 10_000);
+        }
+
         if (is_new) {
             for (&self.endpoints.shards) |*shard| {
                 var it = shard.valueIterator();
@@ -644,6 +669,22 @@ pub const Stack = struct {
                     ep.notify(waiter.EventOut);
                 }
             }
+        }
+    }
+
+    fn arpGcTimer(ptr: *anyopaque) void {
+        const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
+        const now = std.time.milliTimestamp();
+        var it = self.link_addr_cache.iterator();
+        while (it.next()) |entry| {
+            const ttl = if (entry.value_ptr.confirmed) self.arp_confirmed_ttl else self.arp_unconfirmed_ttl;
+            if (now - entry.value_ptr.timestamp >= ttl) {
+                self.link_addr_cache.removeByPtr(entry.key_ptr);
+            }
+        }
+        // Reschedule if cache not empty
+        if (self.link_addr_cache.count() > 0) {
+            self.timer_queue.schedule(&self.arp_gc_timer, 10_000); // Every 10s
         }
     }
 
@@ -674,7 +715,7 @@ pub const Stack = struct {
         if (nic_id != 0) {
             const nic_opt = self.nics.get(nic_id);
             const next_hop = remote_addr;
-            const link_addr_opt = self.link_addr_cache.get(next_hop);
+            const link_addr_opt = if (self.link_addr_cache.get(next_hop)) |entry| entry.link_addr else null;
 
             const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
@@ -695,7 +736,7 @@ pub const Stack = struct {
 
         const nic_opt = self.nics.get(route_entry.nic);
         const next_hop = route_entry.gateway;
-        const link_addr_opt = if (next_hop.isAny()) self.link_addr_cache.get(remote_addr) else self.link_addr_cache.get(next_hop);
+        const link_addr_opt = if (next_hop.isAny()) (if (self.link_addr_cache.get(remote_addr)) |entry| entry.link_addr else null) else (if (self.link_addr_cache.get(next_hop)) |entry| entry.link_addr else null);
 
         const nic = nic_opt orelse return tcpip.Error.UnknownNICID;
 
