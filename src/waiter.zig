@@ -102,29 +102,36 @@ pub const Queue = struct {
     pub fn notify(self: *Queue, mask: EventMask) void {
         self.ready_mask |= mask;
 
-        // Use a snapshot of entries to avoid issues with entries being
-        // added or removed during the notification loop.
-        // Increased size to 16k to handle high connection counts (e.g. 10k connections).
-        // Stack usage: 16384 * 8 bytes = 128 KB.
-        var snapshot: [16384]*Entry = undefined;
-        var count: usize = 0;
+        // Snapshot-and-iterate: callbacks may modify the list, so snapshot first.
+        // 256 entries = 2KB stack — safe for deep call chains.
+        // If queue exceeds 256 entries, we re-scan in batches.
+        const SNAPSHOT_SIZE = 256;
+        var snapshot: [SNAPSHOT_SIZE]*Entry = undefined;
 
-        var current = self.head;
-        while (current) |e| {
-            if (count >= 16384) break;
-            snapshot[count] = e;
-            count += 1;
-            current = e.next;
-        }
+        var remaining = true;
+        var scan_start: ?*Entry = self.head;
 
-        for (snapshot[0..count]) |e| {
-            // Check if the entry is still active and in the same queue.
-            // With Pool zeroing fix, this is safe against reuse.
-            if (!e.active or e.queue != self) continue;
+        while (remaining) {
+            var count: usize = 0;
+            var current = scan_start;
+            while (current) |e| {
+                if (count >= SNAPSHOT_SIZE) break;
+                snapshot[count] = e;
+                count += 1;
+                current = e.next;
+            }
 
-            if ((mask & e.mask) != 0) {
-                if (e.callback) |cb| {
-                    cb(e);
+            remaining = (current != null);
+            scan_start = current;
+
+            for (snapshot[0..count]) |e| {
+                // Check if the entry is still active and in the same queue.
+                if (!e.active or e.queue != self) continue;
+
+                if ((mask & e.mask) != 0) {
+                    if (e.callback) |cb| {
+                        cb(e);
+                    }
                 }
             }
         }
