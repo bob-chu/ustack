@@ -728,11 +728,23 @@ pub const TCPEndpoint = struct {
         if (self.state != .listen) return;
 
         const now = std.time.milliTimestamp();
+
+        // Phase 1: Collect expired keys (max 64 per GC cycle to bound stack usage)
+        var expired_keys: [64]SyncacheKey = undefined;
+        var expired_count: usize = 0;
+
         var it = self.syncache.iterator();
         while (it.next()) |entry| {
+            if (expired_count >= 64) break; // Process rest next cycle
             if (now - entry.value_ptr.created_at >= SYNCACHE_TIMEOUT_MS) {
-                self.syncache.removeByPtr(entry.key_ptr);
+                expired_keys[expired_count] = entry.key_ptr.*;
+                expired_count += 1;
             }
+        }
+
+        // Phase 2: Remove after iteration completes
+        for (expired_keys[0..expired_count]) |key| {
+            _ = self.syncache.remove(key);
         }
 
         if (self.state == .listen and self.syncache.count() > 0) {
