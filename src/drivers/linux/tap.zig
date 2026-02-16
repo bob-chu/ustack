@@ -20,6 +20,7 @@ pub const Tap = struct {
     cluster_pool: ?*buffer.ClusterPool = null,
     view_pool: buffer.BufferPool,
     header_pool: buffer.BufferPool,
+    tx_buf: [16384]u8 = undefined, // Max jumbo frame + headers
 
     /// Initialize a TAP device by name (e.g., "tap0").
     /// Note: This requires CAP_NET_ADMIN privileges.
@@ -91,21 +92,21 @@ pub const Tap = struct {
         _ = r;
         _ = protocol;
 
-        // We need to linearize the packet for write().
         const total_len = pkt.header.usedLength() + pkt.data.size;
+        if (total_len > self.tx_buf.len) return tcpip.Error.MessageTooLong;
 
-        var buf = std.heap.page_allocator.alloc(u8, total_len) catch return tcpip.Error.NoBufferSpace;
-        defer std.heap.page_allocator.free(buf);
-
+        // Copy header into tx_buf
         const hdr_len = pkt.header.usedLength();
-        @memcpy(buf[0..hdr_len], pkt.header.view());
+        @memcpy(self.tx_buf[0..hdr_len], pkt.header.view());
 
-        // Copy data
-        const view = pkt.data.toView(std.heap.page_allocator) catch return tcpip.Error.NoBufferSpace;
-        defer std.heap.page_allocator.free(view);
-        @memcpy(buf[hdr_len..], view);
+        // Copy data views directly (avoid toView allocation)
+        var offset: usize = hdr_len;
+        for (pkt.data.views) |v| {
+            @memcpy(self.tx_buf[offset..][0..v.view.len], v.view);
+            offset += v.view.len;
+        }
 
-        const rc = std.os.linux.write(self.fd, buf.ptr, buf.len);
+        const rc = std.os.linux.write(self.fd, &self.tx_buf, total_len);
         if (std.posix.errno(rc) != .SUCCESS) {
             log.err("writePacket failed: fd={}, rc={}, err={}", .{ self.fd, rc, std.posix.errno(rc) });
             return tcpip.Error.UnknownDevice;
