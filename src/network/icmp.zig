@@ -70,10 +70,10 @@ pub const ICMPv4PacketHandler = struct {
                 var reply_h = header.ICMPv4.init(&reply_hdr);
                 reply_h.data[0] = header.ICMPv4EchoReplyType;
                 reply_h.setChecksum(0);
-                const c = reply_h.calculateChecksum(payload[header.ICMPv4MinimumSize..]);
+                const c = reply_h.calculateChecksum(@constCast(payload[header.ICMPv4MinimumSize..]));
                 reply_h.setChecksum(c);
 
-                var views = [_]buffer.ClusterView{.{ .cluster = null, .view = payload[header.ICMPv4MinimumSize..] }};
+                var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(payload[header.ICMPv4MinimumSize..]) }};
                 const reply_pkt = tcpip.PacketBuffer{
                     .data = buffer.VectorisedView.init(payload.len - header.ICMPv4MinimumSize, &views),
                     .header = buffer.Prependable.initFull(&reply_hdr),
@@ -102,7 +102,7 @@ pub const ICMPv4PacketHandler = struct {
         if (data.len < header.ICMPv4MinimumSize + header.IPv4MinimumSize + 8) return;
 
         const embedded_ip = data[header.ICMPv4MinimumSize..];
-        const embedded_h = header.IPv4.init(embedded_ip);
+        const embedded_h = header.IPv4.init(@constCast(embedded_ip));
         const protocol = embedded_h.protocol();
         const src_addr = tcpip.Address{ .v4 = embedded_h.sourceAddress() };
         const dst_addr = tcpip.Address{ .v4 = embedded_h.destinationAddress() };
@@ -135,7 +135,7 @@ pub const ICMPv4PacketHandler = struct {
         if (data.len < header.ICMPv4MinimumSize + header.IPv4MinimumSize + 8) return;
 
         const embedded_ip = data[header.ICMPv4MinimumSize..];
-        const embedded_h = header.IPv4.init(embedded_ip);
+        const embedded_h = header.IPv4.init(@constCast(embedded_ip));
         const protocol = embedded_h.protocol();
         const src_addr = tcpip.Address{ .v4 = embedded_h.sourceAddress() };
         const dst_addr = tcpip.Address{ .v4 = embedded_h.destinationAddress() };
