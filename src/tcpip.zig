@@ -129,6 +129,8 @@ pub const Endpoint = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        incRef: *const fn (ptr: *anyopaque) void,
+        decRef: *const fn (ptr: *anyopaque) void,
         close: *const fn (ptr: *anyopaque) void,
         read: *const fn (ptr: *anyopaque, addr: ?*FullAddress) Error!buffer.VectorisedView,
         readv: ?*const fn (ptr: *anyopaque, uio: *buffer.Uio, addr: ?*FullAddress) Error!usize = null,
@@ -150,6 +152,12 @@ pub const Endpoint = struct {
         getOption: *const fn (ptr: *anyopaque, opt: EndpointOptionType) EndpointOption,
     };
 
+    pub fn incRef(self: Endpoint) void {
+        self.vtable.incRef(self.ptr);
+    }
+    pub fn decRef(self: Endpoint) void {
+        self.vtable.decRef(self.ptr);
+    }
     pub fn close(self: Endpoint) void {
         self.vtable.close(self.ptr);
     }

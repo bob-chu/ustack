@@ -429,6 +429,8 @@ pub const TCPEndpoint = struct {
     }
 
     const EndpointVTableImpl = tcpip.Endpoint.VTable{
+        .incRef = incRef_external,
+        .decRef = decRef_external,
         .close = close_endpoint_external,
         .read = read,
         .readv = readv_external,

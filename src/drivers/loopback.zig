@@ -9,7 +9,7 @@ const log = @import("../log.zig").scoped(.loopback);
 pub const Loopback = struct {
     dispatcher: ?*stack.NetworkDispatcher = null,
     mtu_val: u32 = 65536,
-    address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0, 0, 0, 0, 0, 0 } },
+    address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } },
     queue: std.TailQueue(Packet),
     allocator: std.mem.Allocator,
 
@@ -60,7 +60,6 @@ pub const Loopback = struct {
         };
         self.queue.append(node);
     }
-
 
     pub fn tick(self: *Loopback) void {
         while (self.queue.popFirst()) |node| {

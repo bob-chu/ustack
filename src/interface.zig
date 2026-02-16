@@ -8,11 +8,13 @@ const AfPacket = @import("drivers/linux/af_packet.zig").AfPacket;
 const AfXdp = @import("drivers/linux/af_xdp.zig").AfXdp;
 const Tap = @import("drivers/linux/tap.zig").Tap;
 const EthernetEndpoint = @import("link/eth.zig").EthernetEndpoint;
+const Loopback = @import("drivers/loopback.zig").Loopback;
 
 pub const DriverType = enum {
     af_packet,
     af_xdp,
     tap,
+    loopback,
 };
 
 pub const InterfaceConfig = struct {
@@ -22,6 +24,7 @@ pub const InterfaceConfig = struct {
     prefix: u8 = 24,
     gateway: ?[]const u8 = null,
     queue_id: u32 = 0,
+    mtu: u32 = 1500,
 };
 
 pub const NetworkInterface = struct {
@@ -33,6 +36,7 @@ pub const NetworkInterface = struct {
         af_packet: AfPacket,
         af_xdp: AfXdp,
         tap: Tap,
+        loopback: Loopback,
     },
     eth_endpoint: *EthernetEndpoint,
 
@@ -53,6 +57,9 @@ pub const NetworkInterface = struct {
             .tap => {
                 self.driver = .{ .tap = try Tap.init(allocator, cfg.name) };
             },
+            .loopback => {
+                self.driver = .{ .loopback = Loopback.init(allocator) };
+            },
         }
 
         // 2. Wrap in Ethernet Endpoint
@@ -60,11 +67,13 @@ pub const NetworkInterface = struct {
             .af_packet => |*d| d.linkEndpoint(),
             .af_xdp => |*d| d.linkEndpoint(),
             .tap => |*d| d.linkEndpoint(),
+            .loopback => |*d| d.linkEndpoint(),
         };
         const mac = switch (self.driver) {
             .af_packet => |*d| d.address,
             .af_xdp => |*d| d.address,
             .tap => |*d| d.address,
+            .loopback => |*d| d.address,
         };
 
         self.eth_endpoint = try allocator.create(EthernetEndpoint);
@@ -101,7 +110,7 @@ pub const NetworkInterface = struct {
                     .v6 => .{ .v6 = [_]u8{0} ** 16 },
                 },
                 .nic = self.nic_id,
-                .mtu = 1500,
+                .mtu = cfg.mtu,
             });
         }
 
@@ -115,7 +124,7 @@ pub const NetworkInterface = struct {
                 },
                 .gateway = gw_addr,
                 .nic = self.nic_id,
-                .mtu = 1500,
+                .mtu = cfg.mtu,
             });
         }
 
@@ -127,6 +136,7 @@ pub const NetworkInterface = struct {
             .af_packet => |*d| _ = d, // AfPacket struct has no deinit, just closes fd on destroy if owned? No, wait.
             .af_xdp => |*d| d.deinit(),
             .tap => |*d| _ = d,
+            .loopback => |*d| _ = d,
         }
         // Ideally we should close FDs here for packet/tap too if not handled.
         // Currently existing drivers don't have consistent deinit patterns.
@@ -141,6 +151,7 @@ pub const NetworkInterface = struct {
             .af_packet => |d| d.fd,
             .af_xdp => |d| d.fd,
             .tap => |d| d.fd,
+            .loopback => -1,
         };
     }
 
@@ -165,6 +176,35 @@ pub const NetworkInterface = struct {
                     if (!more) break;
                 }
             },
+            .loopback => |*d| d.tick(),
         }
     }
 };
+
+test "InterfaceConfig MTU propagates to routes" {
+    const main = @import("main.zig");
+    const allocator = std.testing.allocator;
+
+    var s = try main.init(allocator);
+    defer s.deinit();
+
+    const iface = try NetworkInterface.init(allocator, &s, .{
+        .name = "lo",
+        .driver = .loopback,
+        .address = "10.0.0.1",
+        .prefix = 24,
+        .mtu = 9000,
+    });
+    defer iface.deinit();
+
+    var found_9000 = false;
+    var found_1500 = false;
+
+    for (s.route_table.routes.items) |entry| {
+        if (entry.mtu == 9000) found_9000 = true;
+        if (entry.mtu == 1500) found_1500 = true;
+    }
+
+    try std.testing.expect(found_9000);
+    try std.testing.expect(!found_1500);
+}

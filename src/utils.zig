@@ -34,7 +34,7 @@ pub fn parseCidr(str: []const u8) !Cidr {
     const prefix_part = it.next();
 
     const address = try parseIp(ip_part);
-    const prefix_len = if (prefix_part) |p| try std.fmt.parseInt(u8, p, 10) else switch (address) {
+    const prefix_len: u8 = if (prefix_part) |p| try std.fmt.parseInt(u8, p, 10) else switch (address) {
         .v4 => 32,
         .v6 => 128,
     };

@@ -337,7 +337,7 @@ pub const NIC = struct {
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
 
-        if (remote.eq(self.linkEP.linkAddress())) return;
+        if (remote.eq(self.linkEP.linkAddress()) and (self.linkEP.capabilities() & CapabilityLoopback == 0)) return;
 
         const proto_opt = self.stack.network_protocols.get(protocol);
 
@@ -565,7 +565,7 @@ pub const Stack = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
         var cluster_pool = buffer.ClusterPool.init(allocator);
-        try cluster_pool.prewarm(1024);
+        try cluster_pool.prewarm(32768);
         return .{
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),

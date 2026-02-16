@@ -77,6 +77,8 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
 }
 
 pub const interface = @import("interface.zig");
+pub const socket = @import("socket.zig");
+pub const runtime = @import("runtime.zig");
 pub const utils = @import("utils.zig");
 
 test {
