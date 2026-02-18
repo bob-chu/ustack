@@ -177,7 +177,7 @@ fn libev_stats_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
         conn.bytes_since_last_report = 0;
         conn.packets_since_last_report = 0;
         const elapsed = now - conn.start_time;
-        if (elapsed > global_config.duration * 1000) {
+        if (conn.is_client and elapsed > global_config.duration * 1000) {
             const sec = @as(f64, @floatFromInt(elapsed)) / 1000.0;
             const role = if (conn.is_client) "TX" else "RX";
             std.debug.print("- - - - - - - - - - - - - - - - - - - - - - - - -\n", .{});
