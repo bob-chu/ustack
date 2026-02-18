@@ -309,6 +309,7 @@ const PingServer = struct {
 
             const conn = PingConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config, self, self.conn_count) catch {
                 res.ep.close();
+                // res.wq is destroyed by ep.close() because it's the stack-provided queue
                 self.active_conns -= 1;
                 continue;
             };
@@ -385,17 +386,18 @@ const PingClient = struct {
         if (self.next_conn_id > total) reached_limit = true;
         if (self.config.duration) |d| {
             if (now - self.start_time >= d * 1000) {
-                // std.debug.print("Duration reached: {} >= {}\n", .{now - self.start_time, d * 1000});
                 reached_limit = true;
+            } else {
+                reached_limit = false; // Duration overrides total connections if not yet reached
             }
         }
 
         if (!reached_limit) {
             while (self.active_conns < self.config.concurrency) {
                 self.startConnection() catch |err| {
-                    if (err == tcpip.Error.AddressInUse) return;
+                    if (err == tcpip.Error.AddressInUse) break;
                     std.debug.print("startConnection error: {}\n", .{err});
-                    return;
+                    break;
                 };
 
                 if (self.next_conn_id > total) break;
@@ -471,7 +473,7 @@ const PingConnection = struct {
             .connection_id = id,
             .mux_ctx = .{ .connection = self },
             .wait_entry = undefined,
-            .owns_wq = config.mode == .client,
+            .owns_wq = config.mode == .client, // Restore: Only client owns its wq
         };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn | waiter.EventOut | waiter.EventHUp | waiter.EventErr);
@@ -567,26 +569,6 @@ const PingConnection = struct {
         } else {
             const server = @as(*PingServer, @ptrCast(@alignCast(self.parent)));
             server.active_conns -= 1;
-
-            var done = false;
-            if (server.config.max_conns) |max| {
-                if (server.conn_count >= max and server.active_conns == 0) done = true;
-            }
-            if (server.config.duration) |d| {
-                if (std.time.milliTimestamp() - server.start_time >= d * 1000 and server.active_conns == 0) done = true;
-            }
-
-            if (done) {
-                server.end_time = std.time.milliTimestamp();
-                const duration_ms = @as(f64, @floatFromInt(server.end_time - server.start_time));
-                const duration_s = duration_ms / 1000.0;
-                const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
-
-                std.debug.print("Benchmark finished: {d} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
-
-                global_mark_done = true;
-                global_done_time = std.time.milliTimestamp();
-            }
         }
 
         self.next_cleanup = global_cleanup_list;

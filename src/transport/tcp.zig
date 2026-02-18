@@ -336,7 +336,11 @@ pub const TCPEndpoint = struct {
             self.persist_timer = time.Timer.init(handlePersistTimer, self);
             self.pooled = true;
         } else {
-            try self.cc.reset(mss);
+            self.cc.reset(mss) catch {
+                // If reset fails or is not supported (should not happen for NewReno), re-initialize
+                self.cc.deinit();
+                self.cc = try congestion.NewReno.init(s.allocator, mss);
+            };
             self.sack_blocks.clearRetainingCapacity();
             self.peer_sack_blocks.clearRetainingCapacity();
             self.syncache.clearRetainingCapacity();
