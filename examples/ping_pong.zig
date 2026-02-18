@@ -308,7 +308,8 @@ const PingServer = struct {
                 const diff_conns = self.conn_count - self.last_conn_count;
                 const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
                 const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
-                std.debug.print("CPS: {d:.0}\n", .{current_cps});
+                const total_s = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+                std.debug.print("[ID: S] {d: >5.2}-{d: >5.2} sec  CPS: {d: <6.0} ActiveEP: {d}\n", .{ total_s - diff_time_s, total_s, current_cps, self.active_conns });
                 self.last_report_time = now;
                 self.last_conn_count = self.conn_count;
             }
