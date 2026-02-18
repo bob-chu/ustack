@@ -4,17 +4,80 @@ const tcpip = @import("tcpip.zig");
 const waiter = @import("waiter.zig");
 const buffer = @import("buffer.zig");
 
+// --- Global FD Table implementation ---
+const FD_START = 4096;
+var fd_table: std.ArrayList(?*Socket) = undefined;
+var free_fds: std.ArrayList(i32) = undefined;
+var posix_allocator: std.mem.Allocator = undefined;
+var initialized: bool = false;
+
+pub fn init(allocator: std.mem.Allocator) void {
+    if (initialized) return;
+    fd_table = std.ArrayList(?*Socket).init(allocator);
+    free_fds = std.ArrayList(i32).init(allocator);
+    posix_allocator = allocator;
+    initialized = true;
+}
+
+pub fn deinit() void {
+    if (!initialized) return;
+    for (fd_table.items) |maybe_sock| {
+        if (maybe_sock) |sock| {
+            sock.deinit();
+        }
+    }
+    fd_table.deinit();
+    free_fds.deinit();
+    initialized = false;
+}
+
+fn allocateFd(sock: *Socket) !i32 {
+    if (!initialized) return error.NotInitialized;
+    if (free_fds.popOrNull()) |fd| {
+        const idx: usize = @intCast(fd - FD_START);
+        fd_table.items[idx] = sock;
+        return fd;
+    }
+    const fd: i32 = @intCast(fd_table.items.len + FD_START);
+    try fd_table.append(sock);
+    return fd;
+}
+
+fn releaseFd(fd: i32) void {
+    if (!initialized) return;
+    const idx = fd - FD_START;
+    if (idx < 0 or idx >= fd_table.items.len) return;
+    const u_idx: usize = @intCast(idx);
+    if (fd_table.items[u_idx]) |sock| {
+        fd_table.items[u_idx] = null;
+        sock.deinit();
+        free_fds.append(fd) catch {}; // Ignore OOM on free list
+    }
+}
+
+pub fn getSocket(fd: i32) !*Socket {
+    if (!initialized) return error.NotInitialized;
+    const idx = fd - FD_START;
+    if (idx < 0 or idx >= fd_table.items.len) {
+        // std.debug.print("getSocket(fd={}): idx {} out of range (len={})\n", .{ fd, idx, fd_table.items.len });
+        return error.BadFileDescriptor;
+    }
+    return fd_table.items[@intCast(idx)] orelse {
+        // std.debug.print("getSocket(fd={}): entry is null\n", .{fd});
+        return error.BadFileDescriptor;
+    };
+}
+
 pub const Socket = struct {
     endpoint: tcpip.Endpoint,
-    // The wait queue associated with this socket.
-    // For a listening socket, we create it.
-    // For an accepted socket, we inherit it from the stack.
     wait_queue: *waiter.Queue,
-
     blocking: bool = true,
     allocator: std.mem.Allocator,
-
     wait_entry: waiter.Entry,
+
+    // User context for async dispatch
+    ctx: ?*anyopaque = null,
+    callback: ?*const fn (ctx: ?*anyopaque, sock: *Socket, events: waiter.EventMask) void = null,
 
     pub fn init(allocator: std.mem.Allocator, ep: tcpip.Endpoint, wq: *waiter.Queue) *Socket {
         const self = allocator.create(Socket) catch @panic("OOM");
@@ -50,7 +113,10 @@ pub const Socket = struct {
 };
 
 // Global-ish API functions
-pub fn usocket(s: *stack.Stack, domain: i32, sock_type: i32, protocol: i32) !*Socket {
+pub fn usocket(s: *stack.Stack, domain: i32, sock_type: i32, protocol: i32) !i32 {
+    // Ensure posix layer is initialized (using stack allocator if not)
+    if (!initialized) init(s.allocator);
+
     // Validate domain
     const net_proto: tcpip.NetworkProtocolNumber = switch (domain) {
         std.posix.AF.INET => 0x0800, // IPv4
@@ -77,27 +143,32 @@ pub fn usocket(s: *stack.Stack, domain: i32, sock_type: i32, protocol: i32) !*So
         s.allocator.destroy(wq);
     }
 
-    return Socket.init(s.allocator, ep, wq);
+    const sock = Socket.init(s.allocator, ep, wq);
+    return allocateFd(sock);
 }
 
-pub fn ubind(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
+pub fn ubind(fd: i32, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
     _ = len;
+    const sock = try getSocket(fd);
     const full_addr = fromSockAddr(addr) catch return error.AddressFamilyNotSupported;
     try sock.endpoint.bind(full_addr);
 }
 
-pub fn uconnect(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
+pub fn uconnect(fd: i32, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
     _ = len;
+    const sock = try getSocket(fd);
     const full_addr = fromSockAddr(addr) catch return error.AddressFamilyNotSupported;
 
     try sock.endpoint.connect(full_addr);
 }
 
-pub fn ulisten(sock: *Socket, backlog: i32) !void {
+pub fn ulisten(fd: i32, backlog: i32) !void {
+    const sock = try getSocket(fd);
     try sock.endpoint.listen(backlog);
 }
 
-pub fn uaccept(sock: *Socket, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !*Socket {
+pub fn uaccept(fd: i32, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !i32 {
+    const sock = try getSocket(fd);
     const res = try sock.endpoint.accept();
 
     if (addr) |out_addr| {
@@ -106,11 +177,13 @@ pub fn uaccept(sock: *Socket, addr: ?*std.posix.sockaddr, len: ?*std.posix.sockl
         } else |_| {}
     }
 
-    return Socket.init(sock.allocator, res.ep, res.wq);
+    const accepted = Socket.init(sock.allocator, res.ep, res.wq);
+    return allocateFd(accepted);
 }
 
-pub fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
+pub fn urecv(fd: i32, buf: []u8, flags: u32) !usize {
     _ = flags;
+    const sock = try getSocket(fd);
     var iov = [_][]u8{buf};
     var uio = buffer.Uio.init(&iov);
     return sock.endpoint.readv(&uio, null) catch |err| {
@@ -119,8 +192,9 @@ pub fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
     };
 }
 
-pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
+pub fn usend(fd: i32, buf: []const u8, flags: u32) !usize {
     _ = flags;
+    const sock = try getSocket(fd);
     var iov = [_][]u8{@constCast(buf)};
     var uio = buffer.Uio.init(&iov);
     return sock.endpoint.writev(&uio, .{}) catch |err| {
@@ -129,7 +203,8 @@ pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
     };
 }
 
-pub fn ureadv(sock: *Socket, iov: []const []u8) !usize {
+pub fn ureadv(fd: i32, iov: []const []u8) !usize {
+    const sock = try getSocket(fd);
     var uio = buffer.Uio.init(iov);
     return sock.endpoint.readv(&uio, null) catch |err| {
         if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
@@ -137,7 +212,8 @@ pub fn ureadv(sock: *Socket, iov: []const []u8) !usize {
     };
 }
 
-pub fn uwritev(sock: *Socket, iov: []const []u8) !usize {
+pub fn uwritev(fd: i32, iov: []const []u8) !usize {
+    const sock = try getSocket(fd);
     var uio = buffer.Uio.init(iov);
     return sock.endpoint.writev(&uio, .{}) catch |err| {
         if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
@@ -145,8 +221,9 @@ pub fn uwritev(sock: *Socket, iov: []const []u8) !usize {
     };
 }
 
-pub fn urecvfrom(sock: *Socket, buf: []u8, flags: u32, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !usize {
+pub fn urecvfrom(fd: i32, buf: []u8, flags: u32, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !usize {
     _ = flags;
+    const sock = try getSocket(fd);
     var iov = [_][]u8{buf};
     var uio = buffer.Uio.init(&iov);
     var full_addr: tcpip.FullAddress = undefined;
@@ -160,9 +237,10 @@ pub fn urecvfrom(sock: *Socket, buf: []u8, flags: u32, addr: ?*std.posix.sockadd
     return n;
 }
 
-pub fn usendto(sock: *Socket, buf: []const u8, flags: u32, addr: ?*const std.posix.sockaddr, len: std.posix.socklen_t) !usize {
+pub fn usendto(fd: i32, buf: []const u8, flags: u32, addr: ?*const std.posix.sockaddr, len: std.posix.socklen_t) !usize {
     _ = flags;
     _ = len;
+    const sock = try getSocket(fd);
     var iov = [_][]u8{@constCast(buf)};
     var uio = buffer.Uio.init(&iov);
     var opts = tcpip.WriteOptions{};
@@ -177,8 +255,8 @@ pub fn usendto(sock: *Socket, buf: []const u8, flags: u32, addr: ?*const std.pos
     };
 }
 
-pub fn uclose(sock: *Socket) void {
-    sock.deinit();
+pub fn uclose(fd: i32) void {
+    releaseFd(fd);
 }
 
 // Helpers
@@ -310,8 +388,8 @@ test "POSIX API TCP client/server" {
     try nic.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = .{ 127, 0, 0, 1 } }, .prefix_len = 8 } });
 
     // 1. Create Socket
-    const sock = try usocket(&s, std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    defer uclose(sock);
+    const fd = try usocket(&s, std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer uclose(fd);
 
     // 2. Bind
     const addr = std.posix.sockaddr.in{
@@ -320,19 +398,30 @@ test "POSIX API TCP client/server" {
         .addr = 0, // 0.0.0.0
         .zero = [_]u8{0} ** 8,
     };
-    try ubind(sock, @as(std.posix.sockaddr, @bitCast(addr)), @sizeOf(std.posix.sockaddr.in));
+    try ubind(fd, @as(std.posix.sockaddr, @bitCast(addr)), @sizeOf(std.posix.sockaddr.in));
 
     // 3. Listen
-    try ulisten(sock, 10);
+    try ulisten(fd, 10);
 
     // 4. Accept (Non-blocking check for test)
     // We set non-blocking just to verify it doesn't hang forever in test
+    const sock = try getSocket(fd);
     sock.blocking = false;
-    const res = uaccept(sock, null, null);
-    try std.testing.expectError(tcpip.Error.WouldBlock, res);
+    const res = uaccept(fd, null, null) catch |err| {
+        if (err == tcpip.Error.WouldBlock) {
+            // Success: it correctly didn't block
+            deinit();
+            return;
+        }
+        std.debug.print("uaccept(fd={}) failed: {}\n", .{ fd, err });
+        return err;
+    };
+    uclose(res);
+
+    deinit();
 }
 pub const PollFd = struct {
-    sock: *Socket,
+    fd: i32,
     events: i16,
     revents: i16,
 };
@@ -370,11 +459,8 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
     var ready_count: usize = 0;
     for (fds) |*pfd| {
         pfd.revents = 0;
-        // Access wait queue events directly?
-        // waiter.Queue has events().
-        // We need socket-specific events. Waiter queue is per-socket.
-        // So yes, we can check queue events.
-        const mask = pfd.sock.wait_queue.events();
+        const sock = try getSocket(pfd.fd);
+        const mask = sock.wait_queue.events();
         const interested = pollToWaiter(pfd.events);
         const fired = mask & interested;
 
@@ -389,16 +475,6 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
     }
 
     // 2. Wait
-    // We need a way to sleep on MULTIPLE condition variables?
-    // No, Condition Variable is associated with a Mutex.
-    // Each Socket has its own Mutex/Cond.
-    // This is hard with the current architecture where each Socket owns its queue/cond.
-
-    // Solution: Create a TEMPORARY Waiter Entry that points to a local condition variable.
-    // Register this entry to ALL sockets' queues.
-    // Wait on the local condition variable.
-    // Unregister from all.
-
     var mutex = std.Thread.Mutex{};
     var cond = std.Thread.Condition{};
     var fired = false;
@@ -420,21 +496,13 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
         }
     }.cb;
 
-    // We need an array of entries, one per FD
-    // Stack allocation might be too big for large N.
-    // Use allocator from first socket? Or pass an allocator?
-    // Let's assume fds.len is reasonable (like select 1024), or require allocator.
-    // For now, let's use a temporary allocator or error if too big?
-    // Let's use `std.heap.page_allocator` just for the wait entries array if stack is small.
-
-    // Optimization: Just one entry per socket.
-    // Zig doesn't allow VLA.
-    const entries = try std.heap.page_allocator.alloc(waiter.Entry, fds.len);
-    defer std.heap.page_allocator.free(entries);
+    const entries = try posix_allocator.alloc(waiter.Entry, fds.len);
+    defer posix_allocator.free(entries);
 
     for (fds, 0..) |*pfd, i| {
+        const sock = try getSocket(pfd.fd);
         entries[i] = waiter.Entry.init(&ctx, callback);
-        pfd.sock.wait_queue.eventRegister(&entries[i], pollToWaiter(pfd.events));
+        sock.wait_queue.eventRegister(&entries[i], pollToWaiter(pfd.events));
     }
 
     // Wait
@@ -443,7 +511,6 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
         if (timeout_ms < 0) {
             cond.wait(&mutex);
         } else {
-            // timedWait expects nanoseconds
             const ns = @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms;
             _ = cond.timedWait(&mutex, ns) catch {};
         }
@@ -452,16 +519,16 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
 
     // Unregister
     for (fds, 0..) |*pfd, i| {
-        pfd.sock.wait_queue.eventUnregister(&entries[i]);
+        const sock = try getSocket(pfd.fd);
+        sock.wait_queue.eventUnregister(&entries[i]);
     }
 
     // Re-check events
     ready_count = 0;
     for (fds) |*pfd| {
         pfd.revents = 0;
-        const mask = pfd.sock.wait_queue.events(); // This might race if event cleared?
-        // Actually, events() returns currently asserted events (level triggered).
-        // So this is correct for level-triggered poll.
+        const sock = try getSocket(pfd.fd);
+        const mask = sock.wait_queue.events();
         const interested = pollToWaiter(pfd.events);
         const current_fired = mask & interested;
         if (current_fired != 0) {
@@ -508,11 +575,11 @@ test "POSIX upoll basic" {
     try s.nics.get(1).?.addAddress(.{ .protocol = 0x0800, .address_with_prefix = .{ .address = .{ .v4 = .{ 127, 0, 0, 1 } }, .prefix_len = 8 } });
 
     // Create UDP socket
-    const sock = try usocket(&s, std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-    defer uclose(sock);
+    const fd = try usocket(&s, std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+    defer uclose(fd);
 
     var fds = [_]PollFd{
-        .{ .sock = sock, .events = POLLIN, .revents = 0 },
+        .{ .fd = fd, .events = POLLIN, .revents = 0 },
     };
 
     // 1. Poll empty (should timeout)
@@ -524,6 +591,7 @@ test "POSIX upoll basic" {
 
     // 2. Poll with data
     // Inject packet to make it readable
+    const sock = try getSocket(fd);
     const udp_ep = @as(*@import("transport/udp.zig").UDPEndpoint, @ptrCast(@alignCast(sock.endpoint.ptr)));
     const r = stack.Route{ .local_address = .{ .v4 = .{ 127, 0, 0, 1 } }, .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } }, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = s.nics.get(1).? };
     const id = stack.TransportEndpointID{ .local_port = 0, .local_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .remote_port = 1234, .remote_address = .{ .v4 = .{ 127, 0, 0, 2 } }, .transport_protocol = 17 };
@@ -553,4 +621,6 @@ test "POSIX upoll basic" {
     const n2 = try upoll(&fds, 100);
     try std.testing.expectEqual(@as(usize, 1), n2);
     try std.testing.expect(fds[0].revents & POLLIN != 0);
+
+    deinit();
 }

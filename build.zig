@@ -69,6 +69,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example_uperf_libev", .path = "examples/uperf.zig", .lib = "ev" },
         .{ .name = "example_uperf_socket", .path = "examples/uperf_socket.zig", .lib = "ev" },
         .{ .name = "example_uperf_runtime", .path = "examples/uperf_runtime.zig", .lib = "ev" },
+        .{ .name = "example_uperf_posix", .path = "examples/uperf_posix.zig", .lib = "ev" },
+        .{ .name = "example_ping_pong_socket", .path = "examples/ping_pong_socket.zig", .lib = "ev" },
     };
 
     for (examples) |ex| {
@@ -91,8 +93,10 @@ pub fn build(b: *std.Build) void {
             std.mem.eql(u8, ex.name, "example_uperf_libev") or
             std.mem.eql(u8, ex.name, "example_uperf_socket") or
             std.mem.eql(u8, ex.name, "example_uperf_runtime") or
+            std.mem.eql(u8, ex.name, "example_uperf_posix") or
             std.mem.eql(u8, ex.name, "example_af_xdp_libev") or
-            std.mem.eql(u8, ex.name, "example_ping_pong"))
+            std.mem.eql(u8, ex.name, "example_ping_pong") or
+            std.mem.eql(u8, ex.name, "example_ping_pong_socket"))
         {
             exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
         }

@@ -63,8 +63,9 @@ Optimized for Jumbo Frames (MTU 9000) and extreme concurrency scaling using adva
 ## 🛠️ Supported Features
 
 ### Core Stack Features
+- **POSIX-aligned API (`src/posix.zig`)**: Procedural, integer-based file descriptor API (usocket, ubind, uconnect, etc.) for easier porting of C applications.
 - **Runtime Bootstrap Layer (`src/runtime.zig`)**: Simplifies stack initialization. Provides a `Runtime` struct that manages Stack, NIC, Routes, and Event Multiplexer lifecycles in one place.
-- **BSD-Style Socket API (`src/socket.zig`)**: A zero-cost shim providing a familiar `bind`/`connect`/`accept`/`read`/`write` API. It bridges the gap between raw Endpoints and standard programming patterns.
+- **BSD-Style Socket API (`src/socket.zig`)**: A high-level object-oriented shim providing a familiar `bind`/`connect`/`accept`/`read`/`write` API.
 - **Event Coalescing (`src/event_mux.zig`)**: Drastically reduces system call overhead by batching socket notifications into a single `eventfd` write per event loop tick.
 - **High Concurrency Scaling**: Support for **65k+ concurrent endpoints** through:
   - **Object Pooling**: Recycles TCP Endpoints and Wait Queues to eliminate allocation spikes.
