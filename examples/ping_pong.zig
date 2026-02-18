@@ -274,7 +274,7 @@ const PingServer = struct {
         const ep = try s.transport_protocols.get(6).?.newEndpoint(s, 0x0800, wq);
         try ep.setOption(.{ .ts_enabled = true });
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = config.port });
-        try ep.listen(1024);
+        try ep.listen(8192);
 
         self.* = .{
             .listener = ep,

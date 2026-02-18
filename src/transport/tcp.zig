@@ -50,7 +50,7 @@ pub const TCPProtocol = struct {
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 65536),
             .segment_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node).init(allocator, 65536),
             .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 65536),
-            .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 8192),
+            .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 65536),
             .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 65536),
             .waiter_queue_pool = buffer.Pool(waiter.Queue).init(allocator, 32768),
         };
@@ -333,6 +333,7 @@ pub const TCPEndpoint = struct {
             self.persist_timer = time.Timer.init(handlePersistTimer, self);
             self.pooled = true;
             self.initialized = true; // Mark as initialized
+            self.backlog = 65536; // Maximum backlog for pooled listeners
         } else {
             // Only reset if we were previously initialized
             if (self.initialized) {
