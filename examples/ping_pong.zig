@@ -237,13 +237,19 @@ fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C)
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
         for (ready) |entry| {
+            if (entry.context == null) continue; // Safety
             const ctx = @as(*MuxContext, @ptrCast(@alignCast(entry.context.?)));
             switch (ctx.*) {
                 .server => |s| s.onEvent(),
-                .connection => |conn| conn.onEvent(),
+                .connection => |conn| {
+                    if (!conn.closed and !conn.pending_cleanup) {
+                        conn.onEvent();
+                    }
+                },
             }
         }
     }
+    perform_cleanup();
 }
 
 const PingServer = struct {
@@ -424,7 +430,6 @@ const PingClient = struct {
         if (now - last_tick_time > 0) {
             _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(now - last_tick_time)));
             last_tick_time = now;
-            perform_cleanup();
         }
 
         // Report CPS every second
@@ -560,6 +565,7 @@ const PingConnection = struct {
         self.closed = true;
         self.pending_cleanup = true;
 
+        self.wait_entry.context = null; // Mark entry as invalid for any pending ready_queue processing
         self.wq.eventUnregister(&self.wait_entry);
         self.ep.close();
 
