@@ -36,8 +36,8 @@ pub const AfPacket = struct {
 
         // Ring settings: 16KB frames to support Jumbo frames
         const frame_size: u32 = 16384;
-        const frame_nr: u32 = 256;
-        const block_size: u32 = 4096 * 128; // 512KB block
+        const frame_nr: u32 = 8192;
+        const block_size: u32 = 16384 * 128; // 2MB block
         const block_nr: u32 = (frame_size * frame_nr) / block_size;
 
         const req = header.tpacket_req{
@@ -77,8 +77,8 @@ pub const AfPacket = struct {
             .fd = fd,
             .allocator = allocator,
             .cluster_pool = pool,
-            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 4096),
-            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 4096),
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 16384),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 16384),
             .if_index = if_index,
             .address = .{ .addr = mac },
             .rx_ring = rx_ring_ptr,
@@ -128,8 +128,6 @@ pub const AfPacket = struct {
         const total_ring_size = self.frame_size * self.frame_nr * 2;
         const mmap_ptr = @as([*]align(std.mem.page_size) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
         std.posix.munmap(mmap_ptr[0..total_ring_size]);
-        self.view_pool.deinit();
-        self.header_pool.deinit();
         std.posix.close(self.fd);
     }
 
@@ -141,11 +139,6 @@ pub const AfPacket = struct {
     }
 
     pub fn writePackets(self: *AfPacket, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
-        const start = std.time.nanoTimestamp();
-        defer {
-            const end = std.time.nanoTimestamp();
-            stats.global_stats.latency.driver_tx.record(@as(i64, @intCast(end - start)));
-        }
         var any_sent = false;
         for (packets) |pkt| {
             const slot = self.tx_ring[self.tx_idx * self.frame_size .. (self.tx_idx + 1) * self.frame_size];
@@ -219,7 +212,7 @@ pub const AfPacket = struct {
 
     pub fn readPacket(self: *AfPacket) !bool {
         var num_read: usize = 0;
-        const max_batch = 1024;
+        const max_batch = 4096;
         const driver_start = std.time.nanoTimestamp();
         defer {
             if (num_read > 0) {
@@ -288,7 +281,8 @@ pub const AfPacket = struct {
 
             if (self.dispatcher) |d| {
                 const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
-                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, 0, mut_pkt);
+                const pkt_proto = std.mem.readInt(u16, data[12..14], .big);
+                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, pkt_proto, mut_pkt);
             }
             self.header_pool.release(h_buf);
             mut_pkt.data.deinit();

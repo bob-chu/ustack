@@ -37,6 +37,7 @@ pub fn info(comptime format: []const u8, args: anytype) void {
 
 pub fn debug(comptime format: []const u8, args: anytype) void {
     if (@intFromEnum(log_level) >= @intFromEnum(Level.debug)) {
+        if (!@import("builtin").is_test and std.posix.getenv("USTACK_LOG_DEBUG") == null) return;
         std.debug.print("DEBUG: " ++ format ++ "\n", args);
     }
 }
@@ -52,6 +53,7 @@ pub fn scoped(comptime scope: @Type(.EnumLiteral)) type {
 
         pub fn warn(comptime format: []const u8, args: anytype) void {
             if (@intFromEnum(log_level) >= @intFromEnum(Level.warn)) {
+                if (scope == .stack and !@import("builtin").is_test and std.posix.getenv("USTACK_LOG_STACK_WARN") == null) return;
                 std.debug.print("WARN(" ++ @tagName(scope) ++ "): " ++ format ++ "\n", args);
             }
         }
@@ -64,6 +66,7 @@ pub fn scoped(comptime scope: @Type(.EnumLiteral)) type {
 
         pub fn debug(comptime format: []const u8, args: anytype) void {
             if (@intFromEnum(log_level) >= @intFromEnum(Level.debug)) {
+                if (!@import("builtin").is_test and std.posix.getenv("USTACK_LOG_DEBUG") == null) return;
                 std.debug.print("DEBUG(" ++ @tagName(scope) ++ "): " ++ format ++ "\n", args);
             }
         }

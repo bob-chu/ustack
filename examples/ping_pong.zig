@@ -237,13 +237,19 @@ fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C)
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
         for (ready) |entry| {
+            if (entry.context == null) continue; // Safety
             const ctx = @as(*MuxContext, @ptrCast(@alignCast(entry.context.?)));
             switch (ctx.*) {
                 .server => |s| s.onEvent(),
-                .connection => |conn| conn.onEvent(),
+                .connection => |conn| {
+                    if (!conn.closed and !conn.pending_cleanup) {
+                        conn.onEvent();
+                    }
+                },
             }
         }
     }
+    perform_cleanup();
 }
 
 const PingServer = struct {
@@ -268,7 +274,7 @@ const PingServer = struct {
         const ep = try s.transport_protocols.get(6).?.newEndpoint(s, 0x0800, wq);
         try ep.setOption(.{ .ts_enabled = true });
         try ep.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = config.port });
-        try ep.listen(1024);
+        try ep.listen(8192);
 
         self.* = .{
             .listener = ep,
@@ -302,13 +308,15 @@ const PingServer = struct {
                 const diff_conns = self.conn_count - self.last_conn_count;
                 const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
                 const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
-                std.debug.print("CPS: {d:.0}\n", .{current_cps});
+                const total_s = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+                std.debug.print("[ID: S] {d: >5.2}-{d: >5.2} sec  CPS: {d: <6.0} ActiveEP: {d}\n", .{ total_s - diff_time_s, total_s, current_cps, self.active_conns });
                 self.last_report_time = now;
                 self.last_conn_count = self.conn_count;
             }
 
             const conn = PingConnection.init(self.allocator, res.ep, res.wq, self.mux, self.config, self, self.conn_count) catch {
                 res.ep.close();
+                // res.wq is destroyed by ep.close() because it's the stack-provided queue
                 self.active_conns -= 1;
                 continue;
             };
@@ -385,17 +393,18 @@ const PingClient = struct {
         if (self.next_conn_id > total) reached_limit = true;
         if (self.config.duration) |d| {
             if (now - self.start_time >= d * 1000) {
-                // std.debug.print("Duration reached: {} >= {}\n", .{now - self.start_time, d * 1000});
                 reached_limit = true;
+            } else {
+                reached_limit = false; // Duration overrides total connections if not yet reached
             }
         }
 
         if (!reached_limit) {
             while (self.active_conns < self.config.concurrency) {
                 self.startConnection() catch |err| {
-                    if (err == tcpip.Error.AddressInUse) return;
+                    if (err == tcpip.Error.AddressInUse) break;
                     std.debug.print("startConnection error: {}\n", .{err});
-                    return;
+                    break;
                 };
 
                 if (self.next_conn_id > total) break;
@@ -422,7 +431,6 @@ const PingClient = struct {
         if (now - last_tick_time > 0) {
             _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(now - last_tick_time)));
             last_tick_time = now;
-            perform_cleanup();
         }
 
         // Report CPS every second
@@ -471,7 +479,7 @@ const PingConnection = struct {
             .connection_id = id,
             .mux_ctx = .{ .connection = self },
             .wait_entry = undefined,
-            .owns_wq = config.mode == .client,
+            .owns_wq = config.mode == .client, // Restore: Only client owns its wq
         };
         self.wait_entry = waiter.Entry.initWithUpcall(&self.mux_ctx, mux, EventMultiplexer.upcall);
         wq.eventRegister(&self.wait_entry, waiter.EventIn | waiter.EventOut | waiter.EventHUp | waiter.EventErr);
@@ -558,6 +566,7 @@ const PingConnection = struct {
         self.closed = true;
         self.pending_cleanup = true;
 
+        self.wait_entry.context = null; // Mark entry as invalid for any pending ready_queue processing
         self.wq.eventUnregister(&self.wait_entry);
         self.ep.close();
 
@@ -567,26 +576,6 @@ const PingConnection = struct {
         } else {
             const server = @as(*PingServer, @ptrCast(@alignCast(self.parent)));
             server.active_conns -= 1;
-
-            var done = false;
-            if (server.config.max_conns) |max| {
-                if (server.conn_count >= max and server.active_conns == 0) done = true;
-            }
-            if (server.config.duration) |d| {
-                if (std.time.milliTimestamp() - server.start_time >= d * 1000 and server.active_conns == 0) done = true;
-            }
-
-            if (done) {
-                server.end_time = std.time.milliTimestamp();
-                const duration_ms = @as(f64, @floatFromInt(server.end_time - server.start_time));
-                const duration_s = duration_ms / 1000.0;
-                const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
-
-                std.debug.print("Benchmark finished: {d} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
-
-                global_mark_done = true;
-                global_done_time = std.time.milliTimestamp();
-            }
         }
 
         self.next_cleanup = global_cleanup_list;

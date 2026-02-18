@@ -47,24 +47,20 @@ pub const TCPProtocol = struct {
         self.* = .{
             .allocator = allocator,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 1048576),
-            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 1048576),
-            .segment_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node).init(allocator, 1048576),
-            .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 1048576),
-            .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 262144),
-            .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 1048576),
-            .waiter_queue_pool = buffer.Pool(waiter.Queue).init(allocator, 524288),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 65536),
+            .segment_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node).init(allocator, 65536),
+            .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 65536),
+            .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 65536),
+            .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 65536),
+            .waiter_queue_pool = buffer.Pool(waiter.Queue).init(allocator, 32768),
         };
 
         self.view_pool.prewarm(1024) catch {};
-        self.header_pool.prewarm(1024) catch {};
-        self.segment_node_pool.prewarm(1024) catch {};
-        self.packet_node_pool.prewarm(1024) catch {};
-        self.endpoint_pool.prewarm(1024) catch {};
-        self.waiter_queue_pool.prewarm(1024) catch {};
-
-        for (self.endpoint_pool.free_list.items) |ep| {
-            @memset(std.mem.asBytes(ep), 0);
-        }
+        self.header_pool.prewarm(4096) catch {};
+        self.segment_node_pool.prewarm(4096) catch {};
+        self.packet_node_pool.prewarm(4096) catch {};
+        self.endpoint_pool.prewarm(4096) catch {};
+        self.waiter_queue_pool.prewarm(4096) catch {};
 
         return self;
     }
@@ -177,6 +173,7 @@ pub const TCPEndpoint = struct {
     next: ?*TCPEndpoint = null,
     prev: ?*TCPEndpoint = null,
     pooled: bool = false,
+    initialized: bool = false,
 
     stack: *stack.Stack = undefined,
     proto: *TCPProtocol = undefined,
@@ -335,8 +332,19 @@ pub const TCPEndpoint = struct {
             self.syncache_timer = time.Timer.init(handleSyncacheTimer, self);
             self.persist_timer = time.Timer.init(handlePersistTimer, self);
             self.pooled = true;
+            self.initialized = true; // Mark as initialized
+            self.backlog = 65536; // Maximum backlog for pooled listeners
         } else {
-            try self.cc.reset(mss);
+            // Only reset if we were previously initialized
+            if (self.initialized) {
+                self.cc.reset(mss) catch {
+                    self.cc.deinit();
+                    self.cc = try congestion.NewReno.init(s.allocator, mss);
+                };
+            } else {
+                self.cc = try congestion.NewReno.init(s.allocator, mss);
+                self.initialized = true;
+            }
             self.sack_blocks.clearRetainingCapacity();
             self.peer_sack_blocks.clearRetainingCapacity();
             self.syncache.clearRetainingCapacity();
@@ -429,6 +437,8 @@ pub const TCPEndpoint = struct {
     }
 
     const EndpointVTableImpl = tcpip.Endpoint.VTable{
+        .incRef = incRef_external,
+        .decRef = decRef_external,
         .close = close_endpoint_external,
         .read = read,
         .readv = readv_external,

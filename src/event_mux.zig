@@ -1,11 +1,14 @@
 const std = @import("std");
 const waiter = @import("waiter.zig");
 
+const stats = @import("stats.zig");
+
 /// EventMultiplexer acts as a bridge between ustack's user-space events
 pub const EventMultiplexer = struct {
     ready_queue: ReadyQueue,
     signal_fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
+    signaled: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !*EventMultiplexer {
         const self = try allocator.create(EventMultiplexer);
@@ -37,9 +40,15 @@ pub const EventMultiplexer = struct {
     /// It gets triggered by the stack when data arrives or space opens up.
     pub fn upcall(entry: *waiter.Entry) void {
         const self = @as(*EventMultiplexer, @ptrCast(@alignCast(entry.upcall_ctx.?)));
-        if (self.ready_queue.push(entry) catch false) {
+        _ = self.ready_queue.push(entry) catch false;
+        if (!self.signaled) {
+            self.signaled = true;
+            stats.global_stats.pool.event_signals += 1;
             const val: u64 = 1;
-            _ = std.posix.write(self.signal_fd, std.mem.asBytes(&val)) catch {};
+            // std.debug.print("!", .{});
+            _ = std.posix.write(self.signal_fd, std.mem.asBytes(&val)) catch {
+                self.signaled = false;
+            };
         }
     }
 
@@ -49,6 +58,8 @@ pub const EventMultiplexer = struct {
         // Clear the eventfd
         var val: u64 = 0;
         _ = std.posix.read(self.signal_fd, std.mem.asBytes(&val)) catch {};
+        // std.debug.print(".", .{});
+        self.signaled = false;
 
         return self.ready_queue.popAll();
     }

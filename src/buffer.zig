@@ -113,6 +113,7 @@ pub fn Pool(comptime T: type) type {
             try self.free_list.ensureTotalCapacity(to_warm);
             for (0..to_warm) |_| {
                 const node = try self.allocator.create(T);
+                @memset(std.mem.asBytes(node), 0);
                 self.release(node);
             }
         }
@@ -129,7 +130,9 @@ pub fn Pool(comptime T: type) type {
                 return node;
             }
             stats.global_stats.pool.generic_fallback += 1;
-            return try self.allocator.create(T);
+            const node = try self.allocator.create(T);
+            @memset(std.mem.asBytes(node), 0);
+            return node;
         }
 
         pub fn release(self: *Self, node: *T) void {
