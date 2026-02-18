@@ -32,7 +32,7 @@ pub const StackStats = struct {
         std.debug.print("  Rx Flags - SYN: {d}, SYN+ACK: {d}, ACK: {d}, PSH: {d}, FIN: {d}\n", .{ self.tcp.rx_syn, self.tcp.rx_syn_ack, self.tcp.rx_ack, self.tcp.rx_psh, self.tcp.rx_fin });
         std.debug.print("  Tx Flags - SYN: {d}, SYN+ACK: {d}, ACK: {d}, PSH: {d}, FIN: {d}\n", .{ self.tcp.tx_syn, self.tcp.tx_syn_ack, self.tcp.tx_ack, self.tcp.tx_psh, self.tcp.tx_fin });
         std.debug.print("Pool Fallbacks (Syscall heavy):\n", .{});
-        std.debug.print("  Cluster: {d}, Buffer: {d}, Generic: {d}\n", .{ self.pool.cluster_fallback, self.pool.buffer_fallback, self.pool.generic_fallback });
+        std.debug.print("  Cluster: {d}, Buffer: {d}, Generic: {d}, Signals: {d}\n", .{ self.pool.cluster_fallback, self.pool.buffer_fallback, self.pool.generic_fallback, self.pool.event_signals });
         std.debug.print("-------------------------\n", .{});
         self.latency.dump();
     }
@@ -153,6 +153,7 @@ pub const PoolStats = struct {
     generic_fallback: usize = 0,
     cluster_exhausted: usize = 0,
     view_exhausted: usize = 0,
+    event_signals: usize = 0,
 };
 
 pub const LinkStats = struct {
