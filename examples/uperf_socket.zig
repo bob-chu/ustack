@@ -19,6 +19,11 @@ var global_mux: ?*EventMultiplexer = null;
 var global_connections: std.ArrayList(*Connection) = undefined;
 var global_config: Config = .{};
 
+const MuxContext = union(enum) {
+    server: *PerfServer,
+    connection: *Connection,
+};
+
 const Config = struct {
     mode: []const u8 = "server",
     protocol: enum { tcp, udp } = .tcp,
@@ -174,8 +179,19 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
 fn libev_stats_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
     _ = watcher; _ = revents;
     const now = std.time.milliTimestamp();
+
+    var total_rx_bytes: u64 = 0;
+    var total_tx_bytes: u64 = 0;
+
     for (global_connections.items) |conn| {
-        if (conn.first_packet_time > 0) {
+        if (conn.is_client) {
+            total_tx_bytes += conn.bytes_since_last_report;
+        } else {
+            total_rx_bytes += conn.bytes_since_last_report;
+        }
+        conn.bytes_since_last_report = 0;
+
+        if (conn.is_client and conn.first_packet_time > 0) {
             const elapsed = now - conn.first_packet_time;
             if (elapsed > global_config.duration * 1000) {
                 conn.end_time = now;
@@ -183,6 +199,15 @@ fn libev_stats_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
                 return;
             }
         }
+    }
+
+    if (total_rx_bytes > 0) {
+        const mbps = (@as(f64, @floatFromInt(total_rx_bytes)) * 8.0) / 1000000.0;
+        std.debug.print("[RX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{ mbps });
+    }
+    if (total_tx_bytes > 0) {
+        const mbps = (@as(f64, @floatFromInt(total_tx_bytes)) * 8.0) / 1000000.0;
+        std.debug.print("[TX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{ mbps });
     }
 }
 
@@ -232,6 +257,14 @@ const PerfServer = struct {
 
 fn noopConsumption(_: ?*anyopaque, _: usize) void {}
 
+const UperfPayloader = struct {
+    len: usize,
+    fn fullPayload(ptr: *anyopaque) tcpip.Error![]const u8 {
+        const self = @as(*const UperfPayloader, @ptrCast(@alignCast(ptr)));
+        return StaticBuffer.buf[0..self.len];
+    }
+};
+
 const Connection = struct {
     sock: *socket.Socket,
     allocator: std.mem.Allocator,
@@ -243,6 +276,7 @@ const Connection = struct {
     end_time: i64 = 0,
     bytes_rx: u64 = 0,
     bytes_tx: u64 = 0,
+    bytes_since_last_report: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, sock: *socket.Socket, mux: *EventMultiplexer, is_client: bool) !*Connection {
         const self = try allocator.create(Connection);
@@ -256,6 +290,7 @@ const Connection = struct {
             .end_time = 0,
             .bytes_rx = 0,
             .bytes_tx = 0,
+            .bytes_since_last_report = 0,
         };
         sock.setHandler(mux, self, Connection.onSocketEvent);
         try global_connections.append(self);
@@ -282,8 +317,11 @@ const Connection = struct {
 
     fn onEventExplicit(self: *Connection, mask: waiter.EventMask) void {
         if (self.closed) return;
-        if (mask & (waiter.EventHUp | waiter.EventErr) != 0) { self.close(); return; }
-        
+        if (mask & (waiter.EventHUp | waiter.EventErr) != 0) {
+            self.close();
+            return;
+        }
+
         // Handle RX
         if (mask & waiter.EventIn != 0) {
             while (true) {
@@ -291,6 +329,7 @@ const Connection = struct {
                 if (self.first_packet_time == 0) self.first_packet_time = std.time.milliTimestamp();
                 if (vview.size == 0) { vview.deinit(); if (global_config.protocol == .tcp) self.close(); break; }
                 self.bytes_rx += vview.size;
+                self.bytes_since_last_report += vview.size;
                 vview.deinit();
             }
         }
@@ -300,6 +339,7 @@ const Connection = struct {
             if (self.first_packet_time == 0) self.first_packet_time = std.time.milliTimestamp();
             const slen = if (global_config.packet_size > 0) global_config.packet_size else if (global_config.protocol == .udp) @as(usize, @intCast(global_config.mtu - 28)) else 65536;
             var budget: usize = 10000;
+            const p = UperfPayloader{ .len = @min(slen, 65536) };
             while (budget > 0) : (budget -= 1) {
                 const sl = @min(slen, 65536);
                 const n = if (global_config.protocol == .tcp)
@@ -308,13 +348,13 @@ const Connection = struct {
                         return;
                     }
                 else
-                    self.sock.write(StaticBuffer.buf[0..sl]) catch |err| {
+                    self.sock.endpoint.write(.{ .ptr = @constCast(&p), .vtable = &.{ .fullPayload = UperfPayloader.fullPayload, .viewPayload = null } }, .{}) catch |err| {
                         if (err == tcpip.Error.WouldBlock) return;
                         return;
                     };
                 self.bytes_tx += n;
+                self.bytes_since_last_report += n;
             }
-            EventMultiplexer.upcall(&self.sock.wait_entry);
         }
     }
 

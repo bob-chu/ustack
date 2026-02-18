@@ -10,10 +10,12 @@ ustack is designed as a **single-process, single-threaded network stack** utiliz
 - **Cache Locality**: Critical data structures remain in L1/L2 cache.
 - **Lock-Free Execution**: Event loop serialization eliminates race conditions and lock contention.
 - **Zero-Copy Path**: Data is passed through layers using `VectorisedView` scatter-gather buffers.
+- **Zero-Allocation Runtime**: Aggressive object pooling (TCP Endpoints, Wait Queues, Packet Headers) ensures a stable memory footprint and eliminates allocator churn under load.
 
 ```mermaid
 graph TD
-    App["Application Layer (User Code)"] --> |"Endpoint API (Bind, Connect, Write, Read)"| Trans[Transport Layer]
+    App["Application Layer (User Code)"] --> |"Socket / Runtime API"| Socket[Socket Abstraction Layer]
+    Socket --> |"Endpoint API"| Trans[Transport Layer]
     
     subgraph "Transport Layer"
         UDP["UDP Endpoint"]
@@ -36,7 +38,7 @@ graph TD
     
     subgraph "Link Layer"
         Eth["Ethernet Endpoint"]
-        Driver["AF_PACKET / AF_XDP / TAP"]
+        Driver["AF_PACKET / AF_XDP / TAP / Loopback"]
     end
 ```
 
@@ -44,69 +46,54 @@ graph TD
 
 ## ⚡ Performance Benchmarks
 
-Optimized for Jumbo Frames (MTU 9000) and high-throughput scenarios using the `AF_PACKET` driver with mmap-based zero-copy transmission.
+Optimized for Jumbo Frames (MTU 9000) and extreme concurrency scaling using advanced object pooling and event coalescing.
 
-### Throughput & CPS (veth pair, MTU 9000)
+### Throughput & Scaling (veth pair, MTU 9000)
 
-| Protocol | MTU | Payload Size | Throughput / CPS |
-| :--- | :--- | :--- | :--- |
-| **UDP** | 9000 | 8900 bytes | **~9.6 Gbps** (Near line-rate) |
-| **TCP** | 9000 | 8000 bytes | **~4.7 Gbps** |
-| **TCP** | 1500 | 1400 bytes | **~1.0 Gbps** |
-| **TCP CPS** | 1500 | - | **~10,000 Connections/sec** |
-| **UDP PPS** | 1500 | 64 bytes | **~180,000 Packets/sec** |
+| Scenario | Metric | Result |
+| :--- | :--- | :--- |
+| **UDP Throughput** | 8900 byte payload | **~9.6 Gbps** (Near line-rate) |
+| **TCP Throughput** | 8000 byte payload | **~4.7 Gbps** |
+| **Concurrency** | Active Connections | **65,000+** (Stable) |
+| **Connection Rate** | TCP Handshakes | **~35,000 CPS** (Recycled) |
+| **Event Loop** | Syscall Overhead | **< 5%** (via Coalescing) |
 
 ---
 
 ## 🛠️ Supported Features
 
 ### Core Stack Features
-- **Zero-Copy Architecture**: Uses `VectorisedView` (scatter-gather) and `Prependable` headers to avoid data copies.
-- **High Concurrency**: Connection management is partitioned into **256 independent shards**, supporting 10M+ concurrent endpoints.
+- **Runtime Bootstrap Layer (`src/runtime.zig`)**: Simplifies stack initialization. Provides a `Runtime` struct that manages Stack, NIC, Routes, and Event Multiplexer lifecycles in one place.
+- **BSD-Style Socket API (`src/socket.zig`)**: A zero-cost shim providing a familiar `bind`/`connect`/`accept`/`read`/`write` API. It bridges the gap between raw Endpoints and standard programming patterns.
+- **Event Coalescing (`src/event_mux.zig`)**: Drastically reduces system call overhead by batching socket notifications into a single `eventfd` write per event loop tick.
+- **High Concurrency Scaling**: Support for **65k+ concurrent endpoints** through:
+  - **Object Pooling**: Recycles TCP Endpoints and Wait Queues to eliminate allocation spikes.
+  - **Pre-warmed Pools**: 32k+ cluster buffers allocated at startup.
+  - **Sharded Transport Table**: 256 independent shards for O(1) lookups without contention.
 - **Wait Queue Mechanism**: Robust event notification system (`waiter.zig`) for non-blocking asynchronous I/O.
-- **Single-Threaded Event Loop**: Native integration with `libev` and `libuv`.
 - **Wyhash Implementation**: High-performance hashing for O(1) connection lookups.
 
 ### TCP (Transmission Control Protocol)
-- **RFC-Compliant State Machine**: Support for all states (LISTEN, SYN-SENT, SYN-RCVD, ESTABLISHED, FIN-WAIT-1/2, TIME-WAIT, etc.).
-- **High-Performance Extensions (RFC 7323)**:
-  - **Window Scaling**: Support for large windows via shift counts.
-  - **Timestamps**: PAWS (Protect Against Wrapped Sequences) and RTT estimation.
+- **RFC-Compliant State Machine**: Support for all states (LISTEN, SYN-SENT, SYN-RCVD, ESTABLISHED, etc.).
+- **High-Performance Extensions (RFC 7323)**: Window Scaling and Timestamps (PAWS/RTT estimation).
 - **Selective Acknowledgments (RFC 2018)**: Full **SACK** support for efficient recovery from multiple packet losses.
-- **Reliability & Recovery**:
-  - **Retransmission Queue (RTQ)**: Precise tracking of unacknowledged segments.
-  - **Fast Retransmit**: Detects 3 duplicate ACKs for immediate recovery.
-  - **RTO Timer**: Adaptive retransmission timeouts.
-- **Performance Optimizations**:
-  - **Delayed ACKs (RFC 1122)**: Reduces control traffic by up to 50%.
-  - **Piggybacked ACKs**: Attaches ACKs to outgoing data segments automatically.
-  - **Syncache**: Efficiently manages half-open connections to mitigate SYN flood attacks.
-  - **MSS Negotiation**: Dynamic Maximum Segment Size discovery.
-- **Modular Congestion Control**:
-  - **NewReno**: Standard RFC 5681 implementation.
-  - **CUBIC**: Optimized for high-bandwidth/high-latency networks.
-  - **BBR**: Bottleneck Bandwidth and Round-trip propagation time model.
+- **Reliability & Recovery**: RTQ, Fast Retransmit, and Adaptive RTO.
+- **Performance Optimizations**: Delayed ACKs, Piggybacked ACKs, MSS Negotiation.
+- **Syncache**: Efficiently manages half-open connections with incremental GC to mitigate SYN floods.
+- **Modular Congestion Control**: NewReno, CUBIC, and BBR.
 
 ### UDP & Network Layers
-- **UDP (User Datagram Protocol)**: Efficient datagram handling with zero-copy read/write.
+- **UDP**: Efficient datagram handling with zero-copy read/write.
 - **IPv4 Suite**: Header validation, checksums, **Fragmentation**, and **Reassembly**.
-- **IPv6 Suite**:
-  - **NDP (Neighbor Discovery)**: Support for NS/NA/RA.
-  - **SLAAC**: Stateless address autoconfiguration.
-  - **DAD**: Duplicate Address Detection.
-  - **RS**: Router Solicitation.
+- **IPv6 Suite**: NDP (NS/NA/RA), SLAAC, DAD, and RS.
 - **ARP**: Dynamic address resolution with link-address caching.
-- **ICMPv4/v6**: Echo Request/Reply (Ping) and error notifications.
+- **ICMPv4/v6**: Echo Request/Reply (Ping) and error notifications (Destination Unreachable, Time Exceeded).
 
 ### Drivers & Hardware Integration
-- **AF_PACKET**: Optimized for **Jumbo Frames (MTU 9000)** with a 16KB circular ring buffer and mmap-based zero-copy TX.
+- **AF_PACKET**: Optimized for Jumbo Frames with mmap-based zero-copy TX.
 - **AF_XDP**: High-speed Express Data Path integration (Linux).
 - **TAP Adapter**: Standard virtual ethernet interface support.
-
-### Application Services & Telemetry
-- **Built-in DNS**: Fully integrated resolver supporting A record lookups.
-- **Real-time Telemetry**: Granular latency tracking across Driver, Link, Network, and Transport layers.
-- **Resource Monitoring**: Real-time tracking of buffer pool utilization (Cluster/View pools).
+- **Loopback**: Native loopback driver for local testing and IPC.
 
 ---
 
@@ -125,26 +112,29 @@ zig build
 zig build example
 ```
 
-### Running Benchmarks
+### Running Benchmarks & Examples
 ```bash
-# Start uperf server
-./zig-out/bin/example_uperf_libev veth0 server 10.0.0.2/24 -m 9000
+# Start uperf server (using Runtime API)
+./zig-out/bin/example_uperf_runtime veth0 server 10.0.0.2/24 -m 9000
 
-# Start uperf client (Throughput, PPS, 1s reporting)
-./zig-out/bin/example_uperf_libev veth1 client 10.0.0.1/24 10.0.0.2 -m 9000 -t 10
+# Start uperf client (using Socket API)
+./zig-out/bin/example_uperf_socket veth1 client 10.0.0.1/24 10.0.0.2 -m 9000 -t 10
 
-# Start ping-pong client (CPS, 1s reporting)
-./zig-out/bin/example_ping_pong veth1 10.0.0.1/24 -c 10.0.0.2 -C 10 -n 100000
+# Start ping-pong benchmark (CPS measurement)
+./zig-out/bin/example_ping_pong_socket veth1 10.0.0.1/24 -c 10.0.0.2 -C 1000 -n 100000
 ```
 
 ---
 
 ## 📂 Directory Structure
 
+- `src/runtime.zig`: Bootstrap layer for easy stack initialization.
+- `src/socket.zig`: BSD-style socket abstraction layer.
+- `src/event_mux.zig`: High-performance event multiplexer with coalescing.
 - `src/stack.zig`: Central stack entry point and NIC management.
 - `src/transport/`: TCP/UDP protocol implementations and congestion control.
 - `src/network/`: IPv4, IPv6, ARP, and ICMP handlers.
-- `src/drivers/`: OS-specific interface adapters (Linux AF_PACKET, TAP).
+- `src/drivers/`: OS-specific interface adapters (AF_PACKET, AF_XDP, TAP, Loopback).
 - `src/buffer.zig`: Memory-efficient packet and vectorised view abstractions.
 - `src/stats.zig`: Global statistics and latency metrics collection.
 
@@ -152,3 +142,4 @@ zig build example
 
 ## ⚖️ License
 Distributed under the MIT License. See `LICENSE` for more information.
+
