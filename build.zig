@@ -81,25 +81,18 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         exe.root_module.addImport("ustack", ustack_mod);
-        // exe.linkLibrary(lib);
         exe.linkLibC();
-
         exe.linkSystemLibrary(ex.lib);
-        if (std.mem.eql(u8, ex.name, "example_tap_libev") or
-            std.mem.eql(u8, ex.name, "example_tap_libev_mux") or
-            std.mem.eql(u8, ex.name, "example_af_packet_libev") or
-            std.mem.eql(u8, ex.name, "example_af_packet_libev_mux") or
-            std.mem.eql(u8, ex.name, "example_unified") or
-            std.mem.eql(u8, ex.name, "example_uperf_libev") or
-            std.mem.eql(u8, ex.name, "example_uperf_socket") or
-            std.mem.eql(u8, ex.name, "example_uperf_runtime") or
-            std.mem.eql(u8, ex.name, "example_uperf_posix") or
-            std.mem.eql(u8, ex.name, "example_af_xdp_libev") or
-            std.mem.eql(u8, ex.name, "example_ping_pong") or
-            std.mem.eql(u8, ex.name, "example_ping_pong_socket"))
-        {
-            exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
-        }
+
+        // All examples need the libev wrapper
+        exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
+
+        // All examples currently pull in AF_XDP via the stack dispatcher, so they need the loader and libbpf
+        exe.addCSourceFile(.{ .file = b.path("src/drivers/linux/bpf_loader.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
+        exe.linkSystemLibrary("bpf");
+        exe.linkSystemLibrary("elf");
+        exe.linkSystemLibrary("z");
+
         const install = b.addInstallArtifact(exe, .{});
         example_step.dependOn(&install.step);
     }

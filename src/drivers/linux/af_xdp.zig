@@ -6,6 +6,9 @@ const xdp = @import("xdp_defs.zig");
 const log = @import("../../log.zig").scoped(.af_xdp);
 const stats = @import("../../stats.zig");
 
+extern fn load_xdp_and_get_xsk_map(ifname: [*:0]const u8, filename: [*:0]const u8) i32;
+extern fn bpf_map_update_elem(fd: i32, key: ?*const anyopaque, value: ?*const anyopaque, flags: u64) i32;
+
 /// A LinkEndpoint implementation for Linux AF_XDP (Express Data Path).
 pub const AfXdp = struct {
     fd: std.posix.fd_t,
@@ -129,6 +132,22 @@ pub const AfXdp = struct {
             .shared_umem_fd = 0,
         };
         try std.posix.bind(fd, @as(*const std.posix.sockaddr, @ptrCast(&sa)), @sizeOf(xdp.sockaddr_xdp));
+
+        // 7.5 Load BPF and Update Map
+        var buf: [128]u8 = undefined;
+        const if_name_c = try std.fmt.bufPrintZ(&buf, "{s}", .{if_name});
+        const map_fd = load_xdp_and_get_xsk_map(if_name_c, "src/drivers/linux/xdp_prog.o");
+        if (map_fd < 0) {
+            log.err("AF_XDP: Failed to load BPF program: {}", .{map_fd});
+            return error.BpfLoadFailed;
+        }
+        defer std.posix.close(map_fd);
+
+        const key: i32 = @intCast(queue_id);
+        const value: i32 = fd;
+        if (bpf_map_update_elem(map_fd, &key, &value, 0) != 0) {
+            return error.BpfMapUpdateFailed;
+        }
 
         var fm = try FrameManager.init(allocator, NUM_FRAMES);
         errdefer fm.deinit(allocator);
@@ -408,9 +427,9 @@ pub const AfXdp = struct {
         @memset(std.mem.asBytes(&ifr), 0);
         const copy_len = @min(name.len, 15);
         @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
-        const header = @import("../../header.zig"); // Use header constants
+        const header_defs = @import("../../header.zig");
 
-        const rc = std.os.linux.ioctl(fd, header.SIOCGIFINDEX, @intFromPtr(&ifr));
+        const rc = std.os.linux.ioctl(fd, header_defs.SIOCGIFINDEX, @intFromPtr(&ifr));
         if (std.posix.errno(rc) != .SUCCESS) return error.IoctlFailed;
         return @as(u32, @intCast(ifr.ifru.ivalue));
     }
@@ -423,9 +442,9 @@ pub const AfXdp = struct {
         @memset(std.mem.asBytes(&ifr), 0);
         const copy_len = @min(name.len, 15);
         @memcpy(ifr.ifrn.name[0..copy_len], name[0..copy_len]);
-        const header = @import("../../header.zig");
+        const header_defs = @import("../../header.zig");
 
-        const rc = std.os.linux.ioctl(fd, header.SIOCGIFHWADDR, @intFromPtr(&ifr));
+        const rc = std.os.linux.ioctl(fd, header_defs.SIOCGIFHWADDR, @intFromPtr(&ifr));
         if (std.posix.errno(rc) != .SUCCESS) return error.IoctlFailed;
 
         var mac: [6]u8 = undefined;
