@@ -47,6 +47,10 @@ pub const Socket = struct {
         self.allocator.destroy(self.wait_queue);
         self.allocator.destroy(self);
     }
+
+    pub fn setOption(self: *Socket, opt: tcpip.EndpointOption) !void {
+        return self.endpoint.setOption(opt);
+    }
 };
 
 // Global-ish API functions
@@ -109,22 +113,22 @@ pub fn uaccept(sock: *Socket, addr: ?*std.posix.sockaddr, len: ?*std.posix.sockl
     return Socket.init(sock.allocator, res.ep, res.wq);
 }
 
-pub fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
+pub inline fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
     _ = flags;
     var iov = [_][]u8{buf};
     var uio = buffer.Uio.init(&iov);
     return sock.endpoint.readv(&uio, null) catch |err| {
-        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        if (err == tcpip.Error.WouldBlock or err == tcpip.Error.InvalidEndpointState) return error.WouldBlock;
         return err;
     };
 }
 
-pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
+pub inline fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
     _ = flags;
-    var iov = [_][]u8{@constCast(buf)};
-    var uio = buffer.Uio.init(&iov);
-    return sock.endpoint.writev(&uio, .{}) catch |err| {
-        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+    var views = [_]buffer.ClusterView{.{ .cluster = null, .view = @constCast(buf) }};
+    const data = buffer.VectorisedView.init(buf.len, &views);
+    return sock.endpoint.writeView(data, .{}) catch |err| {
+        if (err == tcpip.Error.WouldBlock or err == tcpip.Error.InvalidEndpointState) return error.WouldBlock;
         return err;
     };
 }
@@ -132,7 +136,7 @@ pub fn usend(sock: *Socket, buf: []const u8, flags: u32) !usize {
 pub fn ureadv(sock: *Socket, iov: []const []u8) !usize {
     var uio = buffer.Uio.init(iov);
     return sock.endpoint.readv(&uio, null) catch |err| {
-        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        if (err == tcpip.Error.WouldBlock or err == tcpip.Error.InvalidEndpointState) return error.WouldBlock;
         return err;
     };
 }
@@ -140,7 +144,7 @@ pub fn ureadv(sock: *Socket, iov: []const []u8) !usize {
 pub fn uwritev(sock: *Socket, iov: []const []u8) !usize {
     var uio = buffer.Uio.init(iov);
     return sock.endpoint.writev(&uio, .{}) catch |err| {
-        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        if (err == tcpip.Error.WouldBlock or err == tcpip.Error.InvalidEndpointState) return error.WouldBlock;
         return err;
     };
 }
@@ -151,7 +155,7 @@ pub fn urecvfrom(sock: *Socket, buf: []u8, flags: u32, addr: ?*std.posix.sockadd
     var uio = buffer.Uio.init(&iov);
     var full_addr: tcpip.FullAddress = undefined;
     const n = sock.endpoint.readv(&uio, &full_addr) catch |err| {
-        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        if (err == tcpip.Error.WouldBlock or err == tcpip.Error.InvalidEndpointState) return error.WouldBlock;
         return err;
     };
     if (addr) |out_addr| {
@@ -172,13 +176,380 @@ pub fn usendto(sock: *Socket, buf: []const u8, flags: u32, addr: ?*const std.pos
         opts.to = &full_addr;
     }
     return sock.endpoint.writev(&uio, opts) catch |err| {
-        if (err == tcpip.Error.WouldBlock) return error.WouldBlock;
+        if (err == tcpip.Error.WouldBlock or err == tcpip.Error.InvalidEndpointState) return error.WouldBlock;
         return err;
     };
 }
 
 pub fn uclose(sock: *Socket) void {
     sock.deinit();
+}
+
+pub const File = union(enum) {
+    socket: *Socket,
+    epoll: *EpollInstance,
+};
+
+pub const uepoll_event = struct {
+    events: u32,
+    data: std.os.linux.epoll_data,
+};
+
+pub const EpollInstance = struct {
+    allocator: std.mem.Allocator,
+    interests: std.AutoHashMap(i32, EpollInterest),
+    ready_list: std.ArrayList(i32),
+    signal_fd: i32,
+    signaled: bool = false,
+
+    const EpollInterest = struct {
+        events: u32,
+        data: std.os.linux.epoll_data,
+        wait_entry: waiter.Entry,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) !*EpollInstance {
+        const self = try allocator.create(EpollInstance);
+        self.* = .{
+            .allocator = allocator,
+            .interests = std.AutoHashMap(i32, EpollInterest).init(allocator),
+            .ready_list = std.ArrayList(i32).init(allocator),
+            .signal_fd = try std.posix.eventfd(0, 0x800),
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *EpollInstance) void {
+        var it = self.interests.iterator();
+        while (it.next()) |entry| {
+            // Unregister from socket
+            const ft = if (global_file_table) |*t| t else return;
+            const file = ft.get(entry.key_ptr.*) orelse continue;
+            switch (file) {
+                .socket => |s| s.wait_queue.eventUnregister(&entry.value_ptr.wait_entry),
+                else => {},
+            }
+        }
+        self.interests.deinit();
+        self.ready_list.deinit();
+        std.posix.close(self.signal_fd);
+        self.allocator.destroy(self);
+    }
+
+    fn notifyCallback(e: *waiter.Entry) void {
+        const self = @as(*EpollInstance, @ptrCast(@alignCast(e.context.?)));
+        const fd = @as(i32, @intCast(@intFromPtr(e.upcall_ctx))); // Store FD in upcall_ctx for simplicity
+
+        // Check if already in ready list
+        for (self.ready_list.items) |rfd| {
+            if (rfd == fd) return;
+        }
+        self.ready_list.append(fd) catch {};
+
+        if (!self.signaled) {
+            self.signaled = true;
+            const val: u64 = 1;
+            _ = std.posix.write(self.signal_fd, std.mem.asBytes(&val)) catch {
+                self.signaled = false;
+            };
+        }
+    }
+};
+
+pub fn uepoll_create(size: i32) !i32 {
+    _ = size;
+    const ft = getGlobalFileTable(std.heap.page_allocator); // Assuming page_allocator for global storage
+    const ep = try EpollInstance.init(ft.allocator);
+    return ft.alloc(.{ .epoll = ep }) catch |err| {
+        ep.deinit();
+        return err;
+    };
+}
+
+pub fn uepoll_ctl(epfd: i32, op: i32, fd: i32, event: ?*uepoll_event) !void {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const ep_file = ft.get(epfd) orelse return error.BadFileDescriptor;
+    const ep = switch (ep_file) {
+        .epoll => |e| e,
+        else => return error.InvalidArguments,
+    };
+
+    const target_file = ft.get(fd) orelse return error.BadFileDescriptor;
+    const sock = switch (target_file) {
+        .socket => |s| s,
+        else => return error.InvalidArguments,
+    };
+
+    switch (op) {
+        std.os.linux.EPOLL.CTL_ADD => {
+            if (ep.interests.contains(fd)) return error.FileExists;
+            const ev = event orelse return error.InvalidArguments;
+
+            var interest = EpollInstance.EpollInterest{
+                .events = ev.events,
+                .data = ev.data,
+                .wait_entry = undefined,
+            };
+            interest.wait_entry = waiter.Entry.init(ep, EpollInstance.notifyCallback);
+            interest.wait_entry.upcall_ctx = @ptrFromInt(@as(usize, @intCast(fd)));
+
+            try ep.interests.put(fd, interest);
+            const entry = ep.interests.getPtr(fd).?;
+            sock.wait_queue.eventRegister(&entry.wait_entry, pollToWaiter(@intCast(ev.events)));
+        },
+        std.os.linux.EPOLL.CTL_MOD => {
+            const entry = ep.interests.getPtr(fd) orelse return error.NoEntity;
+            const ev = event orelse return error.InvalidArguments;
+
+            sock.wait_queue.eventUnregister(&entry.wait_entry);
+            entry.events = ev.events;
+            entry.data = ev.data;
+            sock.wait_queue.eventRegister(&entry.wait_entry, pollToWaiter(@intCast(ev.events)));
+        },
+        std.os.linux.EPOLL.CTL_DEL => {
+            const entry = ep.interests.getPtr(fd) orelse return error.NoEntity;
+            sock.wait_queue.eventUnregister(&entry.wait_entry);
+            _ = ep.interests.remove(fd);
+
+            // Remove from ready list if present
+            for (ep.ready_list.items, 0..) |rfd, i| {
+                if (rfd == fd) {
+                    _ = ep.ready_list.orderedRemove(i);
+                    break;
+                }
+            }
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn uepoll_wait(epfd: i32, events: []uepoll_event, timeout_ms: i32) !usize {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const ep_file = ft.get(epfd) orelse return error.BadFileDescriptor;
+    const ep = switch (ep_file) {
+        .epoll => |e| e,
+        else => return error.InvalidArguments,
+    };
+
+    if (ep.ready_list.items.len == 0 and timeout_ms != 0) {
+        // In a single-threaded stack, we can't block here as no events would ever arrive.
+        // We just return 0 to allow the event loop to continue or the stack to process packets.
+    }
+
+    // Drain signal if any
+    if (ep.signaled) {
+        var val: u64 = 0;
+        _ = std.posix.read(ep.signal_fd, std.mem.asBytes(&val)) catch {};
+        ep.signaled = false;
+    }
+
+    var count: usize = 0;
+    while (count < events.len and ep.ready_list.items.len > 0) {
+        const fd = ep.ready_list.orderedRemove(0);
+        const interest = ep.interests.get(fd) orelse continue;
+
+        const target_file = ft.get(fd) orelse continue;
+        const sock = switch (target_file) {
+            .socket => |s| s,
+            else => continue,
+        };
+
+        const mask = sock.wait_queue.events();
+        const interested = pollToWaiter(@intCast(interest.events));
+        const fired = mask & interested;
+
+        if (fired != 0) {
+            events[count] = .{
+                .events = @intCast(waiterToPoll(fired)),
+                .data = interest.data,
+            };
+            count += 1;
+        }
+    }
+    return count;
+}
+
+pub fn uepoll_get_fd(epfd: i32) !i32 {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const ep_file = ft.get(epfd) orelse return error.BadFileDescriptor;
+    return switch (ep_file) {
+        .epoll => |e| e.signal_fd,
+        else => error.InvalidArguments,
+    };
+}
+
+pub const FileTable = struct {
+    files: std.ArrayList(?File),
+    free_list: std.ArrayList(i32),
+    allocator: std.mem.Allocator,
+    const fd_start = 1024;
+
+    pub fn init(allocator: std.mem.Allocator) FileTable {
+        return .{
+            .files = std.ArrayList(?File).init(allocator),
+            .free_list = std.ArrayList(i32).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *FileTable) void {
+        for (self.files.items) |maybe_file| {
+            if (maybe_file) |f| {
+                switch (f) {
+                    .socket => |s| s.deinit(),
+                    .epoll => |e| e.deinit(),
+                }
+            }
+        }
+        self.files.deinit();
+        self.free_list.deinit();
+    }
+
+    pub fn alloc(self: *FileTable, file: File) !i32 {
+        if (self.free_list.popOrNull()) |fd| {
+            self.files.items[@intCast(fd - fd_start)] = file;
+            return fd;
+        }
+        const fd = @as(i32, @intCast(self.files.items.len)) + fd_start;
+        try self.files.append(file);
+        return fd;
+    }
+
+    pub inline fn get(self: *FileTable, fd: i32) ?File {
+        if (fd < fd_start or fd >= @as(i32, @intCast(self.files.items.len)) + fd_start) return null;
+        return self.files.items[@intCast(fd - fd_start)];
+    }
+
+    pub fn free(self: *FileTable, fd: i32) void {
+        if (fd < fd_start or fd >= @as(i32, @intCast(self.files.items.len)) + fd_start) return;
+        self.files.items[@intCast(fd - fd_start)] = null;
+        self.free_list.append(fd) catch {};
+    }
+};
+
+var global_file_table: ?FileTable = null;
+
+pub fn getGlobalFileTable(allocator: std.mem.Allocator) *FileTable {
+    if (global_file_table == null) {
+        global_file_table = FileTable.init(allocator);
+    }
+    return &global_file_table.?;
+}
+
+pub fn socket_fd(s: *stack.Stack, domain: i32, sock_type: i32, protocol: i32) !i32 {
+    const sock = try usocket(s, domain, sock_type, protocol);
+    const ft = getGlobalFileTable(s.allocator);
+    return ft.alloc(.{ .socket = sock }) catch |err| {
+        sock.deinit();
+        return err;
+    };
+}
+
+pub fn bind_fd(fd: i32, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| try ubind(s, addr, len),
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn listen_fd(fd: i32, backlog: i32) !void {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| try ulisten(s, backlog),
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn accept_fd(fd: i32, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !i32 {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| {
+            const accepted = try uaccept(s, addr, len);
+            return ft.alloc(.{ .socket = accepted }) catch |err| {
+                accepted.deinit();
+                return err;
+            };
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn connect_fd(fd: i32, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| try uconnect(s, addr, len),
+        else => return error.InvalidArguments,
+    }
+}
+
+pub inline fn recv_fd(fd: i32, buf: []u8, flags: u32) !usize {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| return urecv(s, buf, flags),
+        else => return error.InvalidArguments,
+    }
+}
+
+pub inline fn send_fd(fd: i32, buf: []const u8, flags: u32) !usize {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| return usend(s, buf, flags),
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn usend_zc_fd(fd: i32, buf: []const u8, cb: buffer.ConsumptionCallback) !usize {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| {
+            return s.endpoint.writeZeroCopy(@constCast(buf), cb, .{}) catch |err| {
+                if (err == tcpip.Error.WouldBlock or err == tcpip.Error.InvalidEndpointState) return error.WouldBlock;
+                return err;
+            };
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn recvfrom_fd(fd: i32, buf: []u8, flags: u32, addr: ?*std.posix.sockaddr, len: ?*std.posix.socklen_t) !usize {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| return urecvfrom(s, buf, flags, addr, len),
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn sendto_fd(fd: i32, buf: []const u8, flags: u32, addr: ?*const std.posix.sockaddr, len: std.posix.socklen_t) !usize {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+    const file = ft.get(fd) orelse return error.BadFileDescriptor;
+    switch (file) {
+        .socket => |s| return usendto(s, buf, flags, addr, len),
+        else => return error.InvalidArguments,
+    }
+}
+
+pub fn close_fd(fd: i32) void {
+    const ft = if (global_file_table) |*t| t else return;
+    const file = ft.get(fd) orelse return;
+    switch (file) {
+        .socket => |s| {
+            s.deinit();
+            ft.free(fd);
+        },
+        .epoll => |e| {
+            e.deinit();
+            ft.free(fd);
+        },
+    }
 }
 
 // Helpers
@@ -363,6 +734,87 @@ fn pollToWaiter(events: i16) waiter.EventMask {
     return mask;
 }
 
+pub const PollFdFd = struct {
+    fd: i32,
+    events: i16,
+    revents: i16,
+};
+
+/// Polls multiple file descriptors for events.
+pub fn upoll_fd(fds: []PollFdFd, timeout_ms: i32) !usize {
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+
+    // Convert PollFdFd to PollFd (pointer-based)
+    const pfds = try ft.allocator.alloc(PollFd, fds.len);
+    defer ft.allocator.free(pfds);
+
+    for (fds, 0..) |pfd_fd, i| {
+        const file = ft.get(pfd_fd.fd) orelse return error.BadFileDescriptor;
+        switch (file) {
+            .socket => |s| {
+                pfds[i] = .{
+                    .sock = s,
+                    .events = pfd_fd.events,
+                    .revents = 0,
+                };
+            },
+            else => return error.InvalidArguments,
+        }
+    }
+
+    const n = try upoll(pfds, timeout_ms);
+
+    // Sync results back
+    for (pfds, 0..) |pfd, i| {
+        fds[i].revents = pfd.revents;
+    }
+
+    return n;
+}
+
+pub fn uselect_fd(nfds: i32, readfds: ?*std.posix.fd_set, writefds: ?*std.posix.fd_set, exceptfds: ?*std.posix.fd_set, timeout: ?*std.posix.timeval) !i32 {
+    _ = exceptfds;
+    const ft = if (global_file_table) |*t| t else return error.BadFileDescriptor;
+
+    // Convert select to poll
+    var poll_fds = std.ArrayList(PollFdFd).init(ft.allocator);
+    defer poll_fds.deinit();
+
+    var i: i32 = 0;
+    while (i < nfds) : (i += 1) {
+        var events: i16 = 0;
+        if (readfds) |rfds| {
+            if (std.posix.FD_ISSET(@intCast(i), rfds)) events |= POLLIN;
+        }
+        if (writefds) |wfds| {
+            if (std.posix.FD_ISSET(@intCast(i), wfds)) events |= POLLOUT;
+        }
+
+        if (events != 0) {
+            try poll_fds.append(.{ .fd = i, .events = events, .revents = 0 });
+        }
+    }
+
+    const timeout_ms: i32 = if (timeout) |t| @intCast(t.tv_sec * 1000 + @divTrunc(t.tv_usec, 1000)) else -1;
+
+    const n = try upoll_fd(poll_fds.items, timeout_ms);
+
+    // Clear and set result sets
+    if (readfds) |rfds| std.posix.FD_ZERO(rfds);
+    if (writefds) |wfds| std.posix.FD_ZERO(wfds);
+
+    for (poll_fds.items) |pfd| {
+        if (pfd.revents & POLLIN != 0) {
+            if (readfds) |rfds| std.posix.FD_SET(@intCast(pfd.fd), rfds);
+        }
+        if (pfd.revents & POLLOUT != 0) {
+            if (writefds) |wfds| std.posix.FD_SET(@intCast(pfd.fd), wfds);
+        }
+    }
+
+    return @intCast(n);
+}
+
 /// Polls multiple sockets for events.
 /// timeout_ms: < 0 (infinite), 0 (immediate), > 0 (wait time)
 pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
@@ -399,24 +851,17 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
     // Wait on the local condition variable.
     // Unregister from all.
 
-    var mutex = std.Thread.Mutex{};
-    var cond = std.Thread.Condition{};
     var fired = false;
 
     const PollContext = struct {
-        mutex: *std.Thread.Mutex,
-        cond: *std.Thread.Condition,
         fired: *bool,
     };
-    var ctx = PollContext{ .mutex = &mutex, .cond = &cond, .fired = &fired };
+    var ctx = PollContext{ .fired = &fired };
 
     const callback = struct {
         fn cb(e: *waiter.Entry) void {
             const c = @as(*PollContext, @ptrCast(@alignCast(e.context.?)));
-            c.mutex.lock();
             c.fired.* = true;
-            c.cond.signal();
-            c.mutex.unlock();
         }
     }.cb;
 
@@ -438,17 +883,12 @@ pub fn upoll(fds: []PollFd, timeout_ms: i32) !usize {
     }
 
     // Wait
-    mutex.lock();
-    if (!fired) {
-        if (timeout_ms < 0) {
-            cond.wait(&mutex);
-        } else {
-            // timedWait expects nanoseconds
-            const ns = @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms;
-            _ = cond.timedWait(&mutex, ns) catch {};
-        }
+    if (!fired and timeout_ms != 0) {
+        // In a single-threaded stack, we cannot block and wait for an external event
+        // because the stack itself isn't running to receive the event.
+        // We can either sleep or return. We'll just return to satisfy non-blocking loops.
+        // If we really wanted to wait, we'd sleep, but that blocks the event loop.
     }
-    mutex.unlock();
 
     // Unregister
     for (fds, 0..) |*pfd, i| {
@@ -515,12 +955,9 @@ test "POSIX upoll basic" {
         .{ .sock = sock, .events = POLLIN, .revents = 0 },
     };
 
-    // 1. Poll empty (should timeout)
-    const start = std.time.milliTimestamp();
+    // 1. Poll empty (should return 0 immediately)
     const n = try upoll(&fds, 100);
-    const end = std.time.milliTimestamp();
     try std.testing.expectEqual(@as(usize, 0), n);
-    try std.testing.expect(end - start >= 90); // Allow some jitter
 
     // 2. Poll with data
     // Inject packet to make it readable
@@ -553,4 +990,79 @@ test "POSIX upoll basic" {
     const n2 = try upoll(&fds, 100);
     try std.testing.expectEqual(@as(usize, 1), n2);
     try std.testing.expect(fds[0].revents & POLLIN != 0);
+}
+
+test "FD-based API basic" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer {
+        s.deinit();
+        if (global_file_table) |*ft| {
+            ft.deinit();
+            global_file_table = null;
+        }
+    }
+
+    var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
+    try s.registerTransportProtocol(udp_proto.protocol());
+    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+
+    // 1. socket_fd
+    const fd = try socket_fd(&s, std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+    try std.testing.expect(fd >= 0);
+
+    // 2. bind_fd
+    const addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 1234),
+        .addr = 0,
+        .zero = [_]u8{0} ** 8,
+    };
+    try bind_fd(fd, @as(std.posix.sockaddr, @bitCast(addr)), @sizeOf(std.posix.sockaddr.in));
+
+    // 3. upoll_fd
+    var pfds = [_]PollFdFd{
+        .{ .fd = fd, .events = POLLIN, .revents = 0 },
+    };
+    const n = try upoll_fd(&pfds, 0);
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    // 4. close_fd
+    close_fd(fd);
+    try std.testing.expect(global_file_table.?.get(fd) == null);
+}
+
+test "Epoll FD-based API" {
+    const allocator = std.testing.allocator;
+    var s = try stack.Stack.init(allocator);
+    defer {
+        s.deinit();
+        if (global_file_table) |*ft| {
+            ft.deinit();
+            global_file_table = null;
+        }
+    }
+
+    var tcp_proto = @import("transport/tcp.zig").TCPProtocol.init(allocator);
+    try s.registerTransportProtocol(tcp_proto.protocol());
+    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
+
+    const epfd = try uepoll_create(10);
+    const sfd = try socket_fd(&s, std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+
+    var ev = uepoll_event{
+        .events = POLLIN,
+        .data = .{ .fd = sfd },
+    };
+    try uepoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, sfd, &ev);
+
+    // Should timeout/be empty
+    var events: [1]uepoll_event = undefined;
+    const n = try uepoll_wait(epfd, &events, 0);
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    close_fd(sfd);
+    close_fd(epfd);
 }
