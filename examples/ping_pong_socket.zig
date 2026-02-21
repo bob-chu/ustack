@@ -7,7 +7,7 @@ const waiter = ustack.waiter;
 const header = ustack.header;
 const AfPacket = ustack.drivers.af_packet.AfPacket;
 const EventMultiplexer = ustack.event_mux.EventMultiplexer;
-const socket = ustack.socket;
+const Socket = ustack.socket.Socket;
 const stats = @import("ustack").stats;
 
 const c = @cImport({
@@ -179,7 +179,7 @@ extern fn my_ev_timer_init(w: *c.ev_timer, cb: *const fn (?*anyopaque, *c.ev_tim
 extern fn my_ev_io_start(loop: ?*anyopaque, w: *c.ev_io) void;
 extern fn my_ev_timer_start(loop: ?*anyopaque, w: *c.ev_timer) void;
 extern fn my_ev_run(loop: ?*anyopaque) void;
-extern fn my_ev_break(loop: ?*anyopaque) void;
+extern fn my_ev_break(loop: ?*anyopaque, how: i32) void;
 
 var global_loop: ?*anyopaque = null;
 var global_mark_done: bool = false;
@@ -187,6 +187,7 @@ var global_done_time: i64 = 0;
 var global_start_time: i64 = 0;
 var last_tick_time: i64 = 0;
 var global_client: ?*PingClient = null;
+var global_server: ?*PingServer = null;
 
 fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
@@ -195,10 +196,11 @@ fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callco
     var budget: usize = 1024;
     while (budget > 0) : (budget -= 1) {
         const ok = global_af_packet.readPacket() catch {
-            return;
+            break;
         };
         if (!ok) break;
     }
+    global_stack.flush();
 }
 
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
@@ -212,17 +214,24 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     if (diff > 0) {
         _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(diff)));
         last_tick_time = now;
+        global_stack.flush();
         perform_cleanup();
+        
         if (global_client) |client| {
+            client.report(now);
             client.refill();
+        }
+        if (global_server) |server| {
+            server.report(now);
         }
     }
 
     if (global_mark_done) {
         if (std.time.milliTimestamp() - global_done_time >= 1000) {
-            if (global_loop) |l| my_ev_break(l);
+            if (global_loop) |l| my_ev_break(l, 2);
         }
     }
+    global_stack.flush();
 }
 
 fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
@@ -232,74 +241,89 @@ fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C)
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
         for (ready) |entry| {
-            socket.Socket.dispatch(entry);
+            Socket.dispatch(entry);
         }
     }
+    global_stack.flush();
+    perform_cleanup();
 }
 
 const PingServer = struct {
-    sock: *socket.Socket,
+    listener: *Socket,
     allocator: std.mem.Allocator,
     mux: *EventMultiplexer,
     config: Config,
     conn_count: u32 = 0,
     active_conns: u32 = 0,
     start_time: i64 = 0,
-    end_time: i64 = 0,
     last_report_time: i64 = 0,
     last_conn_count: u32 = 0,
 
     pub fn init(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, config: Config) !*PingServer {
         const self = try allocator.create(PingServer);
-        const sock_obj = try socket.Socket.create(s, .inet, .stream, .tcp);
-        try sock_obj.setOption(.{ .ts_enabled = true });
-        try sock_obj.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = config.port });
-        try sock_obj.listen(1024);
+
+        const sock = try Socket.create(s, .inet, .stream, .tcp);
+        try sock.setOption(.{ .ts_enabled = true });
+        try sock.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = config.port });
+        try sock.listen(8192);
 
         self.* = .{
-            .sock = sock_obj,
+            .listener = sock,
             .allocator = allocator,
             .mux = mux,
             .config = config,
-            .last_report_time = std.time.milliTimestamp(),
         };
-        sock_obj.setHandler(mux, self, PingServer.onEvent);
-
+        sock.setHandler(mux, self, onSocketEvent);
+        
+        global_server = self;
+        global_stack.flush();
         return self;
     }
 
-    fn onEvent(ctx: ?*anyopaque, sock_obj: *socket.Socket, events: waiter.EventMask) void {
+    fn onSocketEvent(ctx: ?*anyopaque, sock: *Socket, events: waiter.EventMask) void {
         const self = @as(*PingServer, @ptrCast(@alignCast(ctx.?)));
+        _ = sock;
         if (events & waiter.EventIn != 0) {
-            while (true) {
-                const accepted = sock_obj.accept() catch |err| {
-                    if (err == tcpip.Error.WouldBlock) return;
-                    return;
-                };
-                if (self.conn_count == 0) {
-                    self.start_time = std.time.milliTimestamp();
-                }
-                self.conn_count += 1;
-                self.active_conns += 1;
+            self.onAccept();
+        }
+    }
 
-                const now = std.time.milliTimestamp();
-                if (now - self.last_report_time >= 1000) {
-                    const diff_conns = self.conn_count - self.last_conn_count;
-                    const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
-                    const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
-                    std.debug.print("CPS: {d:.0}\n", .{current_cps});
-                    self.last_report_time = now;
-                    self.last_conn_count = self.conn_count;
-                }
-
-                _ = PingConnection.fromSocket(self.allocator, accepted, self.mux, self.config, self, self.conn_count) catch {
-                    accepted.deinit();
-                    self.active_conns -= 1;
-                    continue;
-                };
-                // Initial check for data if it was already buffered
-                EventMultiplexer.upcall(&accepted.wait_entry);
+    fn onAccept(self: *PingServer) void {
+        while (true) {
+            const client_sock = self.listener.accept() catch |err| {
+                if (err == tcpip.Error.WouldBlock) return;
+                return;
+            };
+            
+            const now = std.time.milliTimestamp();
+            if (self.conn_count == 0) {
+                self.start_time = now;
+                self.last_report_time = now;
             }
+            
+            self.conn_count += 1;
+            self.active_conns += 1;
+
+            const conn = PingConnection.init(self.allocator, client_sock, self.mux, self.config, self, self.conn_count) catch {
+                client_sock.deinit();
+                self.active_conns -= 1;
+                continue;
+            };
+            // Initial event check
+            conn.onEvent(waiter.EventIn);
+        }
+    }
+
+    pub fn report(self: *PingServer, now: i64) void {
+        if (self.start_time == 0) return;
+        if (now - self.last_report_time >= 1000) {
+            const diff_conns = self.conn_count - self.last_conn_count;
+            const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
+            const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
+            const total_s = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+            std.debug.print("[ID: S] {d: >5.2}-{d: >5.2} sec  CPS: {d: <6.0} ActiveEP: {d}\n", .{ @max(0, total_s - diff_time_s), total_s, current_cps, self.active_conns });
+            self.last_report_time = now;
+            self.last_conn_count = self.conn_count;
         }
     }
 };
@@ -312,7 +336,6 @@ const PingClient = struct {
     next_conn_id: u32 = 1,
     active_conns: u32 = 0,
     start_time: i64 = 0,
-    end_time: i64 = 0,
     last_report_time: i64 = 0,
     last_report_count: u32 = 0,
 
@@ -339,6 +362,7 @@ const PingClient = struct {
         while (i < concurrency and i < total) : (i += 1) {
             try self.startConnection();
         }
+        global_stack.flush();
     }
 
     pub fn startConnection(self: *PingClient) !void {
@@ -347,18 +371,36 @@ const PingClient = struct {
         self.active_conns += 1;
         errdefer self.active_conns -= 1;
 
-        const sock_obj = try socket.Socket.create(self.stack_obj, .inet, .stream, .tcp);
-        errdefer sock_obj.deinit();
-        try sock_obj.setOption(.{ .ts_enabled = true });
+        const sock = try Socket.create(self.stack_obj, .inet, .stream, .tcp);
+        errdefer sock.deinit();
+        try sock.setOption(.{ .ts_enabled = true });
 
-        _ = try PingConnection.fromSocket(self.allocator, sock_obj, self.mux, self.config, self, id);
+        const conn = try PingConnection.init(self.allocator, sock, self.mux, self.config, self, id);
 
-        try sock_obj.bind(.{ .nic = 0, .addr = .{ .v4 = self.config.local_ip }, .port = 0 });
-        _ = sock_obj.connect(.{ .nic = 1, .addr = .{ .v4 = self.config.target_ip.? }, .port = self.config.port }) catch |err| {
+        try sock.bind(.{ .nic = 0, .addr = .{ .v4 = self.config.local_ip }, .port = 0 });
+        _ = sock.connect(.{ .nic = 1, .addr = .{ .v4 = self.config.target_ip.? }, .port = self.config.port }) catch |err| {
             if (err != tcpip.Error.WouldBlock) return err;
         };
 
-        EventMultiplexer.upcall(&sock_obj.wait_entry);
+        // Initial event check
+        conn.onEvent(waiter.EventOut);
+        global_stack.flush();
+    }
+
+    pub fn report(self: *PingClient, now: i64) void {
+        if (self.start_time == 0) return;
+        if (now - self.last_report_time >= 1000) {
+            const completed = self.next_conn_id - self.active_conns - 1;
+            const diff_conns = completed - self.last_report_count;
+            const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
+            const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
+            const total_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
+
+            std.debug.print("[ID: C] {d: >5.2}-{d: >5.2} sec  CPS: {d:.0}  ActiveEP: {}\n", .{ @max(0, total_sec - diff_time_s), total_sec, current_cps, self.active_conns });
+
+            self.last_report_time = now;
+            self.last_report_count = completed;
+        }
     }
 
     pub fn refill(self: *PingClient) void {
@@ -374,18 +416,19 @@ const PingClient = struct {
         }
 
         if (!reached_limit) {
+            var refill_count: usize = 0;
             while (self.active_conns < self.config.concurrency) {
                 self.startConnection() catch |err| {
-                    if (err == tcpip.Error.AddressInUse) return;
+                    if (err == tcpip.Error.AddressInUse) break;
                     std.debug.print("startConnection error: {}\n", .{err});
-                    return;
+                    break;
                 };
-
+                refill_count += 1;
                 if (self.next_conn_id > total) break;
             }
+            if (refill_count > 0) global_stack.flush();
         } else if (self.active_conns == 0 and !global_mark_done) {
-            self.end_time = now;
-            const duration_ms = @as(f64, @floatFromInt(self.end_time - self.start_time));
+            const duration_ms = @as(f64, @floatFromInt(now - self.start_time));
             const duration_s = duration_ms / 1000.0;
             const total_completed = self.next_conn_id - self.active_conns - 1;
             const cps = @as(f64, @floatFromInt(total_completed)) / duration_s;
@@ -399,35 +442,12 @@ const PingClient = struct {
 
     pub fn onConnectionFinished(self: *PingClient) void {
         self.active_conns -= 1;
-        const now = std.time.milliTimestamp();
-
-        // Advance stack timers frequently
-        if (now - last_tick_time > 0) {
-            _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(now - last_tick_time)));
-            last_tick_time = now;
-            perform_cleanup();
-        }
-
-        // Report CPS every second
-        if (now - self.last_report_time >= 1000) {
-            const completed = self.next_conn_id - self.active_conns - 1;
-            const diff_conns = completed - self.last_report_count;
-            const diff_time_s = @as(f64, @floatFromInt(now - self.last_report_time)) / 1000.0;
-            const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
-            const total_sec = @as(f64, @floatFromInt(now - self.start_time)) / 1000.0;
-
-            std.debug.print("[ID: C] {d: >5.2}-{d: >5.2} sec  CPS: {d:.0}  ActiveEP: {}\n", .{ total_sec - diff_time_s, total_sec, current_cps, stats.global_stats.tcp.active_endpoints });
-
-            self.last_report_time = now;
-            self.last_report_count = completed;
-        }
-
         self.refill();
     }
 };
 
 const PingConnection = struct {
-    sock: *socket.Socket,
+    socket: *Socket,
     allocator: std.mem.Allocator,
     mux: *EventMultiplexer,
     config: Config,
@@ -438,22 +458,23 @@ const PingConnection = struct {
     sent: bool = false,
     next_cleanup: ?*PingConnection = null,
 
-    pub fn fromSocket(allocator: std.mem.Allocator, sock: *socket.Socket, mux: *EventMultiplexer, config: Config, parent: *anyopaque, id: u32) !*PingConnection {
+    pub fn init(allocator: std.mem.Allocator, sock: *Socket, mux: *EventMultiplexer, config: Config, parent: *anyopaque, id: u32) !*PingConnection {
         const self = try allocator.create(PingConnection);
         self.* = .{
-            .sock = sock,
+            .socket = sock,
             .allocator = allocator,
             .mux = mux,
             .config = config,
             .parent = parent,
             .connection_id = id,
         };
-        sock.setHandler(mux, self, PingConnection.onSocketEvent);
+        sock.setHandler(mux, self, onSocketEvent);
         return self;
     }
 
-    fn onSocketEvent(ctx: ?*anyopaque, _: *socket.Socket, events: waiter.EventMask) void {
+    fn onSocketEvent(ctx: ?*anyopaque, sock: *Socket, events: waiter.EventMask) void {
         const self = @as(*PingConnection, @ptrCast(@alignCast(ctx.?)));
+        _ = sock;
         self.onEvent(events);
     }
 
@@ -473,46 +494,53 @@ const PingConnection = struct {
     }
 
     fn handleClient(self: *PingConnection, events: waiter.EventMask) void {
-        if (events & waiter.EventOut != 0 and !self.sent) {
-            // Check if established
-            const tcp_ep = @as(*ustack.transport.tcp.TCPEndpoint, @ptrCast(@alignCast(self.sock.endpoint.ptr)));
-            if (tcp_ep.state == .established) {
-                _ = self.sock.write("ping") catch return;
-                self.sent = true;
-            }
+        const tcp_ep = @as(*ustack.transport.tcp.TCPEndpoint, @ptrCast(@alignCast(self.socket.endpoint.ptr)));
+
+        if (!self.sent and tcp_ep.state == .established) {
+            _ = self.socket.write("ping") catch return;
+            self.sent = true;
+            global_stack.flush();
         }
 
         if (events & waiter.EventIn != 0) {
-            var buf: [16]u8 = undefined;
-            const n = self.sock.read(&buf) catch |err| {
+            var buf = self.socket.recvVio() catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
                 self.close();
                 return;
             };
+            defer buf.deinit();
 
-            if (n == 0) {
+            if (buf.size == 0) {
                 self.close();
                 return;
             }
 
-            if (self.sent and std.mem.eql(u8, buf[0..n], "pong")) {
-                _ = self.sock.shutdown(0) catch {}; // Shutdown write side
+            if (self.sent) {
+                const view = buf.toView(self.allocator) catch return;
+                defer self.allocator.free(view);
+                if (std.mem.eql(u8, view, "pong")) {
+                    _ = self.socket.shutdown(0) catch {};
+                    global_stack.flush();
+                }
             }
         }
     }
 
     fn handleServer(self: *PingConnection, events: waiter.EventMask) void {
         if (events & waiter.EventIn != 0) {
-            var buf: [16]u8 = undefined;
-            const n = self.sock.read(&buf) catch |err| {
+            var buf = self.socket.recvVio() catch |err| {
                 if (err == tcpip.Error.WouldBlock) return;
                 self.close();
                 return;
             };
+            defer buf.deinit();
 
-            if (n > 0) {
-                if (std.mem.eql(u8, buf[0..n], "ping")) {
-                    _ = self.sock.write("pong") catch {};
+            if (buf.size > 0) {
+                const view = buf.toView(self.allocator) catch return;
+                defer self.allocator.free(view);
+                if (std.mem.eql(u8, view, "ping")) {
+                    _ = self.socket.write("pong") catch {};
+                    global_stack.flush();
                 }
             } else {
                 self.close();
@@ -525,7 +553,8 @@ const PingConnection = struct {
         self.closed = true;
         self.pending_cleanup = true;
 
-        self.sock.deinit();
+        self.socket.close();
+        global_stack.flush();
 
         if (self.config.mode == .client) {
             const client = @as(*PingClient, @ptrCast(@alignCast(self.parent)));
@@ -533,26 +562,6 @@ const PingConnection = struct {
         } else {
             const server = @as(*PingServer, @ptrCast(@alignCast(self.parent)));
             server.active_conns -= 1;
-
-            var done = false;
-            if (server.config.max_conns) |max| {
-                if (server.conn_count >= max and server.active_conns == 0) done = true;
-            }
-            if (server.config.duration) |d| {
-                if (std.time.milliTimestamp() - server.start_time >= d * 1000 and server.active_conns == 0) done = true;
-            }
-
-            if (done) {
-                server.end_time = std.time.milliTimestamp();
-                const duration_ms = @as(f64, @floatFromInt(server.end_time - server.start_time));
-                const duration_s = duration_ms / 1000.0;
-                const cps = @as(f64, @floatFromInt(server.conn_count)) / duration_s;
-
-                std.debug.print("Benchmark finished: {d} connections, CPS: {d:.0}\n", .{ server.conn_count, cps });
-
-                global_mark_done = true;
-                global_done_time = std.time.milliTimestamp();
-            }
         }
 
         self.next_cleanup = global_cleanup_list;
@@ -567,6 +576,7 @@ fn perform_cleanup() void {
     global_cleanup_list = null;
     while (current) |conn| {
         const next = conn.next_cleanup;
+        conn.socket.deinit();
         conn.allocator.destroy(conn);
         current = next;
     }
