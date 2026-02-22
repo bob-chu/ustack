@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example_ping_pong_socket", .path = "examples/ping_pong_socket.zig", .lib = "ev" },
         .{ .name = "example_uperf_fd", .path = "examples/uperf_fd.zig", .lib = "ev" },
         .{ .name = "example_uperf_linux", .path = "examples/uperf_linux.zig", .lib = "ev" },
+        .{ .name = "example_ping_pong_linux", .path = "examples/ping_pong_linux.zig", .lib = "ev" },
     };
 
     for (examples) |ex| {
@@ -98,6 +99,7 @@ pub fn build(b: *std.Build) void {
             std.mem.eql(u8, ex.name, "example_af_xdp_libev") or
             std.mem.eql(u8, ex.name, "example_ping_pong") or
             std.mem.eql(u8, ex.name, "example_ping_pong_socket") or
+            std.mem.eql(u8, ex.name, "example_ping_pong_linux") or
             std.mem.eql(u8, ex.name, "example_uperf_linux") or
             std.mem.eql(u8, ex.name, "example_uperf_fd"))
         {
