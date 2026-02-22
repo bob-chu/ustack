@@ -917,7 +917,6 @@ pub const TCPEndpoint = struct {
             if (node.data.flags & header.TCPFlagPsh != 0) stats.global_stats.tcp.tx_psh += 1;
             if (node.data.flags & header.TCPFlagFin != 0) stats.global_stats.tcp.tx_fin += 1;
 
-            node.data.timestamp = now;
             batch_count += 1;
             if (batch_count == 64) {
                 const net_ep = r.nic.network_endpoints.get(r.net_proto) orelse break;
@@ -925,6 +924,15 @@ pub const TCPEndpoint = struct {
                     for (packet_batch[0..batch_count]) |p| self.proto.header_pool.release(p.header.buf);
                     return err;
                 };
+
+                // Only set timestamp after successful send
+                var batch_it = self.snd_queue.first;
+                while (batch_it) |bnode| {
+                    if (bnode.data.timestamp == 0) bnode.data.timestamp = now;
+                    if (bnode == node) break;
+                    batch_it = bnode.next;
+                }
+
                 for (packet_batch[0..batch_count]) |p| self.proto.header_pool.release(p.header.buf);
                 batch_count = 0;
             }
@@ -936,6 +944,14 @@ pub const TCPEndpoint = struct {
                 for (packet_batch[0..batch_count]) |p| self.proto.header_pool.release(p.header.buf);
                 return err;
             };
+
+            // Set timestamps for the last batch
+            var batch_it = self.snd_queue.first;
+            while (batch_it) |bnode| {
+                if (bnode.data.timestamp == 0) bnode.data.timestamp = now;
+                batch_it = bnode.next;
+            }
+
             for (packet_batch[0..batch_count]) |p| self.proto.header_pool.release(p.header.buf);
         }
     }
@@ -1235,6 +1251,10 @@ pub const TCPEndpoint = struct {
         while (it) |node| {
             self.rcv_view_count += node.data.data.views.len;
             it = node.next;
+        }
+
+        if (self.rcv_list.first == null) {
+            self.waiter_queue.clear(waiter.EventIn);
         }
 
         if (total_moved > 0) {

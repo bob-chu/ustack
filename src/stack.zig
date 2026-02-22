@@ -666,10 +666,26 @@ pub const Stack = struct {
         }
 
         if (is_new) {
+            var endpoints_to_notify = std.ArrayList(TransportEndpoint).init(self.allocator);
+            defer endpoints_to_notify.deinit();
+
             for (&self.endpoints.shards) |*shard| {
+                endpoints_to_notify.clearRetainingCapacity();
                 var it = shard.valueIterator();
                 while (it.next()) |ep| {
+                    endpoints_to_notify.append(ep.*) catch {};
+                }
+
+                for (endpoints_to_notify.items) |ep| {
+                    ep.incRef();
+                }
+
+                for (endpoints_to_notify.items) |ep| {
                     ep.notify(waiter.EventOut);
+                }
+
+                for (endpoints_to_notify.items) |ep| {
+                    ep.decRef();
                 }
             }
         }
