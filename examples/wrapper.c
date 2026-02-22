@@ -29,8 +29,13 @@ void my_ev_io_start(void* loop, ev_io* w) {
     ev_io_start(loop, w); 
 }
 void my_ev_timer_start(void* loop, ev_timer* w) { 
-    // printf("C: ev_timer_start loop=%p, w=%p\n", loop, w); fflush(stdout);
     ev_timer_start(loop, w); 
+}
+void my_ev_io_stop(void* loop, ev_io* w) { 
+    ev_io_stop(loop, w); 
+}
+void my_ev_timer_stop(void* loop, ev_timer* w) { 
+    ev_timer_stop(loop, w); 
 }
 void my_ev_run(void* loop) { 
     // printf("C: ev_run loop=%p\n", loop); fflush(stdout);
