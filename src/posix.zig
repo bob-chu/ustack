@@ -197,7 +197,7 @@ pub const uepoll_event = struct {
 
 pub const EpollInstance = struct {
     allocator: std.mem.Allocator,
-    interests: std.AutoHashMap(i32, EpollInterest),
+    interests: std.AutoHashMap(i32, *EpollInterest),
     ready_list: std.ArrayList(i32),
     signal_fd: i32,
     signaled: bool = false,
@@ -212,7 +212,7 @@ pub const EpollInstance = struct {
         const self = try allocator.create(EpollInstance);
         self.* = .{
             .allocator = allocator,
-            .interests = std.AutoHashMap(i32, EpollInterest).init(allocator),
+            .interests = std.AutoHashMap(i32, *EpollInterest).init(allocator),
             .ready_list = std.ArrayList(i32).init(allocator),
             .signal_fd = try std.posix.eventfd(0, 0x800),
         };
@@ -222,13 +222,17 @@ pub const EpollInstance = struct {
     pub fn deinit(self: *EpollInstance) void {
         var it = self.interests.iterator();
         while (it.next()) |entry| {
-            // Unregister from socket
-            const ft = if (global_file_table) |*t| t else return;
-            const file = ft.get(entry.key_ptr.*) orelse continue;
-            switch (file) {
-                .socket => |s| s.wait_queue.eventUnregister(&entry.value_ptr.wait_entry),
-                else => {},
+            const interest = entry.value_ptr.*;
+            // Unregister from socket if possible
+            if (global_file_table) |*ft| {
+                if (ft.get(entry.key_ptr.*)) |file| {
+                    switch (file) {
+                        .socket => |s| s.wait_queue.eventUnregister(&interest.wait_entry),
+                        else => {},
+                    }
+                }
             }
+            self.allocator.destroy(interest);
         }
         self.interests.deinit();
         self.ready_list.deinit();
@@ -285,7 +289,10 @@ pub fn uepoll_ctl(epfd: i32, op: i32, fd: i32, event: ?*uepoll_event) !void {
             if (ep.interests.contains(fd)) return error.FileExists;
             const ev = event orelse return error.InvalidArguments;
 
-            var interest = EpollInstance.EpollInterest{
+            const interest = try ep.allocator.create(EpollInstance.EpollInterest);
+            errdefer ep.allocator.destroy(interest);
+
+            interest.* = .{
                 .events = ev.events,
                 .data = ev.data,
                 .wait_entry = undefined,
@@ -294,24 +301,24 @@ pub fn uepoll_ctl(epfd: i32, op: i32, fd: i32, event: ?*uepoll_event) !void {
             interest.wait_entry.upcall_ctx = @ptrFromInt(@as(usize, @intCast(fd)));
 
             try ep.interests.put(fd, interest);
-            const entry = ep.interests.getPtr(fd).?;
-            sock.wait_queue.eventRegister(&entry.wait_entry, pollToWaiter(@intCast(ev.events)));
+            sock.wait_queue.eventRegister(&interest.wait_entry, pollToWaiter(@intCast(ev.events)));
         },
         std.os.linux.EPOLL.CTL_MOD => {
-            const entry = ep.interests.getPtr(fd) orelse return error.NoEntity;
+            const interest = ep.interests.get(fd) orelse return error.NoEntity;
             const ev = event orelse return error.InvalidArguments;
 
-            sock.wait_queue.eventUnregister(&entry.wait_entry);
-            entry.events = ev.events;
-            entry.data = ev.data;
-            sock.wait_queue.eventRegister(&entry.wait_entry, pollToWaiter(@intCast(ev.events)));
+            sock.wait_queue.eventUnregister(&interest.wait_entry);
+            interest.events = ev.events;
+            interest.data = ev.data;
+            sock.wait_queue.eventRegister(&interest.wait_entry, pollToWaiter(@intCast(ev.events)));
         },
         std.os.linux.EPOLL.CTL_DEL => {
-            const entry = ep.interests.getPtr(fd) orelse return error.NoEntity;
-            sock.wait_queue.eventUnregister(&entry.wait_entry);
+            const interest = ep.interests.get(fd) orelse return error.NoEntity;
+            sock.wait_queue.eventUnregister(&interest.wait_entry);
             _ = ep.interests.remove(fd);
+            ep.allocator.destroy(interest);
 
-            // Remove from ready list if present
+            // Also check ready list
             for (ep.ready_list.items, 0..) |rfd, i| {
                 if (rfd == fd) {
                     _ = ep.ready_list.orderedRemove(i);

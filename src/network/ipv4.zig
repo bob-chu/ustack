@@ -206,6 +206,7 @@ pub const IPv4Endpoint = struct {
 
         if (remote_link_address == null) {
             const arp_proto_ptr = self.nic.stack.network_protocols.get(0x0806) orelse return tcpip.Error.NoRoute;
+            std.debug.print("[IPv4] ARP needed for {}.{}.{}.{}\n", .{ r.remote_address.v4[0], r.remote_address.v4[1], r.remote_address.v4[2], r.remote_address.v4[3] });
             arp_proto_ptr.linkAddressRequest(r.remote_address, r.local_address, self.nic) catch {};
             return tcpip.Error.WouldBlock;
         }
