@@ -503,6 +503,10 @@ pub const TransportTable = struct {
 
     pub fn deinit(self: *TransportTable) void {
         for (&self.shards) |*shard| {
+            var it = shard.valueIterator();
+            while (it.next()) |ep| {
+                ep.decRef();
+            }
             shard.deinit();
         }
     }
@@ -521,6 +525,10 @@ pub const TransportTable = struct {
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
         return self.getShard(id).remove(id);
+    }
+
+    pub fn contains(self: *TransportTable, id: TransportEndpointID) bool {
+        return self.getShard(id).contains(id);
     }
 
     pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
@@ -590,20 +598,24 @@ pub const Stack = struct {
     }
 
     pub fn deinit(self: *Stack) void {
+        std.debug.print("[Stack] deinit self={*}\n", .{self});
+        var endpoints_to_clean = std.ArrayList(TransportEndpoint).init(self.allocator);
+        defer endpoints_to_clean.deinit();
+
         var shard_idx: usize = 0;
         while (shard_idx < 256) : (shard_idx += 1) {
             var shard = &self.endpoints.shards[shard_idx];
-            var it = shard.valueIterator();
-            while (it.next()) |ep| {
-                // decRef might destroy the endpoint, but we clear the map after
-                // so we don't care about map corruption here.
-                // However, we MUST NOT use fetchRemove inside the loop.
-                ep.decRef();
+            while (true) {
+                var it = shard.iterator();
+                if (it.next()) |kv| {
+                    const id = kv.key_ptr.*;
+                    self.unregisterTransportEndpoint(id);
+                } else {
+                    break;
+                }
             }
-            shard.clearAndFree();
         }
         self.endpoints.deinit();
-        self.cluster_pool.deinit();
         var nic_it = self.nics.valueIterator();
         while (nic_it.next()) |nic| {
             nic.*.deinit();
@@ -625,6 +637,7 @@ pub const Stack = struct {
         self.network_protocols.deinit();
 
         self.route_table.deinit();
+        self.cluster_pool.deinit();
     }
 
     pub fn registerNetworkProtocol(self: *Stack, proto: NetworkProtocol) !void {

@@ -39,6 +39,7 @@ pub const Socket = struct {
     pub fn deinit(self: *Socket) void {
         self.wait_queue.eventUnregister(&self.wait_entry);
         self.endpoint.close();
+        self.endpoint.decRef();
         // Wait queue handling:
         // If we created it (client/listener), we own it.
         // If accepted, we also own it (TCPEndpoint logic passes ownership).
@@ -620,7 +621,7 @@ test "POSIX API TCP client/server" {
     defer s.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
 
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     // Setup Link
@@ -927,7 +928,7 @@ test "POSIX upoll basic" {
 
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     // Setup Link
@@ -1012,7 +1013,7 @@ test "FD-based API basic" {
 
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     // 1. socket_fd
@@ -1053,7 +1054,7 @@ test "Epoll FD-based API" {
 
     var tcp_proto = @import("transport/tcp.zig").TCPProtocol.init(allocator);
     try s.registerTransportProtocol(tcp_proto.protocol());
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     const epfd = try uepoll_create(10);

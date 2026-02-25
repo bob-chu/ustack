@@ -11,7 +11,7 @@ const TCPProtocol = tcp.TCPProtocol;
 
 test "TCP Fast Retransmit" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
@@ -86,7 +86,7 @@ test "TCP Fast Retransmit" {
 
 test "TCP Keepalive" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
@@ -188,7 +188,7 @@ test "TCP Keepalive" {
 
 test "TCP Retransmission" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
@@ -264,8 +264,6 @@ test "TCP Retransmission" {
     ep_server.handlePacket(&r_to_server, id_to_server, mut_ack);
 
     const accept_res = try ep_server.endpoint().accept();
-    const ep_accepted = @as(*TCPEndpoint, @ptrCast(@alignCast(accept_res.ep.ptr)));
-    defer ep_accepted.decRef();
     defer accept_res.ep.close();
     const FakePayloader = struct {
         data: []const u8,
@@ -278,13 +276,13 @@ test "TCP Retransmission" {
     };
     var fp = FakePayloader{ .data = "important data" };
     fake_ep.drop_next = true;
-    _ = try ep_accepted.endpoint().write(fp.payloader(), .{});
+    _ = try accept_res.ep.write(fp.payloader(), .{});
     try std.testing.expect(fake_ep.drop_next == false);
 }
 
 test "TCP CWND Enforcement" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
@@ -320,8 +318,7 @@ test "TCP CWND Enforcement" {
     ep.rcv_nxt = 1000;
 
     var data1 = [_]u8{'B'} ** 100;
-    const pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
-    var mut_pkt1 = pkt1;
+    var mut_pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     defer mut_pkt1.data.deinit();
     try ep.insertOOO(2000, mut_pkt1.data);
     try std.testing.expectEqual(@as(usize, 1), ep.ooo_list.len);
@@ -355,7 +352,7 @@ test "TCP CWND Enforcement" {
 
 test "TCP SACK Blocks Generation" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
@@ -371,15 +368,14 @@ test "TCP SACK Blocks Generation" {
     ep.rcv_nxt = 1000;
 
     var data1 = [_]u8{'B'} ** 100;
-    const pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
-    var mut_pkt1 = pkt1;
+    var mut_pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    defer mut_pkt1.data.deinit();
     try ep.insertOOO(2000, mut_pkt1.data);
     try std.testing.expectEqual(@as(usize, 1), ep.sack_blocks.items.len);
     try std.testing.expectEqual(@as(u32, 2000), ep.sack_blocks.items[0].start);
     try std.testing.expectEqual(@as(u32, 2100), ep.sack_blocks.items[0].end);
 
     try ep.insertOOO(3000, mut_pkt1.data);
-    mut_pkt1.data.deinit();
     try std.testing.expectEqual(@as(usize, 2), ep.sack_blocks.items.len);
     try std.testing.expectEqual(@as(u32, 3000), ep.sack_blocks.items[0].start);
     try std.testing.expectEqual(@as(u32, 3100), ep.sack_blocks.items[0].end);
@@ -394,7 +390,7 @@ test "TCP SACK Blocks Generation" {
 
 test "TCP readv/writev zero-copy" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();

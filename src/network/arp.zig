@@ -10,8 +10,12 @@ pub const ProtocolNumber = 0x0806;
 pub const ProtocolAddress = "arp";
 
 pub const ARPProtocol = struct {
-    pub fn init() ARPProtocol {
-        return .{};
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) *ARPProtocol {
+        const self = allocator.create(ARPProtocol) catch unreachable;
+        self.* = .{ .allocator = allocator };
+        return self;
     }
 
     pub fn protocol(self: *ARPProtocol) stack.NetworkProtocol {
@@ -26,7 +30,13 @@ pub const ARPProtocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*ARPProtocol, @ptrCast(@alignCast(ptr)));
+        self.allocator.destroy(self);
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;

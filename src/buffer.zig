@@ -119,7 +119,11 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            std.debug.print("[Pool] {s} deinit count={}\n", .{ @typeName(T), self.free_list.items.len });
             for (self.free_list.items) |node| {
+                if (@hasDecl(T, "deinit")) {
+                    node.deinit();
+                }
                 self.allocator.destroy(node);
             }
             self.free_list.deinit();
@@ -191,10 +195,13 @@ pub const BufferPool = struct {
 
     pub fn acquire(self: *BufferPool) ![]u8 {
         if (self.free_list.popOrNull()) |buf| {
+            @memset(buf, 0);
             return buf;
         }
         stats.global_stats.pool.buffer_fallback += 1;
-        return try self.allocator.alloc(u8, self.buffer_size);
+        const buf = try self.allocator.alloc(u8, self.buffer_size);
+        @memset(buf, 0);
+        return buf;
     }
 
     pub fn release(self: *BufferPool, buf: []u8) void {
@@ -396,7 +403,6 @@ pub const VectorisedView = struct {
         for (views) |v| total += v.view.len;
         return .{
             .views = views,
-            .original_views = views,
             .size = total,
         };
     }
@@ -419,7 +425,6 @@ pub const VectorisedView = struct {
         views_buffer[0] = .{ .cluster = null, .view = data };
         return .{
             .views = views_buffer[0..1],
-            .original_views = views_buffer[0..1],
             .size = data.len,
         };
     }
@@ -476,14 +481,16 @@ pub const VectorisedView = struct {
 
     pub fn deinit(self: *VectorisedView) void {
         const total_size = self.size;
-        for (self.views) |cv| {
+        const ov = if (self.original_views.len > 0) self.original_views else self.views;
+        for (ov) |cv| {
             if (cv.cluster) |c| c.release();
         }
-        const ov = self.original_views;
-        if (self.view_pool) |pool| {
-            pool.release(std.mem.sliceAsBytes(ov));
-        } else if (self.allocator) |alloc| {
-            if (ov.len > 0) alloc.free(ov);
+        if (self.original_views.len > 0) {
+            if (self.view_pool) |pool| {
+                pool.release(std.mem.sliceAsBytes(self.original_views));
+            } else if (self.allocator) |alloc| {
+                alloc.free(self.original_views);
+            }
         }
 
         if (self.consumption_callback) |cb| {
@@ -530,7 +537,9 @@ pub const VectorisedView = struct {
 
     pub fn removeFirst(self: *VectorisedView) void {
         if (self.views.len == 0) return;
-        if (self.views[0].cluster) |c| c.release();
+        if (self.original_views.len == 0) {
+            if (self.views[0].cluster) |c| c.release();
+        }
         self.size -= self.views[0].view.len;
         self.views = self.views[1..];
     }

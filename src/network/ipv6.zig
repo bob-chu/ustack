@@ -7,8 +7,12 @@ const buffer = @import("../buffer.zig");
 pub const ProtocolNumber = 0x86dd;
 
 pub const IPv6Protocol = struct {
-    pub fn init() IPv6Protocol {
-        return .{};
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) *IPv6Protocol {
+        const self = allocator.create(IPv6Protocol) catch unreachable;
+        self.* = .{ .allocator = allocator };
+        return self;
     }
 
     pub fn protocol(self: *IPv6Protocol) stack.NetworkProtocol {
@@ -23,7 +27,17 @@ pub const IPv6Protocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    pub fn deinit(self: *IPv6Protocol) void {
+        self.allocator.destroy(self);
+    }
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*IPv6Protocol, @ptrCast(@alignCast(ptr)));
+        self.deinit();
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;

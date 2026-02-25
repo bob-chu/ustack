@@ -15,8 +15,12 @@ const MAX_FRAGMENTS_PER_DATAGRAM = 64;
 const REASSEMBLY_TIMEOUT_MS: i64 = 30_000; // 30 seconds
 
 pub const IPv4Protocol = struct {
-    pub fn init() IPv4Protocol {
-        return .{};
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) *IPv4Protocol {
+        const self = allocator.create(IPv4Protocol) catch unreachable;
+        self.* = .{ .allocator = allocator };
+        return self;
     }
 
     pub fn protocol(self: *IPv4Protocol) stack.NetworkProtocol {
@@ -34,10 +38,13 @@ pub const IPv4Protocol = struct {
         .deinit = deinit_external,
     };
 
+    pub fn deinit(self: *IPv4Protocol) void {
+        self.allocator.destroy(self);
+    }
+
     fn deinit_external(ptr: *anyopaque) void {
-        _ = ptr;
-        // IPv4Protocol is stateless and usually allocated on stack or once.
-        // But in main.zig it's on heap.
+        const self = @as(*IPv4Protocol, @ptrCast(@alignCast(ptr)));
+        self.deinit();
     }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
@@ -433,7 +440,8 @@ test "IPv4 fragmentation and reassembly" {
 
     try s.createNIC(1, link_ep);
     const nic = s.nics.get(1).?;
-    const ipv4_proto = IPv4Protocol.init();
+    const ipv4_proto = IPv4Protocol.init(allocator);
+    try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     var delivered = false;
     var delivered_len: usize = 0;
@@ -460,7 +468,7 @@ test "IPv4 fragmentation and reassembly" {
     ep_ipv4.* = .{
         .nic = nic,
         .address = .{ .v4 = .{ 10, 0, 0, 1 } },
-        .protocol = @constCast(&ipv4_proto),
+        .protocol = ipv4_proto,
         .dispatcher = dispatcher,
         .reassembly_list = std.AutoHashMap(ReassemblyKey, ReassemblyContext).init(allocator),
     };
