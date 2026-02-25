@@ -112,9 +112,13 @@ pub const AfXdp = struct {
 
         // 6. Mmap Rings
         const fill_map = try std.posix.mmap(null, off.fr.desc + RING_SIZE * @sizeOf(u64), std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED, .POPULATE = true }, fd, xdp.XDP_UMEM_PGOFF_FILL_RING);
+        errdefer std.posix.munmap(fill_map);
         const comp_map = try std.posix.mmap(null, off.cr.desc + RING_SIZE * @sizeOf(u64), std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED, .POPULATE = true }, fd, xdp.XDP_UMEM_PGOFF_COMPLETION_RING);
+        errdefer std.posix.munmap(comp_map);
         const rx_map = try std.posix.mmap(null, off.rx.desc + RING_SIZE * @sizeOf(xdp.xdp_desc), std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED, .POPULATE = true }, fd, xdp.XDP_PGOFF_RX_RING);
+        errdefer std.posix.munmap(rx_map);
         const tx_map = try std.posix.mmap(null, off.tx.desc + RING_SIZE * @sizeOf(xdp.xdp_desc), std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED, .POPULATE = true }, fd, xdp.XDP_PGOFF_TX_RING);
+        errdefer std.posix.munmap(tx_map);
 
         // 7. Bind
         const ifindex = try getIfIndex(if_name);

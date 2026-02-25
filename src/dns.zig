@@ -198,7 +198,7 @@ test "DNS Query and Response Parsing" {
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
 
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     var fake_link = struct {

@@ -66,20 +66,15 @@ pub const TCPProtocol = struct {
     }
 
     pub fn deinit(self: *TCPProtocol) void {
+        self.endpoint_pool.deinit();
+        self.waiter_queue_pool.deinit();
+
         self.view_pool.deinit();
         self.header_pool.deinit();
         self.segment_node_pool.deinit();
         self.packet_node_pool.deinit();
         self.accept_node_pool.deinit();
 
-        // Drain endpoint pool and really deinit them
-        for (self.endpoint_pool.free_list.items) |ep| {
-            ep.deinit();
-            // endpoint_pool.deinit() will destroy the pointer
-        }
-
-        self.endpoint_pool.deinit();
-        self.waiter_queue_pool.deinit();
         self.allocator.destroy(self);
     }
 
@@ -193,7 +188,7 @@ pub const TCPEndpoint = struct {
     rcv_wnd: u32 = 0,
     snd_wnd: u32 = 65535,
 
-    cc: congestion.CongestionControl = undefined,
+    cc: ?congestion.CongestionControl = null,
     ref_count: usize = 1,
     cached_route: ?stack.Route = null,
     app_closed: bool = false,
@@ -314,13 +309,33 @@ pub const TCPEndpoint = struct {
     };
 
     pub fn init(s: *stack.Stack, proto: *TCPProtocol, wq: *waiter.Queue, mss: u16) !TCPEndpoint {
-        var self = TCPEndpoint{ .stack = s, .proto = proto, .waiter_queue = wq, .cc = undefined };
+        var self = TCPEndpoint{ .stack = s, .proto = proto, .waiter_queue = wq, .cc = null };
         try self.initialize_v2(s, proto, wq, mss);
         return self;
     }
 
     pub fn initialize_v2(self: *TCPEndpoint, s: *stack.Stack, proto: *TCPProtocol, wq: *waiter.Queue, mss: u16) !void {
-        if (!self.pooled) {
+        stats.global_stats.tcp.active_endpoints += 1;
+        self.stack = s;
+        self.proto = proto;
+        self.waiter_queue = wq;
+        self.ref_count = 1;
+
+        // Reset non-zero defaults broken by pool memset
+        self.rcv_wnd_scale = 14;
+        self.rcv_wnd_max = 64 * 1024 * 1024;
+        self.snd_wnd = 65535;
+        self.persist_interval = 1000;
+        self.persist_max_interval = 60_000;
+        self.keepalive_idle = 7200;
+        self.keepalive_intvl = 75;
+        self.keepalive_cnt = 9;
+        self.max_segment_size = mss;
+        self.rto = 1000;
+        self.state = .initial;
+        self.app_closed = false;
+
+        if (!self.pooled or self.cc == null) {
             self.cc = try congestion.NewReno.init(s.allocator, mss);
             self.sack_blocks = std.ArrayList(SackBlock).init(s.allocator);
             self.peer_sack_blocks = std.ArrayList(SackBlock).init(s.allocator);
@@ -335,71 +350,19 @@ pub const TCPEndpoint = struct {
             self.initialized = true; // Mark as initialized
             self.backlog = 65536; // Maximum backlog for pooled listeners
         } else {
-            // Only reset if we were previously initialized
-            if (self.initialized) {
-                self.cc.reset(mss) catch {
-                    self.cc.deinit();
-                    self.cc = try congestion.NewReno.init(s.allocator, mss);
-                };
-            } else {
-                self.cc = try congestion.NewReno.init(s.allocator, mss);
-                self.initialized = true;
-            }
+            // Reuse resources for pooled endpoints
+            try self.cc.?.reset(mss);
             self.sack_blocks.clearRetainingCapacity();
             self.peer_sack_blocks.clearRetainingCapacity();
             self.syncache.clearRetainingCapacity();
+            self.initialized = true;
             self.sack_enabled = false;
             self.hint_sack_enabled = false;
             self.dup_ack_count = 0;
             self.rcv_packets_since_ack = 0;
+            self.retransmit_count = 0;
+            self.app_closed = false;
         }
-
-        self.persist_interval = 1000;
-
-        stats.global_stats.tcp.active_endpoints += 1;
-
-        self.stack = s;
-        self.proto = proto;
-        self.waiter_queue = wq;
-        self.state = .initial;
-        self.local_addr = null;
-        self.remote_addr = null;
-        const initial_seq = @as(u32, @intCast(@mod(std.time.milliTimestamp(), 0x7FFFFFFF)));
-        self.snd_nxt = initial_seq;
-        self.last_ack = initial_seq;
-        self.rcv_nxt = 0;
-        self.snd_wnd_scale = 0;
-        self.rcv_wnd_scale = 14;
-        self.rcv_wnd_max = 64 * 1024 * 1024;
-        self.rcv_buf_used = 0;
-        self.rcv_view_count = 0;
-        self.rcv_wnd = self.rcv_wnd_max;
-        self.snd_wnd = 65535;
-        self.ref_count = 1;
-        self.stack_ref = false;
-        self.cached_route = null;
-        self.app_closed = false;
-        self.retransmit_count = 0;
-        self.ts_enabled = false;
-        self.ts_recent = 0;
-        self.max_segment_size = mss;
-        self.owns_waiter_queue = false;
-
-        self.srtt = 0;
-        self.rttvar = 0;
-        self.rto = 1000; // 1 second initial RTO per RFC 6298
-        self.rtt_measured = false;
-
-        self.keepalive_enabled = false;
-        self.keepalive_idle = 7200;
-        self.keepalive_intvl = 75;
-        self.keepalive_cnt = 9;
-        self.keepalive_probes_sent = 0;
-
-        self.rcv_list = .{};
-        self.ooo_list = .{};
-        self.accepted_queue = .{};
-        self.snd_queue = .{};
     }
 
     pub fn transportEndpoint(self: *TCPEndpoint) stack.TransportEndpoint {
@@ -526,7 +489,7 @@ pub const TCPEndpoint = struct {
             const mss = @as(u16, @intCast(mtu - header_overhead));
             if (mss != self.max_segment_size) {
                 self.max_segment_size = mss;
-                self.cc.setMss(mss);
+                self.cc.?.setMss(mss);
             }
         }
 
@@ -537,7 +500,7 @@ pub const TCPEndpoint = struct {
         var current_view_offset: usize = 0;
         while (total_sent < view.size) {
             const in_flight = @as(i64, @intCast(self.snd_nxt -% self.last_ack));
-            const effective_wnd = @min(self.snd_wnd, self.cc.getCwnd());
+            const effective_wnd = @min(self.snd_wnd, self.cc.?.getCwnd());
             var avail = if (effective_wnd > in_flight) @as(u32, @intCast(effective_wnd - in_flight)) else 0;
             if (avail == 0 and self.snd_wnd == 0 and self.snd_queue.first == null and total_sent == 0) avail = 1;
 
@@ -617,7 +580,7 @@ pub const TCPEndpoint = struct {
             .ts_enabled => |v| self.ts_enabled = v,
             .reuse_address => {}, // TODO: Implement reuse_address logic if needed
             .congestion_control => |alg| {
-                self.cc.deinit();
+                self.cc.?.deinit();
                 self.cc = switch (alg) {
                     .new_reno => try congestion.NewReno.init(self.stack.allocator, self.max_segment_size),
                     .cubic => try congestion.Cubic.init(self.stack.allocator, self.max_segment_size),
@@ -693,6 +656,7 @@ pub const TCPEndpoint = struct {
         const r = &self.cached_route.?;
 
         const hdr_buf = self.proto.header_pool.acquire() catch return tcpip.Error.NoBufferSpace;
+        defer self.proto.header_pool.release(hdr_buf);
         var pre = buffer.Prependable.init(hdr_buf);
         const tcp_hdr = pre.prepend(header.TCPMinimumSize).?;
         @memset(tcp_hdr, 0);
@@ -812,6 +776,7 @@ pub const TCPEndpoint = struct {
                 self.stack.unregisterTransportEndpoint(term_id);
             }
         }
+        self.reset();
         self.decStackRef();
     }
 
@@ -989,7 +954,7 @@ pub const TCPEndpoint = struct {
             }
             if (force or node.data.timestamp == 0 or (now - node.data.timestamp > self.rto)) {
                 if (!force and node.data.timestamp != 0) {
-                    self.cc.onLoss();
+                    self.cc.?.onLoss();
                     self.rto = @min(self.rto * 2, 60_000); // Exponential backoff
                 }
                 const la = self.local_addr orelse return tcpip.Error.InvalidEndpointState;
@@ -1088,18 +1053,33 @@ pub const TCPEndpoint = struct {
         }
     }
 
-    pub fn deinit(self: *TCPEndpoint) void {
-        if (self.pooled) {
-            self.cc.deinit();
-            self.sack_blocks.deinit();
-            self.peer_sack_blocks.deinit();
-            self.syncache.deinit();
-            self.pooled = false;
-        }
-    }
+    pub fn reset(self: *TCPEndpoint) void {
+        if (!self.initialized) return;
 
-    fn destroy(self: *TCPEndpoint) void {
-        stats.global_stats.tcp.active_endpoints -= 1;
+        // Clear timers
+        self.stack.timer_queue.cancel(&self.retransmit_timer);
+        self.stack.timer_queue.cancel(&self.time_wait_timer);
+        self.stack.timer_queue.cancel(&self.delayed_ack_timer);
+        self.stack.timer_queue.cancel(&self.keepalive_timer);
+        self.stack.timer_queue.cancel(&self.syncache_timer);
+        self.stack.timer_queue.cancel(&self.persist_timer);
+
+        // Terminate any accepted endpoints
+        while (self.accepted_queue.popFirst()) |node| {
+            node.data.ep.close();
+            self.proto.accept_node_pool.release(node);
+        }
+
+        // Clear send queue
+        while (self.snd_queue.popFirst()) |node| {
+            node.data.data.deinit();
+            self.proto.segment_node_pool.release(node);
+        }
+
+        if (self.owns_waiter_queue) {
+            self.proto.waiter_queue_pool.release(self.waiter_queue);
+            self.owns_waiter_queue = false;
+        }
 
         // Drain queues
         while (self.rcv_list.popFirst()) |node| {
@@ -1112,29 +1092,34 @@ pub const TCPEndpoint = struct {
             self.proto.packet_node_pool.release(node);
         }
 
-        while (self.accepted_queue.popFirst()) |node| {
-            node.data.ep.close();
-            self.proto.accept_node_pool.release(node);
+        self.initialized = false;
+    }
+
+    pub fn deinit(self: *TCPEndpoint) void {
+        const was_init = self.initialized;
+        const has_cc = self.cc != null;
+        self.reset();
+
+        if (was_init or has_cc) {
+            // Clean up sub-resources
+            if (self.cc) |cc| {
+                cc.deinit();
+                self.cc = null;
+            }
+            self.sack_blocks.deinit();
+            self.peer_sack_blocks.deinit();
+            self.syncache.deinit();
         }
+    }
 
-        self.stack.timer_queue.cancel(&self.retransmit_timer);
-        self.stack.timer_queue.cancel(&self.time_wait_timer);
-        self.stack.timer_queue.cancel(&self.delayed_ack_timer);
-        self.stack.timer_queue.cancel(&self.keepalive_timer);
-        self.stack.timer_queue.cancel(&self.syncache_timer);
-        self.stack.timer_queue.cancel(&self.persist_timer);
-
-        while (self.snd_queue.popFirst()) |node| {
-            node.data.data.deinit();
-            self.proto.segment_node_pool.release(node);
-        }
-
-        if (self.owns_waiter_queue) {
-            self.proto.waiter_queue_pool.release(self.waiter_queue);
+    fn destroy(self: *TCPEndpoint) void {
+        if (self.initialized) {
+            stats.global_stats.tcp.active_endpoints -= 1;
+            self.reset(); // Drain everything but keep heap resources for reuse
         }
 
         if (!self.proto.endpoint_pool.tryRelease(self)) {
-            self.deinit();
+            self.deinit(); // Free everything including heap resources
             self.proto.allocator.destroy(self);
         }
     }
@@ -1153,6 +1138,7 @@ pub const TCPEndpoint = struct {
                 const id = stack.TransportEndpointID{ .local_port = la.port, .local_address = la.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
                 self.stack.unregisterTransportEndpoint(id);
             }
+            self.decStackRef();
         } else if (self.state == .syn_sent or self.state == .syn_recv) {
             self.state = .closed;
             // Optionally send RST here, but for now just unregister
@@ -1162,33 +1148,28 @@ pub const TCPEndpoint = struct {
                     self.stack.unregisterTransportEndpoint(id);
                 }
             }
+            self.decStackRef();
         }
 
         // Always try to unregister if closing/error/closed.
         // For Active Close, we stay in the table until TIME_WAIT expires.
         if (self.state == .closed or self.state == .error_state) {
-            self.decStackRef();
             if (self.local_addr) |la| {
-                if (self.remote_addr) |ra| {
-                    const id = stack.TransportEndpointID{
-                        .local_port = la.port,
-                        .local_address = la.addr,
-                        .remote_port = ra.port,
-                        .remote_address = ra.addr,
-                        .transport_protocol = ProtocolNumber,
-                    };
-                    const shard = self.stack.endpoints.getShard(id);
-                    if (shard.get(id)) |ep| {
-                        // get() increments refcount, so we need to decRef after checking
-                        if (ep.ptr == @as(*anyopaque, @ptrCast(self))) {
-                            _ = self.stack.endpoints.fetchRemove(id);
-                            ep.decRef(); // decRef for the fetchRemove
-                        }
-                        ep.decRef(); // decRef for the get()
-                    }
-                }
+                const ra = self.remote_addr orelse tcpip.FullAddress{ .nic = la.nic, .port = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } } };
+                const id = stack.TransportEndpointID{
+                    .local_port = la.port,
+                    .local_address = la.addr,
+                    .remote_port = ra.port,
+                    .remote_address = ra.addr,
+                    .transport_protocol = ProtocolNumber,
+                };
+                self.stack.unregisterTransportEndpoint(id);
             }
         }
+
+        // Release the stack reference if the app is closed.
+        // The endpoint will stay alive as long as it's in the TransportTable.
+        self.decStackRef();
 
         self.decRef();
     }
@@ -1843,7 +1824,7 @@ pub const TCPEndpoint = struct {
                         if (ack == self.last_ack) {
                             self.dup_ack_count += 1;
                             if (self.dup_ack_count == 3) {
-                                self.cc.onRetransmit();
+                                self.cc.?.onRetransmit();
                                 self.checkRetransmitLocked(true, &notify_mask) catch {};
                                 self.dup_ack_count = 0;
                             }
@@ -1875,7 +1856,7 @@ pub const TCPEndpoint = struct {
                             } else {
                                 self.stack.timer_queue.schedule(&self.retransmit_timer, @as(u64, @intCast(self.rto)));
                             }
-                            self.cc.onAck(diff);
+                            self.cc.?.onAck(diff);
                             notify_mask |= waiter.EventOut;
                         }
                     }

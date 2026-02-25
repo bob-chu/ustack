@@ -10,7 +10,7 @@ const TCPEndpoint = @import("tcp.zig").TCPEndpoint;
 
 test "TCP 2MSL TIME_WAIT Expiration" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
@@ -58,6 +58,7 @@ test "TCP 2MSL TIME_WAIT Expiration" {
     var wq_client = waiter.Queue{};
     const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
     const ep_client = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_client_res.ptr)));
+    defer ep_client.close();
 
     ep_client.state = .fin_wait2;
     ep_client.local_addr = ca;
@@ -85,19 +86,18 @@ test "TCP 2MSL TIME_WAIT Expiration" {
 
     try std.testing.expect(ep_client.state == .time_wait);
     try std.testing.expect(ep_client.time_wait_timer.active);
-    try std.testing.expect(s.endpoints.get(id) != null);
-    if (s.endpoints.get(id)) |e| e.decRef();
+    try std.testing.expect(s.endpoints.contains(id));
 
     // Advance time by 2MSL (200ms)
     _ = s.timer_queue.tickTo(s.timer_queue.current_tick + 201);
 
     try std.testing.expect(ep_client.state == .closed);
-    try std.testing.expect(s.endpoints.get(id) == null);
+    try std.testing.expect(!s.endpoints.contains(id));
 }
 
 test "TCP RFC 1337 RST in TIME_WAIT" {
     const allocator = std.testing.allocator;
-    var ipv4_proto = ipv4.IPv4Protocol.init();
+    const ipv4_proto = ipv4.IPv4Protocol.init(allocator);
     const tcp_proto = TCPProtocol.init(allocator);
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
@@ -142,6 +142,7 @@ test "TCP RFC 1337 RST in TIME_WAIT" {
     var wq_client = waiter.Queue{};
     const ep_client_res = try tcp_proto.protocol().newEndpoint(&s, 0x0800, &wq_client);
     const ep_client = @as(*TCPEndpoint, @ptrCast(@alignCast(ep_client_res.ptr)));
+    defer ep_client.close();
 
     ep_client.state = .time_wait;
     ep_client.local_addr = ca;

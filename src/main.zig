@@ -43,24 +43,19 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     var s = try stack.Stack.init(allocator);
     errdefer s.deinit();
 
-    const ipv4_proto = try allocator.create(network.ipv4.IPv4Protocol);
-    ipv4_proto.* = network.ipv4.IPv4Protocol.init();
+    const ipv4_proto = network.ipv4.IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
-    const ipv6_proto = try allocator.create(network.ipv6.IPv6Protocol);
-    ipv6_proto.* = network.ipv6.IPv6Protocol.init();
+    const ipv6_proto = network.ipv6.IPv6Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv6_proto.protocol());
 
-    const arp_proto = try allocator.create(network.arp.ARPProtocol);
-    arp_proto.* = network.arp.ARPProtocol.init();
+    const arp_proto = network.arp.ARPProtocol.init(allocator);
     try s.registerNetworkProtocol(arp_proto.protocol());
 
-    const icmp_proto = try allocator.create(network.icmp.ICMPv4Protocol);
-    icmp_proto.* = network.icmp.ICMPv4Protocol.init();
+    const icmp_proto = network.icmp.ICMPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(icmp_proto.protocol());
 
-    const icmpv4_transport = try allocator.create(network.icmp.ICMPv4TransportProtocol);
-    icmpv4_transport.* = network.icmp.ICMPv4TransportProtocol.init();
+    const icmpv4_transport = network.icmp.ICMPv4TransportProtocol.init(allocator);
     try s.registerTransportProtocol(icmpv4_transport.protocol());
 
     const tcp_proto = transport.tcp.TCPProtocol.init(allocator);
@@ -69,8 +64,7 @@ pub fn init(allocator: std.mem.Allocator) !stack.Stack {
     const udp_proto = transport.udp.UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
 
-    const icmpv6_proto = try allocator.create(network.icmpv6.ICMPv6TransportProtocol);
-    icmpv6_proto.* = network.icmpv6.ICMPv6TransportProtocol.init();
+    const icmpv6_proto = network.icmpv6.ICMPv6TransportProtocol.init(allocator);
     try s.registerTransportProtocol(icmpv6_proto.protocol());
 
     return s;
