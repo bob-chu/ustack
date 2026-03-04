@@ -2,6 +2,7 @@ const std = @import("std");
 const stack = @import("stack.zig");
 const tcpip = @import("tcpip.zig");
 const waiter = @import("waiter.zig");
+const tcp = @import("transport/tcp.zig");
 const buffer = @import("buffer.zig");
 
 pub const Socket = struct {
@@ -10,17 +11,22 @@ pub const Socket = struct {
     // For a listening socket, we create it.
     // For an accepted socket, we inherit it from the stack.
     wait_queue: *waiter.Queue,
+    proto: ?stack.TransportProtocol = null,
 
     blocking: bool = true,
+    owns_wq: bool = false,
     allocator: std.mem.Allocator,
 
     wait_entry: waiter.Entry,
 
-    pub fn init(allocator: std.mem.Allocator, ep: tcpip.Endpoint, wq: *waiter.Queue) *Socket {
+    pub fn init(allocator: std.mem.Allocator, ep: tcpip.Endpoint, wq: *waiter.Queue, proto: ?stack.TransportProtocol, owns_wq: bool) *Socket {
+        if (@intFromPtr(ep.vtable) == 0) @panic("Socket.init: ep.vtable is NULL");
         const self = allocator.create(Socket) catch @panic("OOM");
         self.* = .{
             .endpoint = ep,
             .wait_queue = wq,
+            .proto = proto,
+            .owns_wq = owns_wq,
             .allocator = allocator,
             .wait_entry = undefined,
         };
@@ -38,13 +44,16 @@ pub const Socket = struct {
 
     pub fn deinit(self: *Socket) void {
         self.wait_queue.eventUnregister(&self.wait_entry);
+        if (self.owns_wq) {
+            // Transfer waiter queue ownership to the TCP endpoint.
+            // The endpoint may still be alive in close states (FIN_WAIT, TIME_WAIT)
+            // and will call notify() on the waiter queue. If we release it now,
+            // it could be recycled to a new connection, causing cross-talk.
+            // The endpoint's experimentalReset() will release it when truly done.
+            const tcp_ep = @as(*tcp.TCPEndpoint, @ptrCast(@alignCast(self.endpoint.ptr)));
+            tcp_ep.owns_waiter_queue = true;
+        }
         self.endpoint.close();
-        // Wait queue handling:
-        // If we created it (client/listener), we own it.
-        // If accepted, we also own it (TCPEndpoint logic passes ownership).
-        // Since TCPEndpoint.close() doesn't free the queue passed to it, we must free it.
-        // Wait, TCPEndpoint stores reference.
-        self.allocator.destroy(self.wait_queue);
         self.allocator.destroy(self);
     }
 
@@ -71,17 +80,20 @@ pub fn usocket(s: *stack.Stack, domain: i32, sock_type: i32, protocol: i32) !*So
 
     const trans_proto = s.transport_protocols.get(trans_proto_id) orelse return error.ProtocolNotSupported;
 
-    // Create Wait Queue
-    const wq = try s.allocator.create(waiter.Queue);
-    wq.* = .{};
+    // Create Wait Queue from pool if possible
+    const wq = trans_proto.acquireWaiterQueue() catch blk: {
+        const q = try s.allocator.create(waiter.Queue);
+        q.* = .{};
+        break :blk q;
+    };
 
     // Create Endpoint
     const ep = try trans_proto.newEndpoint(s, net_proto, wq);
     errdefer {
-        s.allocator.destroy(wq);
+        trans_proto.releaseWaiterQueue(wq);
     }
 
-    return Socket.init(s.allocator, ep, wq);
+    return Socket.init(s.allocator, ep, wq, trans_proto, true);
 }
 
 pub fn ubind(sock: *Socket, addr: std.posix.sockaddr, len: std.posix.socklen_t) !void {
@@ -110,7 +122,7 @@ pub fn uaccept(sock: *Socket, addr: ?*std.posix.sockaddr, len: ?*std.posix.sockl
         } else |_| {}
     }
 
-    return Socket.init(sock.allocator, res.ep, res.wq);
+    return Socket.init(sock.allocator, res.ep, res.wq, sock.proto, true);
 }
 
 pub inline fn urecv(sock: *Socket, buf: []u8, flags: u32) !usize {
@@ -197,22 +209,24 @@ pub const uepoll_event = struct {
 
 pub const EpollInstance = struct {
     allocator: std.mem.Allocator,
-    interests: std.AutoHashMap(i32, EpollInterest),
+    interests: std.AutoHashMap(i32, *EpollInterest),
     ready_list: std.ArrayList(i32),
     signal_fd: i32,
     signaled: bool = false,
 
     const EpollInterest = struct {
+        fd: i32,
         events: u32,
         data: std.os.linux.epoll_data,
         wait_entry: waiter.Entry,
+        is_ready: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator) !*EpollInstance {
         const self = try allocator.create(EpollInstance);
         self.* = .{
             .allocator = allocator,
-            .interests = std.AutoHashMap(i32, EpollInterest).init(allocator),
+            .interests = std.AutoHashMap(i32, *EpollInterest).init(allocator),
             .ready_list = std.ArrayList(i32).init(allocator),
             .signal_fd = try std.posix.eventfd(0, 0x800),
         };
@@ -222,13 +236,17 @@ pub const EpollInstance = struct {
     pub fn deinit(self: *EpollInstance) void {
         var it = self.interests.iterator();
         while (it.next()) |entry| {
-            // Unregister from socket
-            const ft = if (global_file_table) |*t| t else return;
-            const file = ft.get(entry.key_ptr.*) orelse continue;
-            switch (file) {
-                .socket => |s| s.wait_queue.eventUnregister(&entry.value_ptr.wait_entry),
-                else => {},
+            const interest = entry.value_ptr.*;
+            // Unregister from socket if possible
+            if (global_file_table) |*ft| {
+                if (ft.get(entry.key_ptr.*)) |file| {
+                    switch (file) {
+                        .socket => |s| s.wait_queue.eventUnregister(&interest.wait_entry),
+                        else => {},
+                    }
+                }
             }
+            self.allocator.destroy(interest);
         }
         self.interests.deinit();
         self.ready_list.deinit();
@@ -238,13 +256,12 @@ pub const EpollInstance = struct {
 
     fn notifyCallback(e: *waiter.Entry) void {
         const self = @as(*EpollInstance, @ptrCast(@alignCast(e.context.?)));
-        const fd = @as(i32, @intCast(@intFromPtr(e.upcall_ctx))); // Store FD in upcall_ctx for simplicity
+        const interest = @as(*EpollInterest, @ptrCast(@alignCast(e.upcall_ctx.?)));
 
-        // Check if already in ready list
-        for (self.ready_list.items) |rfd| {
-            if (rfd == fd) return;
+        if (!interest.is_ready) {
+            interest.is_ready = true;
+            self.ready_list.append(interest.fd) catch {};
         }
-        self.ready_list.append(fd) catch {};
 
         if (!self.signaled) {
             self.signaled = true;
@@ -285,39 +302,54 @@ pub fn uepoll_ctl(epfd: i32, op: i32, fd: i32, event: ?*uepoll_event) !void {
             if (ep.interests.contains(fd)) return error.FileExists;
             const ev = event orelse return error.InvalidArguments;
 
-            var interest = EpollInstance.EpollInterest{
+            const interest = try ep.allocator.create(EpollInstance.EpollInterest);
+            errdefer ep.allocator.destroy(interest);
+
+            interest.* = .{
+                .fd = fd,
                 .events = ev.events,
                 .data = ev.data,
                 .wait_entry = undefined,
             };
             interest.wait_entry = waiter.Entry.init(ep, EpollInstance.notifyCallback);
-            interest.wait_entry.upcall_ctx = @ptrFromInt(@as(usize, @intCast(fd)));
+            interest.wait_entry.upcall_ctx = interest;
 
             try ep.interests.put(fd, interest);
-            const entry = ep.interests.getPtr(fd).?;
-            sock.wait_queue.eventRegister(&entry.wait_entry, pollToWaiter(@intCast(ev.events)));
-        },
-        std.os.linux.EPOLL.CTL_MOD => {
-            const entry = ep.interests.getPtr(fd) orelse return error.NoEntity;
-            const ev = event orelse return error.InvalidArguments;
+            sock.wait_queue.eventRegister(&interest.wait_entry, pollToWaiter(@intCast(ev.events)));
 
-            sock.wait_queue.eventUnregister(&entry.wait_entry);
-            entry.events = ev.events;
-            entry.data = ev.data;
-            sock.wait_queue.eventRegister(&entry.wait_entry, pollToWaiter(@intCast(ev.events)));
-        },
-        std.os.linux.EPOLL.CTL_DEL => {
-            const entry = ep.interests.getPtr(fd) orelse return error.NoEntity;
-            sock.wait_queue.eventUnregister(&entry.wait_entry);
-            _ = ep.interests.remove(fd);
-
-            // Remove from ready list if present
-            for (ep.ready_list.items, 0..) |rfd, i| {
-                if (rfd == fd) {
-                    _ = ep.ready_list.orderedRemove(i);
-                    break;
+            // Immediate readiness check
+            if (!interest.is_ready) {
+                const mask = sock.wait_queue.events();
+                const interested = pollToWaiter(@intCast(ev.events));
+                if (mask & interested != 0) {
+                    interest.is_ready = true;
+                    ep.ready_list.append(fd) catch {};
+                    if (!ep.signaled) {
+                        ep.signaled = true;
+                        const val: u64 = 1;
+                        _ = std.posix.write(ep.signal_fd, std.mem.asBytes(&val)) catch {
+                            ep.signaled = false;
+                        };
+                    }
                 }
             }
+        },
+        std.os.linux.EPOLL.CTL_MOD => {
+            const interest = ep.interests.get(fd) orelse return error.NoEntity;
+            const ev = event orelse return error.InvalidArguments;
+
+            sock.wait_queue.eventUnregister(&interest.wait_entry);
+            interest.events = ev.events;
+            interest.data = ev.data;
+            sock.wait_queue.eventRegister(&interest.wait_entry, pollToWaiter(@intCast(ev.events)));
+        },
+        std.os.linux.EPOLL.CTL_DEL => {
+            const interest = ep.interests.get(fd) orelse return error.NoEntity;
+            sock.wait_queue.eventUnregister(&interest.wait_entry);
+            _ = ep.interests.remove(fd);
+            ep.allocator.destroy(interest);
+            // We don't remove from ready_list here to avoid O(N) scan.
+            // uepoll_wait will handle it lazily.
         },
         else => return error.InvalidArguments,
     }
@@ -344,14 +376,27 @@ pub fn uepoll_wait(epfd: i32, events: []uepoll_event, timeout_ms: i32) !usize {
     }
 
     var count: usize = 0;
-    while (count < events.len and ep.ready_list.items.len > 0) {
-        const fd = ep.ready_list.orderedRemove(0);
-        const interest = ep.interests.get(fd) orelse continue;
+    const ready_items = ep.ready_list.items;
+    var ready_idx: usize = 0;
+    while (count < events.len and ready_idx < ready_items.len) {
+        const fd = ready_items[ready_idx];
+        ready_idx += 1;
 
-        const target_file = ft.get(fd) orelse continue;
+        const interest = ep.interests.get(fd) orelse {
+            continue;
+        };
+
+        const target_file = ft.get(fd) orelse {
+            interest.is_ready = false;
+            continue;
+        };
+
         const sock = switch (target_file) {
             .socket => |s| s,
-            else => continue,
+            else => {
+                interest.is_ready = false;
+                continue;
+            },
         };
 
         const mask = sock.wait_queue.events();
@@ -364,6 +409,20 @@ pub fn uepoll_wait(epfd: i32, events: []uepoll_event, timeout_ms: i32) !usize {
                 .data = interest.data,
             };
             count += 1;
+            interest.is_ready = false;
+        } else {
+            // Not ready anymore
+            interest.is_ready = false;
+        }
+    }
+
+    // Cleanup the ready list
+    if (ready_idx > 0) {
+        if (ready_idx < ready_items.len) {
+            std.mem.copyForwards(i32, ready_items[0 .. ready_items.len - ready_idx], ready_items[ready_idx..]);
+            ep.ready_list.shrinkRetainingCapacity(ready_items.len - ready_idx);
+        } else {
+            ep.ready_list.clearRetainingCapacity();
         }
     }
     return count;
@@ -434,6 +493,13 @@ pub fn getGlobalFileTable(allocator: std.mem.Allocator) *FileTable {
         global_file_table = FileTable.init(allocator);
     }
     return &global_file_table.?;
+}
+
+pub fn deinit_posix() void {
+    if (global_file_table) |*ft| {
+        ft.deinit();
+        global_file_table = null;
+    }
 }
 
 pub fn socket_fd(s: *stack.Stack, domain: i32, sock_type: i32, protocol: i32) !i32 {
@@ -613,7 +679,7 @@ test "POSIX API TCP client/server" {
     defer s.deinit();
     try s.registerTransportProtocol(tcp_proto.protocol());
 
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     // Setup Link
@@ -920,7 +986,7 @@ test "POSIX upoll basic" {
 
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     // Setup Link
@@ -996,16 +1062,13 @@ test "FD-based API basic" {
     const allocator = std.testing.allocator;
     var s = try stack.Stack.init(allocator);
     defer {
+        deinit_posix();
         s.deinit();
-        if (global_file_table) |*ft| {
-            ft.deinit();
-            global_file_table = null;
-        }
     }
 
     var udp_proto = @import("transport/udp.zig").UDPProtocol.init(allocator);
     try s.registerTransportProtocol(udp_proto.protocol());
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     // 1. socket_fd
@@ -1037,16 +1100,13 @@ test "Epoll FD-based API" {
     const allocator = std.testing.allocator;
     var s = try stack.Stack.init(allocator);
     defer {
+        deinit_posix();
         s.deinit();
-        if (global_file_table) |*ft| {
-            ft.deinit();
-            global_file_table = null;
-        }
     }
 
     var tcp_proto = @import("transport/tcp.zig").TCPProtocol.init(allocator);
     try s.registerTransportProtocol(tcp_proto.protocol());
-    var ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init();
+    const ipv4_proto = @import("network/ipv4.zig").IPv4Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv4_proto.protocol());
 
     const epfd = try uepoll_create(10);

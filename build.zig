@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         debug,
         none,
     };
-    const log_level = b.option(LogLevel, "log_level", "Log level for ustack (default: debug)") orelse .debug;
+    const log_level = b.option(LogLevel, "log_level", "Log level for ustack (default: info)") orelse .info;
 
     const options = b.addOptions();
     options.addOption(LogLevel, "log_level", log_level);
@@ -72,6 +72,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example_uperf_runtime", .path = "examples/uperf_runtime.zig", .lib = "ev" },
         .{ .name = "example_ping_pong_socket", .path = "examples/ping_pong_socket.zig", .lib = "ev" },
         .{ .name = "example_uperf_fd", .path = "examples/uperf_fd.zig", .lib = "ev" },
+        .{ .name = "example_uperf_linux", .path = "examples/uperf_linux.zig", .lib = "ev" },
+        .{ .name = "example_ping_pong_linux", .path = "examples/ping_pong_linux.zig", .lib = "ev" },
+        .{ .name = "example_ping_pong_fd", .path = "examples/ping_pong_fd.zig", .lib = "ev" },
     };
 
     for (examples) |ex| {
@@ -97,11 +100,19 @@ pub fn build(b: *std.Build) void {
             std.mem.eql(u8, ex.name, "example_af_xdp_libev") or
             std.mem.eql(u8, ex.name, "example_ping_pong") or
             std.mem.eql(u8, ex.name, "example_ping_pong_socket") or
-            std.mem.eql(u8, ex.name, "example_uperf_fd"))
+            std.mem.eql(u8, ex.name, "example_ping_pong_linux") or
+            std.mem.eql(u8, ex.name, "example_uperf_linux") or
+            std.mem.eql(u8, ex.name, "example_uperf_fd") or
+            std.mem.eql(u8, ex.name, "example_ping_pong_fd"))
         {
             exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
         }
         const install = b.addInstallArtifact(exe, .{});
         example_step.dependOn(&install.step);
+
+        if (std.mem.eql(u8, ex.name, "example_ping_pong_fd")) {
+            const step = b.step("ping_pong_fd", "Build the ping_pong_fd example");
+            step.dependOn(&install.step);
+        }
     }
 }

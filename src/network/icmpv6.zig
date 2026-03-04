@@ -57,8 +57,12 @@ pub const ICMPv6Protocol = struct {
 };
 
 pub const ICMPv6TransportProtocol = struct {
-    pub fn init() ICMPv6TransportProtocol {
-        return .{};
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) *ICMPv6TransportProtocol {
+        const self = allocator.create(ICMPv6TransportProtocol) catch unreachable;
+        self.* = .{ .allocator = allocator };
+        return self;
     }
 
     pub fn protocol(self: *ICMPv6TransportProtocol) stack.TransportProtocol {
@@ -69,8 +73,14 @@ pub const ICMPv6TransportProtocol = struct {
                 .newEndpoint = newTransportEndpoint,
                 .parsePorts = parsePorts,
                 .handlePacket = handlePacket_external,
+                .deinit = transportDeinit,
             },
         };
+    }
+
+    fn transportDeinit(ptr: *anyopaque) void {
+        const self = @as(*ICMPv6TransportProtocol, @ptrCast(@alignCast(ptr)));
+        self.allocator.destroy(self);
     }
 
     fn transportNumber(ptr: *anyopaque) tcpip.TransportProtocolNumber {
@@ -109,6 +119,7 @@ pub const ICMPv6PacketHandler = struct {
         const v = mut_pkt.data.first() orelse return;
         var h = header.ICMPv6.init(v);
 
+        std.debug.print("[ICMPv6] handlePacket type={}\n", .{h.type()});
         switch (h.type()) {
             header.ICMPv6EchoRequestType => {
                 const payload = mut_pkt.data.toView(s.allocator) catch return;
@@ -228,6 +239,7 @@ pub const ICMPv6PacketHandler = struct {
 
                 // Add default gateway if lifetime > 0
                 if (ra.routerLifetime() > 0) {
+                    std.debug.print("[ICMPv6] RA: lifetime > 0, adding default route\n", .{});
                     s.addRoute(.{
                         .destination = .{ .address = .{ .v6 = [_]u8{0} ** 16 }, .prefix = 0 },
                         .gateway = r.remote_address,
@@ -237,6 +249,7 @@ pub const ICMPv6PacketHandler = struct {
 
                     // Learn router's MAC
                     if (r.remote_link_address) |mac| {
+                        std.debug.print("[ICMPv6] RA: learning router MAC\n", .{});
                         s.addLinkAddress(r.remote_address, mac) catch {};
                     }
                 }
@@ -258,7 +271,9 @@ pub const ICMPv6PacketHandler = struct {
                             // Flags are in byte 3 of Prefix Information option
                             // L=0x80, A=0x40
                             const flags = v[opt_idx + 3];
+                            std.debug.print("[ICMPv6] RA: Prefix option flags=0x{x}, prefix={}/{}\n", .{ flags, tcpip.Address{ .v6 = prefix }, prefix_len });
                             if (flags & 0x40 != 0) { // Autonomous address-configuration flag
+                                std.debug.print("[ICMPv6] RA: SLAAC A-flag set\n", .{});
                                 // Generate address: prefix + interface ID
                                 var new_addr = prefix;
                                 const mac = r.nic.linkEP.linkAddress();
@@ -272,14 +287,18 @@ pub const ICMPv6PacketHandler = struct {
                                 new_addr[14] = mac.addr[4];
                                 new_addr[15] = mac.addr[5];
 
+                                std.debug.print("[ICMPv6] SLAAC: generated {}\n", .{tcpip.Address{ .v6 = new_addr }});
                                 if (!r.nic.hasAddress(.{ .v6 = new_addr })) {
+                                    std.debug.print("[ICMPv6] SLAAC: adding address to NIC\n", .{});
                                     r.nic.addAddress(.{
                                         .protocol = 0x86dd,
                                         .address_with_prefix = .{
                                             .address = .{ .v6 = new_addr },
                                             .prefix_len = prefix_len,
                                         },
-                                    }) catch {};
+                                    }) catch |err| {
+                                        std.debug.print("[ICMPv6] SLAAC: addAddress failed: {}\n", .{err});
+                                    };
                                 }
                             }
                         }
@@ -297,10 +316,10 @@ test "ICMPv6 Neighbor Discovery" {
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
 
-    var ipv6_proto = @import("ipv6.zig").IPv6Protocol.init();
+    const ipv6_proto = @import("ipv6.zig").IPv6Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv6_proto.protocol());
 
-    var icmpv6_transport = ICMPv6TransportProtocol.init();
+    const icmpv6_transport = ICMPv6TransportProtocol.init(allocator);
     try s.registerTransportProtocol(icmpv6_transport.protocol());
 
     var fake_link = struct {
@@ -421,10 +440,10 @@ test "ICMPv6 Router Advertisement & SLAAC" {
     var s = try stack.Stack.init(allocator);
     defer s.deinit();
 
-    var ipv6_proto = @import("ipv6.zig").IPv6Protocol.init();
+    const ipv6_proto = @import("ipv6.zig").IPv6Protocol.init(allocator);
     try s.registerNetworkProtocol(ipv6_proto.protocol());
 
-    var icmpv6_transport = ICMPv6TransportProtocol.init();
+    const icmpv6_transport = ICMPv6TransportProtocol.init(allocator);
     try s.registerTransportProtocol(icmpv6_transport.protocol());
 
     var fake_link = struct {

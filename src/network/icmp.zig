@@ -8,8 +8,12 @@ const waiter = @import("../waiter.zig");
 pub const ProtocolNumber = 1;
 
 pub const ICMPv4TransportProtocol = struct {
-    pub fn init() ICMPv4TransportProtocol {
-        return .{};
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) *ICMPv4TransportProtocol {
+        const self = allocator.create(ICMPv4TransportProtocol) catch unreachable;
+        self.* = .{ .allocator = allocator };
+        return self;
     }
 
     pub fn protocol(self: *ICMPv4TransportProtocol) stack.TransportProtocol {
@@ -20,8 +24,14 @@ pub const ICMPv4TransportProtocol = struct {
                 .newEndpoint = newTransportEndpoint,
                 .parsePorts = parsePorts,
                 .handlePacket = handlePacket_external,
+                .deinit = transportDeinit,
             },
         };
+    }
+
+    fn transportDeinit(ptr: *anyopaque) void {
+        const self = @as(*ICMPv4TransportProtocol, @ptrCast(@alignCast(ptr)));
+        self.allocator.destroy(self);
     }
 
     fn transportNumber(ptr: *anyopaque) tcpip.TransportProtocolNumber {
@@ -162,8 +172,12 @@ pub const ICMPv4PacketHandler = struct {
 };
 
 pub const ICMPv4Protocol = struct {
-    pub fn init() ICMPv4Protocol {
-        return .{};
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) *ICMPv4Protocol {
+        const self = allocator.create(ICMPv4Protocol) catch unreachable;
+        self.* = .{ .allocator = allocator };
+        return self;
     }
 
     pub fn protocol(self: *ICMPv4Protocol) stack.NetworkProtocol {
@@ -178,7 +192,13 @@ pub const ICMPv4Protocol = struct {
         .newEndpoint = newEndpoint,
         .linkAddressRequest = linkAddressRequest,
         .parseAddresses = parseAddresses,
+        .deinit = deinit_external,
     };
+
+    fn deinit_external(ptr: *anyopaque) void {
+        const self = @as(*ICMPv4Protocol, @ptrCast(@alignCast(ptr)));
+        self.allocator.destroy(self);
+    }
 
     fn number(ptr: *anyopaque) tcpip.NetworkProtocolNumber {
         _ = ptr;

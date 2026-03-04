@@ -232,6 +232,8 @@ pub const TransportProtocol = struct {
         newEndpoint: *const fn (ptr: *anyopaque, stack: *Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint,
         parsePorts: *const fn (ptr: *anyopaque, pkt: tcpip.PacketBuffer) PortPair,
         handlePacket: ?*const fn (ptr: *anyopaque, r: *const Route, id: TransportEndpointID, pkt: tcpip.PacketBuffer) void = null,
+        acquireWaiterQueue: ?*const fn (ptr: *anyopaque) tcpip.Error!*waiter.Queue = null,
+        releaseWaiterQueue: ?*const fn (ptr: *anyopaque, wq: *waiter.Queue) void = null,
         deinit: ?*const fn (ptr: *anyopaque) void = null,
     };
 
@@ -249,6 +251,13 @@ pub const TransportProtocol = struct {
 
     pub fn parsePorts(self: TransportProtocol, pkt: tcpip.PacketBuffer) PortPair {
         return self.vtable.parsePorts(self.ptr, pkt);
+    }
+    pub fn acquireWaiterQueue(self: TransportProtocol) tcpip.Error!*waiter.Queue {
+        if (self.vtable.acquireWaiterQueue) |f| return f(self.ptr);
+        return tcpip.Error.NotSupported;
+    }
+    pub fn releaseWaiterQueue(self: TransportProtocol, wq: *waiter.Queue) void {
+        if (self.vtable.releaseWaiterQueue) |f| f(self.ptr, wq);
     }
 };
 
@@ -326,13 +335,13 @@ pub const NIC = struct {
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
-        const start_processing: i64 = @intCast(std.time.nanoTimestamp());
+        // const start_processing: i64 = @intCast(std.time.nanoTimestamp());
         defer {
-            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
-            if (pkt.timestamp_ns != 0) {
-                stats.global_stats.latency.link_layer.record(@as(i64, @intCast(start_processing - pkt.timestamp_ns)));
-                stats.global_stats.latency.network_layer.record(@as(i64, @intCast(end_processing - start_processing)));
-            }
+            // const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            // if (pkt.timestamp_ns != 0) {
+            //     stats.global_stats.latency.link_layer.record(@as(i64, @intCast(start_processing - pkt.timestamp_ns)));
+            //     stats.global_stats.latency.network_layer.record(@as(i64, @intCast(end_processing - start_processing)));
+            // }
         }
         const self = @as(*NIC, @ptrCast(@alignCast(ptr)));
         // log.debug("NIC: Received packet proto=0x{x} remote={any} local={any}", .{ protocol, remote, local });
@@ -503,6 +512,10 @@ pub const TransportTable = struct {
 
     pub fn deinit(self: *TransportTable) void {
         for (&self.shards) |*shard| {
+            var it = shard.valueIterator();
+            while (it.next()) |ep| {
+                ep.decRef();
+            }
             shard.deinit();
         }
     }
@@ -521,6 +534,10 @@ pub const TransportTable = struct {
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
         return self.getShard(id).remove(id);
+    }
+
+    pub fn contains(self: *TransportTable, id: TransportEndpointID) bool {
+        return self.getShard(id).contains(id);
     }
 
     pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
@@ -565,7 +582,7 @@ pub const Stack = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
         var cluster_pool = buffer.ClusterPool.init(allocator);
-        try cluster_pool.prewarm(32768);
+        try cluster_pool.prewarm(131072);
         return .{
             .allocator = allocator,
             .nics = std.AutoHashMap(tcpip.NICID, *NIC).init(allocator),
@@ -590,20 +607,24 @@ pub const Stack = struct {
     }
 
     pub fn deinit(self: *Stack) void {
+        std.debug.print("[Stack] deinit self={*}\n", .{self});
+        var endpoints_to_clean = std.ArrayList(TransportEndpoint).init(self.allocator);
+        defer endpoints_to_clean.deinit();
+
         var shard_idx: usize = 0;
         while (shard_idx < 256) : (shard_idx += 1) {
             var shard = &self.endpoints.shards[shard_idx];
-            var it = shard.valueIterator();
-            while (it.next()) |ep| {
-                // decRef might destroy the endpoint, but we clear the map after
-                // so we don't care about map corruption here.
-                // However, we MUST NOT use fetchRemove inside the loop.
-                ep.decRef();
+            while (true) {
+                var it = shard.iterator();
+                if (it.next()) |kv| {
+                    const id = kv.key_ptr.*;
+                    self.unregisterTransportEndpoint(id);
+                } else {
+                    break;
+                }
             }
-            shard.clearAndFree();
         }
         self.endpoints.deinit();
-        self.cluster_pool.deinit();
         var nic_it = self.nics.valueIterator();
         while (nic_it.next()) |nic| {
             nic.*.deinit();
@@ -625,6 +646,7 @@ pub const Stack = struct {
         self.network_protocols.deinit();
 
         self.route_table.deinit();
+        self.cluster_pool.deinit();
     }
 
     pub fn registerNetworkProtocol(self: *Stack, proto: NetworkProtocol) !void {
@@ -666,10 +688,26 @@ pub const Stack = struct {
         }
 
         if (is_new) {
+            var endpoints_to_notify = std.ArrayList(TransportEndpoint).init(self.allocator);
+            defer endpoints_to_notify.deinit();
+
             for (&self.endpoints.shards) |*shard| {
+                endpoints_to_notify.clearRetainingCapacity();
                 var it = shard.valueIterator();
                 while (it.next()) |ep| {
+                    endpoints_to_notify.append(ep.*) catch {};
+                }
+
+                for (endpoints_to_notify.items) |ep| {
+                    ep.incRef();
+                }
+
+                for (endpoints_to_notify.items) |ep| {
                     ep.notify(waiter.EventOut);
+                }
+
+                for (endpoints_to_notify.items) |ep| {
+                    ep.decRef();
                 }
             }
         }
@@ -705,6 +743,9 @@ pub const Stack = struct {
     }
 
     pub fn registerTransportEndpoint(self: *Stack, id: TransportEndpointID, ep: TransportEndpoint) !void {
+        if (self.endpoints.contains(id)) {
+            return tcpip.Error.AddressInUse;
+        }
         try self.endpoints.put(id, ep);
         ep.incRef();
     }
@@ -716,14 +757,44 @@ pub const Stack = struct {
         }
     }
 
-    pub fn getNextEphemeralPort(self: *Stack) u16 {
-        const port = self.ephemeral_port;
-        if (self.ephemeral_port == 65535) {
-            self.ephemeral_port = 32768;
-        } else {
-            self.ephemeral_port += 1;
+    pub fn isPortUsed(self: *Stack, addr: tcpip.Address, port: u16, transport: tcpip.TransportProtocolNumber) bool {
+        // We need to check if ANY endpoint is using this local port/addr.
+        // Since TransportTable is indexed by full ID, we have to iterate or use a secondary index.
+        // For performance, let's just check the most common case: a listening socket or a bound-only socket.
+        const id = TransportEndpointID{
+            .local_port = port,
+            .local_address = addr,
+            .remote_port = 0,
+            .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } },
+            .transport_protocol = transport,
+        };
+        if (self.endpoints.contains(id)) return true;
+
+        // Also check if ANY shard has an endpoint with this local port.
+        // This is slow (O(N)), but getNextEphemeralPort is not in the hot path for ESTABLISHED connections.
+        // Actually, for 30k CPS, it IS in the hot path.
+        // TODO: Add a local port usage bitmap or secondary hash map.
+        // For now, let's just rely on the fact that if we use the full ID in connect(),
+        // it will fail if the 4-tuple is already taken.
+        return false;
+    }
+
+    pub fn getNextEphemeralPort(self: *Stack, addr: tcpip.Address, transport: tcpip.TransportProtocolNumber) u16 {
+        const start_port = self.ephemeral_port;
+        while (true) {
+            const port = self.ephemeral_port;
+            if (self.ephemeral_port == 65535) {
+                self.ephemeral_port = 32768;
+            } else {
+                self.ephemeral_port += 1;
+            }
+
+            if (!self.isPortUsed(addr, port, transport)) {
+                return port;
+            }
+
+            if (self.ephemeral_port == start_port) return 0; // Exhausted
         }
-        return port;
     }
 
     // Find route using longest-prefix matching in routing table
@@ -834,10 +905,10 @@ pub const Stack = struct {
 
     pub fn deliverTransportPacket(ptr: *anyopaque, r: *const Route, protocol: tcpip.TransportProtocolNumber, pkt: tcpip.PacketBuffer) void {
         defer {
-            const end_processing: i64 = @intCast(std.time.nanoTimestamp());
-            if (pkt.timestamp_ns != 0) {
-                stats.global_stats.latency.transport_dispatch.record(end_processing - pkt.timestamp_ns);
-            }
+            // const end_processing: i64 = @intCast(std.time.nanoTimestamp());
+            // if (pkt.timestamp_ns != 0) {
+            //     stats.global_stats.latency.transport_dispatch.record(end_processing - pkt.timestamp_ns);
+            // }
         }
         const self = @as(*Stack, @ptrCast(@alignCast(ptr)));
 
