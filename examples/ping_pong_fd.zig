@@ -6,6 +6,7 @@ const buffer = ustack.buffer;
 const waiter = ustack.waiter;
 const AfPacket = ustack.drivers.af_packet.AfPacket;
 const posix = ustack.posix;
+const stats = ustack.stats;
 
 const c = @cImport({
     @cInclude("ev.h");
@@ -35,12 +36,11 @@ var global_active_conns: u32 = 0;
 var global_start_time: i64 = 0;
 var global_last_report_time: i64 = 0;
 var global_last_conn_count: u32 = 0;
+var global_last_printed_second: i64 = -1;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    global_allocator = gpa.allocator();
-    const allocator = global_allocator;
+    const allocator = std.heap.c_allocator;
+    global_allocator = allocator;
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -80,7 +80,10 @@ pub fn main() !void {
     }
 
     global_stack = try ustack.init(allocator);
-    defer global_stack.deinit();
+    defer {
+        posix.deinit_posix();
+        global_stack.deinit();
+    }
     global_stack.tcp_msl = 100;
 
     global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, ifname);
@@ -112,7 +115,7 @@ pub fn main() !void {
     my_ev_timer_start(loop, &timer_watcher);
 
     var stats_watcher = std.mem.zeroInit(c.ev_timer, .{});
-    my_ev_timer_init(&stats_watcher, libev_stats_cb, 1.0, 1.0);
+    my_ev_timer_init(&stats_watcher, libev_stats_cb, 0.1, 0.1);
     my_ev_timer_start(loop, &stats_watcher);
 
     global_start_time = std.time.milliTimestamp();
@@ -127,7 +130,7 @@ pub fn main() !void {
             .zero = [_]u8{0} ** 8,
         };
         try posix.bind_fd(server_fd, @as(std.posix.sockaddr, @bitCast(addr)), @sizeOf(std.posix.sockaddr.in));
-        try posix.listen_fd(server_fd, 8192);
+        try posix.listen_fd(server_fd, 65535);
 
         const sctx = try allocator.create(EpollContext);
         sctx.* = .{ .tag = .server, .ptr = .{ .server_fd = server_fd } };
@@ -138,10 +141,10 @@ pub fn main() !void {
         try posix.uepoll_ctl(global_epfd, std.os.linux.EPOLL.CTL_ADD, server_fd, &ev);
         std.debug.print("Server listening on port {}...\n", .{global_config.port});
     } else {
-        std.debug.print("Client connecting to {}.{}.{}.{}...\n", .{ global_config.target_ip.?[0], global_config.target_ip.?[1], global_config.target_ip.?[2], global_config.target_ip.?[3] });
         for (0..global_config.concurrency) |_| {
             try startClientConnection(loop, allocator);
         }
+        global_stack.flush();
     }
 
     my_ev_run(loop);
@@ -198,16 +201,29 @@ const EpollContext = struct {
     },
 };
 
+fn advance_timers() void {
+    const now = std.time.milliTimestamp();
+    if (last_tick == 0) last_tick = now;
+    const diff = now - last_tick;
+    if (diff > 0) {
+        _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(diff)));
+        last_tick = now;
+    }
+}
+
 fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
     _ = loop;
     _ = watcher;
     _ = revents;
-    while (true) {
+    var budget: usize = 1024;
+    while (budget > 0) : (budget -= 1) {
         const has_packet = global_af_packet.readPacket() catch false;
         if (!has_packet) break;
     }
-    global_stack.flush();
+    advance_timers();
     process_epoll();
+    perform_cleanup();
+    global_stack.flush();
 }
 
 fn libev_uepoll_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
@@ -215,6 +231,7 @@ fn libev_uepoll_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(
     _ = watcher;
     _ = revents;
     process_epoll();
+    perform_cleanup();
     global_stack.flush();
 }
 
@@ -223,16 +240,10 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     _ = loop;
     _ = watcher;
     _ = revents;
-    const now = std.time.milliTimestamp();
-    if (last_tick == 0) last_tick = now;
-    const diff = now - last_tick;
-    if (diff > 0) {
-        _ = global_stack.timer_queue.tickTo(global_stack.timer_queue.current_tick + @as(u64, @intCast(diff)));
-        last_tick = now;
-    }
-    global_stack.flush();
+    advance_timers();
     process_epoll();
     perform_cleanup();
+    global_stack.flush();
 }
 
 fn process_epoll() void {
@@ -263,7 +274,7 @@ fn handle_server_event(fd: i32, mask: i16) void {
                 posix.close_fd(client_fd);
                 continue;
             };
-            std.debug.print("[S] Accepted connection, fd={}\n", .{client_fd});
+            // std.debug.print("[S] Accepted connection, fd={}\n", .{client_fd});
             var ev = posix.uepoll_event{
                 .events = posix.POLLIN,
                 .data = .{ .ptr = @intFromPtr(conn.ctx) },
@@ -273,6 +284,7 @@ fn handle_server_event(fd: i32, mask: i16) void {
             global_active_conns += 1;
             conn.onEvent(posix.POLLIN);
         }
+        global_stack.flush();
     }
 }
 
@@ -381,16 +393,47 @@ fn libev_stats_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
     _ = watcher;
     _ = revents;
     const now = std.time.milliTimestamp();
+    const total_s_f = @as(f64, @floatFromInt(now - global_start_time)) / 1000.0;
+    const current_second = @as(i64, @intFromFloat(@floor(total_s_f)));
+
+    // Only report at chosen interval
+    // if (current_second <= global_last_printed_second) return;
+
+    // Skip the 0th second report if it's too early to be meaningful
+    // if (current_second == 0 and total_s_f < 0.9) return;
+
     const diff_conns = global_conn_count - global_last_conn_count;
     const diff_time_s = @as(f64, @floatFromInt(now - global_last_report_time)) / 1000.0;
-    if (diff_time_s == 0) return;
-    const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
-    const total_s = @as(f64, @floatFromInt(now - global_start_time)) / 1000.0;
-    std.debug.print("[{s}] {d:.1}s CPS: {d:.0} Active: {}\n", .{ if (std.mem.eql(u8, global_config.mode, "server")) @as([]const u8, "S") else "C", total_s, current_cps, global_active_conns });
+
+    if (diff_time_s > 0) {
+        const current_cps = @as(f64, @floatFromInt(diff_conns)) / diff_time_s;
+        std.debug.print("[{s}] {d:.2}s CPS: {d:.0} Act: {d} Est: {d} | RX/TX S: {d}/{d} SA: {d}/{d} A: {d}/{d} | IP Drp/Chks: {d}/{d} | EP: {d} SD: {d} PE: {d} RT: {d}\n", .{
+            if (std.mem.eql(u8, global_config.mode, "server")) @as([]const u8, "S") else @as([]const u8, "C"),
+            @as(f64, @floatFromInt(now - global_start_time)) / 1000.0,
+            current_cps,
+            global_active_conns,
+            stats.global_stats.tcp.established,
+            stats.global_stats.tcp.rx_syn,
+            stats.global_stats.tcp.tx_syn,
+            stats.global_stats.tcp.rx_syn_ack,
+            stats.global_stats.tcp.tx_syn_ack,
+            stats.global_stats.tcp.rx_ack,
+            stats.global_stats.tcp.tx_ack,
+            stats.global_stats.ip.dropped_packets,
+            stats.global_stats.ip.invalid_checksum,
+            stats.global_stats.tcp.active_endpoints,
+            stats.global_stats.tcp.syncache_dropped,
+            stats.global_stats.tcp.pool_exhausted,
+            stats.global_stats.tcp.retransmits,
+        });
+    }
+
     global_last_report_time = now;
     global_last_conn_count = global_conn_count;
+    global_last_printed_second = current_second;
+
     if (global_config.duration) |d| {
-        if (total_s >= @as(f64, @floatFromInt(d))) {
+        if (total_s_f >= @as(f64, @floatFromInt(d))) {
             global_finish = true;
             if (global_active_conns == 0 or std.mem.eql(u8, global_config.mode, "server")) my_ev_break(loop, 2);
         }

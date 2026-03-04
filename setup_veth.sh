@@ -6,9 +6,9 @@ ip link add veth0 type veth peer name veth1
 ip link set veth0 up
 ip link set veth1 up
 
-# Set MTU to 9000 to support Jumbo Frames testing
-ip link set veth0 mtu 9000
-ip link set veth1 mtu 9000
+# Set MTU to 1500 to match ClusterSize
+ip link set veth0 mtu 1500
+ip link set veth1 mtu 1500
 
 ethtool -K veth0 tx off rx off gso off tso off gro off
 ethtool -K veth1 tx off rx off gso off tso off gro off

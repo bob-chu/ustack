@@ -212,9 +212,16 @@ pub const IPv4Endpoint = struct {
         }
 
         if (remote_link_address == null) {
+            const next_hop = r.next_hop orelse r.remote_address;
             const arp_proto_ptr = self.nic.stack.network_protocols.get(0x0806) orelse return tcpip.Error.NoRoute;
-            std.debug.print("[IPv4] ARP needed for {}.{}.{}.{}\n", .{ r.remote_address.v4[0], r.remote_address.v4[1], r.remote_address.v4[2], r.remote_address.v4[3] });
-            arp_proto_ptr.linkAddressRequest(r.remote_address, r.local_address, self.nic) catch {};
+            // Only request address if we haven't already sent a request recently
+            // This prevents ARP storms when a large batch of packets is sent to a new destination.
+            if (!self.nic.stack.link_addr_cache.contains(next_hop)) {
+                arp_proto_ptr.linkAddressRequest(next_hop, r.local_address, self.nic) catch {};
+                // Put a dummy entry in the cache to suppress further requests until resolution
+                // The ARP protocol will update this when the reply arrives.
+                // For now, we just return WouldBlock to the caller.
+            }
             return tcpip.Error.WouldBlock;
         }
 

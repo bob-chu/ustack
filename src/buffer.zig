@@ -69,11 +69,11 @@ pub const ClusterPool = struct {
     pub fn acquire(self: *ClusterPool) !*Cluster {
         if (self.free_list) |c| {
             self.free_list = c.next;
-            if (self.count > 0) self.count -= 1;
             c.ref_count = 1;
+            c.next = null;
+            self.count -= 1;
             return c;
         }
-
         stats.global_stats.pool.cluster_fallback += 1;
         const c = try self.allocator.create(Cluster);
         c.* = .{
@@ -131,31 +131,26 @@ pub fn Pool(comptime T: type) type {
 
         pub fn acquire(self: *Self) !*T {
             if (self.free_list.popOrNull()) |node| {
+                @memset(std.mem.asBytes(node), 0);
                 return node;
             }
-            stats.global_stats.pool.generic_fallback += 1;
+            stats.global_stats.tcp.pool_exhausted += 1;
             const node = try self.allocator.create(T);
             @memset(std.mem.asBytes(node), 0);
             return node;
         }
 
         pub fn release(self: *Self, node: *T) void {
-            if (self.free_list.items.len >= self.capacity) {
-                self.allocator.destroy(node);
-                return;
-            }
             self.free_list.append(node) catch {
+                if (@hasDecl(T, "deinit")) {
+                    node.deinit();
+                }
                 self.allocator.destroy(node);
             };
         }
 
         pub fn tryRelease(self: *Self, node: *T) bool {
-            if (self.free_list.items.len >= self.capacity) {
-                return false;
-            }
-            self.free_list.append(node) catch {
-                return false;
-            };
+            self.release(node);
             return true;
         }
     };
@@ -198,17 +193,12 @@ pub const BufferPool = struct {
             @memset(buf, 0);
             return buf;
         }
-        stats.global_stats.pool.buffer_fallback += 1;
         const buf = try self.allocator.alloc(u8, self.buffer_size);
         @memset(buf, 0);
         return buf;
     }
 
     pub fn release(self: *BufferPool, buf: []u8) void {
-        if (self.free_list.items.len >= self.capacity) {
-            self.allocator.free(buf);
-            return;
-        }
         self.free_list.append(buf) catch {
             self.allocator.free(buf);
         };

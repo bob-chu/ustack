@@ -41,6 +41,8 @@ pub const UDPProtocol = struct {
         .number = number,
         .newEndpoint = newEndpoint,
         .parsePorts = parsePorts,
+        .acquireWaiterQueue = acquireWaiterQueue_external,
+        .releaseWaiterQueue = releaseWaiterQueue_external,
         .deinit = deinit_external,
     };
 
@@ -55,6 +57,18 @@ pub const UDPProtocol = struct {
     fn number(ptr: *anyopaque) tcpip.TransportProtocolNumber {
         _ = ptr;
         return ProtocolNumber;
+    }
+
+    fn acquireWaiterQueue_external(ptr: *anyopaque) tcpip.Error!*waiter.Queue {
+        const self = @as(*UDPProtocol, @ptrCast(@alignCast(ptr)));
+        const wq = self.view_pool.allocator.create(waiter.Queue) catch return tcpip.Error.OutOfMemory;
+        wq.* = .{};
+        return wq;
+    }
+
+    fn releaseWaiterQueue_external(ptr: *anyopaque, wq: *waiter.Queue) void {
+        const self = @as(*UDPProtocol, @ptrCast(@alignCast(ptr)));
+        self.view_pool.allocator.destroy(wq);
     }
 
     fn newEndpoint(ptr: *anyopaque, s: *stack.Stack, net_proto: tcpip.NetworkProtocolNumber, wait_queue: *waiter.Queue) tcpip.Error!tcpip.Endpoint {
@@ -90,6 +104,7 @@ pub const UDPEndpoint = struct {
     local_addr: ?tcpip.FullAddress = null,
     remote_addr: ?tcpip.FullAddress = null,
     cached_route: ?stack.Route = null,
+    owns_waiter_queue: bool = false,
 
     pub fn init(s: *stack.Stack, proto: *UDPProtocol, wq: *waiter.Queue) UDPEndpoint {
         return .{
@@ -181,8 +196,6 @@ pub const UDPEndpoint = struct {
             };
             self.stack.unregisterTransportEndpoint(id);
         }
-
-        self.decRef();
     }
 
     fn incRef_external(ptr: *anyopaque) void {
@@ -486,7 +499,7 @@ pub const UDPEndpoint = struct {
 
         const new_addr = if (addr.port == 0) blk: {
             var tmp = addr;
-            tmp.port = self.stack.getNextEphemeralPort();
+            tmp.port = self.stack.getNextEphemeralPort(addr.addr, ProtocolNumber);
             break :blk tmp;
         } else addr;
 
