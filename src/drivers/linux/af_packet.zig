@@ -22,6 +22,7 @@ pub const AfPacket = struct {
     tx_ring: []u8,
     rx_idx: usize = 0,
     tx_idx: usize = 0,
+    needs_flush: bool = false,
     frame_size: u32,
     frame_nr: u32,
 
@@ -77,8 +78,8 @@ pub const AfPacket = struct {
             .fd = fd,
             .allocator = allocator,
             .cluster_pool = pool,
-            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 16384),
-            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 16384),
+            .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 131072),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 131072),
             .if_index = if_index,
             .address = .{ .addr = mac },
             .rx_ring = rx_ring_ptr,
@@ -111,12 +112,13 @@ pub const AfPacket = struct {
     }
 
     pub fn flush(self: *AfPacket) void {
+        if (!self.needs_flush) return;
         // Kick kernel to send pending frames
-        const start = std.time.nanoTimestamp();
-        _ = std.os.linux.syscall6(.sendto, @as(usize, @intCast(self.fd)), 0, 0, 0, 0, 0);
-        const end = std.time.nanoTimestamp();
-        stats.global_stats.latency.driver_tx.record(@as(i64, @intCast(end - start)));
+        const MSG_DONTWAIT = 0x40;
+        const MSG_NOSIGNAL = 0x4000;
+        _ = std.os.linux.syscall6(.sendto, @as(usize, @intCast(self.fd)), 0, 0, MSG_DONTWAIT | MSG_NOSIGNAL, 0, 0);
         stats.global_link_stats.tx_syscalls += 1;
+        self.needs_flush = false;
     }
 
     fn close_external(ptr: *anyopaque) void {
@@ -139,7 +141,6 @@ pub const AfPacket = struct {
     }
 
     pub fn writePackets(self: *AfPacket, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
-        var any_sent = false;
         for (packets) |pkt| {
             const slot = self.tx_ring[self.tx_idx * self.frame_size .. (self.tx_idx + 1) * self.frame_size];
             var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(slot.ptr)));
@@ -173,9 +174,8 @@ pub const AfPacket = struct {
             stats.global_link_stats.tx_bytes += total_len;
 
             self.tx_idx = (self.tx_idx + 1) % self.frame_nr;
-            any_sent = true;
+            self.needs_flush = true;
         }
-        if (any_sent) self.flush();
     }
 
     fn writePacket_external(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) tcpip.Error!void {
@@ -211,21 +211,24 @@ pub const AfPacket = struct {
     }
 
     pub fn readPacket(self: *AfPacket) !bool {
+        stats.global_link_stats.rx_syscalls += 1;
         var num_read: usize = 0;
-        const max_batch = 4096;
-        const driver_start = std.time.nanoTimestamp();
+        // std.debug.print("readPacket called on fd={}\n", .{self.fd});
+        // const driver_start = std.time.nanoTimestamp();
         defer {
             if (num_read > 0) {
-                const driver_end = std.time.nanoTimestamp();
-                stats.global_stats.latency.driver_rx.record(@as(i64, @intCast(driver_end - driver_start)));
+                // const driver_end = std.time.nanoTimestamp();
+                // stats.global_stats.latency.driver_rx.record(@as(i64, @intCast(driver_end - driver_start)));
             }
         }
+        const max_batch = 16384;
         while (num_read < max_batch) {
             const rx_slot = self.rx_ring[self.rx_idx * self.frame_size .. (self.rx_idx + 1) * self.frame_size];
             var h = @as(*volatile header.tpacket2_hdr, @ptrCast(@alignCast(rx_slot.ptr)));
 
             const status = h.tp_status;
-            if ((status & header.TP_STATUS_USER) == 0) break;
+            if (status == header.TP_STATUS_KERNEL) break;
+            // std.debug.print("AfPacket: Received frame with status {}\n", .{status});
 
             const len = h.tp_len;
             const data_start = h.tp_mac;
@@ -238,7 +241,7 @@ pub const AfPacket = struct {
             const data = rx_slot[data_start .. data_start + len];
 
             // Filter out loopback (if source MAC is ours)
-            if (std.mem.eql(u8, data[6..12], &self.address.addr)) {
+            if (len >= 12 and std.mem.eql(u8, data[6..12], &self.address.addr)) {
                 h.tp_status = header.TP_STATUS_KERNEL;
                 self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
                 continue;
@@ -248,6 +251,12 @@ pub const AfPacket = struct {
                 stats.global_stats.pool.cluster_exhausted += 1;
                 return num_read > 0;
             };
+            if (len > c.data.len) {
+                c.release();
+                h.tp_status = header.TP_STATUS_KERNEL;
+                self.rx_idx = (self.rx_idx + 1) % self.frame_nr;
+                continue;
+            }
             @memcpy(c.data[0..len], data);
 
             h.tp_status = header.TP_STATUS_KERNEL;
@@ -268,21 +277,25 @@ pub const AfPacket = struct {
                 return num_read > 0;
             };
             const original_views = @as([]buffer.ClusterView, @ptrCast(@alignCast(std.mem.bytesAsSlice(buffer.ClusterView, view_mem))));
+            @memset(original_views, .{ .cluster = null, .view = &[_]u8{} });
             original_views[0] = .{ .cluster = c, .view = c.data[0..len] };
 
             const pkt = tcpip.PacketBuffer{
                 .data = buffer.VectorisedView.init(len, original_views[0..1]),
                 .header = buffer.Prependable.init(h_buf),
-                .timestamp_ns = @intCast(std.time.nanoTimestamp()),
+                .timestamp_ns = 0, // @intCast(std.time.nanoTimestamp()),
             };
             var mut_pkt = pkt;
             mut_pkt.data.original_views = original_views;
             mut_pkt.data.view_pool = &self.view_pool;
 
             if (self.dispatcher) |d| {
-                const dummy_mac = tcpip.LinkAddress{ .addr = [_]u8{0} ** 6 };
-                const pkt_proto = std.mem.readInt(u16, data[12..14], .big);
-                d.deliverNetworkPacket(&dummy_mac, &dummy_mac, pkt_proto, mut_pkt);
+                if (len >= 14) {
+                    const src_mac = tcpip.LinkAddress{ .addr = data[6..12].* };
+                    const dst_mac = tcpip.LinkAddress{ .addr = data[0..6].* };
+                    const pkt_proto = std.mem.readInt(u16, data[12..14], .big);
+                    d.deliverNetworkPacket(&src_mac, &dst_mac, pkt_proto, mut_pkt);
+                }
             }
             self.header_pool.release(h_buf);
             mut_pkt.data.deinit();

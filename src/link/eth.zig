@@ -33,7 +33,19 @@ pub const EthernetEndpoint = struct {
         .mtu = mtu,
         .setMTU = setMTU,
         .capabilities = capabilities,
+        .flush = flush,
+        .close = close,
     };
+
+    fn flush(ptr: *anyopaque) void {
+        const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
+        self.lower.flush();
+    }
+
+    fn close(ptr: *anyopaque) void {
+        const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
+        self.lower.close();
+    }
 
     fn writePackets(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
@@ -85,11 +97,11 @@ pub const EthernetEndpoint = struct {
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
-        const start = std.time.nanoTimestamp();
-        defer {
-            const end = std.time.nanoTimestamp();
-            stats.global_stats.latency.link_layer.record(@as(i64, @intCast(end - start)));
-        }
+        // const start = std.time.nanoTimestamp();
+        // defer {
+        //     const end = std.time.nanoTimestamp();
+        //     stats.global_stats.latency.link_layer.record(@as(i64, @intCast(end - start)));
+        // }
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
         _ = remote;
         _ = local;

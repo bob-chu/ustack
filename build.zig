@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         debug,
         none,
     };
-    const log_level = b.option(LogLevel, "log_level", "Log level for ustack (default: debug)") orelse .debug;
+    const log_level = b.option(LogLevel, "log_level", "Log level for ustack (default: info)") orelse .info;
 
     const options = b.addOptions();
     options.addOption(LogLevel, "log_level", log_level);
@@ -109,5 +109,10 @@ pub fn build(b: *std.Build) void {
         }
         const install = b.addInstallArtifact(exe, .{});
         example_step.dependOn(&install.step);
+
+        if (std.mem.eql(u8, ex.name, "example_ping_pong_fd")) {
+            const step = b.step("ping_pong_fd", "Build the ping_pong_fd example");
+            step.dependOn(&install.step);
+        }
     }
 }
