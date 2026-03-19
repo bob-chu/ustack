@@ -54,8 +54,10 @@ pub const Socket = struct {
             tcp_ep.owns_waiter_queue = true;
         }
         self.endpoint.close();
+
         self.endpoint.decRef(); // Release Socket's reference; endpoint stays alive via transport table
-        self.allocator.destroy(self);
+
+
     }
 
     pub fn setOption(self: *Socket, opt: tcpip.EndpointOption) !void {
