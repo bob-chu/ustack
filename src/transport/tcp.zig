@@ -1368,22 +1368,37 @@ pub const TCPEndpoint = struct {
         const self = @as(*TCPEndpoint, @ptrCast(@alignCast(ptr)));
         if (self.state != .initial) return tcpip.Error.InvalidEndpointState;
         var final_addr = addr;
-        if (final_addr.port == 0) final_addr.port = self.stack.getNextEphemeralPort();
+        if (final_addr.port == 0) final_addr.port = self.stack.getNextEphemeralPort(final_addr.addr, ProtocolNumber);
 
-        // Check for existing endpoint with the same ID
-        const id = stack.TransportEndpointID{ .local_port = final_addr.port, .local_address = final_addr.addr, .remote_port = 0, .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } }, .transport_protocol = ProtocolNumber };
-        const shard = self.stack.endpoints.getShard(id);
-        if (shard.get(id)) |existing_ep| {
+        // Check for existing endpoint with the same ID, including wildcards
+        if (self.stack.isPortUsed(final_addr.addr, final_addr.port, ProtocolNumber)) |existing_ep| {
             defer existing_ep.decRef();
+
             const existing_tcp = @as(*TCPEndpoint, @ptrCast(@alignCast(existing_ep.ptr)));
             if (existing_tcp.state != .time_wait and existing_tcp.state != .closed) {
                 return tcpip.Error.AddressInUse;
             }
-            // If in TIME_WAIT or CLOSED, we'll unregister it to reuse the port
-            _ = self.stack.endpoints.fetchRemove(id);
-            existing_ep.decRef(); // decRef for the fetchRemove
+            
+            // Reconstruct ID to unregister
+            const la = existing_tcp.local_addr.?;
+            const ra = existing_tcp.remote_addr orelse tcpip.FullAddress{ .nic = 0, .addr = switch (la.addr) {
+                .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                .v6 => .{ .v6 = [_]u8{0} ** 16 },
+            }, .port = 0 };
+            const id = stack.TransportEndpointID{
+                .local_port = la.port,
+                .local_address = la.addr,
+                .remote_port = ra.port,
+                .remote_address = ra.addr,
+                .transport_protocol = ProtocolNumber,
+            };
+            self.stack.unregisterTransportEndpoint(id);
         }
 
+        const id = stack.TransportEndpointID{ .local_port = final_addr.port, .local_address = final_addr.addr, .remote_port = 0, .remote_address = switch (final_addr.addr) {
+            .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+            .v6 => .{ .v6 = [_]u8{0} ** 16 },
+        }, .transport_protocol = ProtocolNumber };
         self.stack.registerTransportEndpoint(id, self.transportEndpoint()) catch return tcpip.Error.OutOfMemory;
         self.local_addr = final_addr;
         self.state = .bound;

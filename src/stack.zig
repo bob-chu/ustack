@@ -528,6 +528,27 @@ pub const TransportTable = struct {
         if (ep) |e| e.incRef();
         return ep;
     }
+
+    pub fn hasConflict(self: *TransportTable, addr: tcpip.Address, port: u16, transport: tcpip.TransportProtocolNumber) ?TransportEndpoint {
+        const is_any = addr.isAny();
+        for (&self.shards) |*shard| {
+            var it = shard.iterator();
+            while (it.next()) |kv| {
+                const id = kv.key_ptr;
+                if (id.local_port == port and id.transport_protocol == transport and id.remote_port == 0) {
+                    if (is_any or id.local_address.isAny() or id.local_address.eq(addr)) {
+                        // For TCP, we can reuse ports in TIME_WAIT or CLOSED state.
+                        // We need a way to check state without circular dependency.
+                        // For now, let's just return the endpoint and let the caller decide.
+                        const ep = kv.value_ptr.*;
+                        ep.incRef();
+                        return ep;
+                    }
+                }
+            }
+        }
+        return null;
+    }
 };
 
 pub const LinkCacheEntry = struct {
@@ -716,14 +737,28 @@ pub const Stack = struct {
         }
     }
 
-    pub fn getNextEphemeralPort(self: *Stack) u16 {
-        const port = self.ephemeral_port;
-        if (self.ephemeral_port == 65535) {
-            self.ephemeral_port = 32768;
-        } else {
-            self.ephemeral_port += 1;
+    pub fn isPortUsed(self: *Stack, addr: tcpip.Address, port: u16, transport: tcpip.TransportProtocolNumber) ?TransportEndpoint {
+        return self.endpoints.hasConflict(addr, port, transport);
+    }
+
+    pub fn getNextEphemeralPort(self: *Stack, addr: tcpip.Address, transport: tcpip.TransportProtocolNumber) u16 {
+        const start_port = self.ephemeral_port;
+        while (true) {
+            const port = self.ephemeral_port;
+            if (self.ephemeral_port == 65535) {
+                self.ephemeral_port = 32768;
+            } else {
+                self.ephemeral_port += 1;
+            }
+
+            if (self.isPortUsed(addr, port, transport)) |ep| {
+                ep.decRef();
+            } else {
+                return port;
+            }
+
+            if (self.ephemeral_port == start_port) return 0; // Exhausted
         }
-        return port;
     }
 
     // Find route using longest-prefix matching in routing table
