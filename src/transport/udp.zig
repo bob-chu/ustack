@@ -486,7 +486,7 @@ pub const UDPEndpoint = struct {
 
         const new_addr = if (addr.port == 0) blk: {
             var tmp = addr;
-            tmp.port = self.stack.getNextEphemeralPort();
+            tmp.port = self.stack.getNextEphemeralPort(tmp.addr, ProtocolNumber);
             break :blk tmp;
         } else addr;
 
