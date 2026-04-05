@@ -130,7 +130,7 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn acquire(self: *Self) !*T {
-            if (self.free_list.popOrNull()) |node| {
+            if (self.free_list.pop()) |node| {
                 @memset(std.mem.asBytes(node), 0);
                 return node;
             }
@@ -189,7 +189,7 @@ pub const BufferPool = struct {
     }
 
     pub fn acquire(self: *BufferPool) ![]u8 {
-        if (self.free_list.popOrNull()) |buf| {
+        if (self.free_list.pop()) |buf| {
             @memset(buf, 0);
             return buf;
         }

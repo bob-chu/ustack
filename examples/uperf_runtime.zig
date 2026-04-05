@@ -47,7 +47,7 @@ pub fn main() !void {
     global_config.address = args[3];
 
     {
-        var it = std.mem.split(u8, global_config.address, "/");
+        var it = std.mem.splitSequence(u8, global_config.address, "/");
         global_config.local_ip = try utils.parseIp(it.first());
     }
 
@@ -302,7 +302,7 @@ const Connection = struct {
 };
 
 fn parseIp(str: []const u8) ![4]u8 {
-    var it = std.mem.split(u8, str, ".");
+    var it = std.mem.splitSequence(u8, str, ".");
     var out: [4]u8 = undefined;
     for (0..4) |j| out[j] = try std.fmt.parseInt(u8, it.next() orelse return error.InvalidIP, 10);
     return out;

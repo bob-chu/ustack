@@ -118,7 +118,7 @@ fn parseArgs(args: []const []const u8) !Config {
     }
 
     const interface = args[1];
-    var parts = std.mem.split(u8, args[2], "/");
+    var parts = std.mem.splitSequence(u8, args[2], "/");
     const local_ip = try parseIp(parts.first());
 
     var mode: ?Mode = null;
@@ -172,7 +172,7 @@ fn parseArgs(args: []const []const u8) !Config {
 }
 
 fn parseIp(str: []const u8) ![4]u8 {
-    var it = std.mem.split(u8, str, ".");
+    var it = std.mem.splitSequence(u8, str, ".");
     var out: [4]u8 = undefined;
     for (0..4) |j| out[j] = try std.fmt.parseInt(u8, it.next() orelse return error.InvalidIP, 10);
     return out;

@@ -11,14 +11,14 @@ pub const ProtocolNumber = 17;
 pub const UDPProtocol = struct {
     view_pool: buffer.BufferPool,
     header_pool: buffer.BufferPool,
-    packet_node_pool: buffer.Pool(std.TailQueue(UDPEndpoint.Packet).Node),
+    packet_node_pool: buffer.Pool(std.DoublyLinkedList(UDPEndpoint.Packet).Node),
 
     pub fn init(allocator: std.mem.Allocator) *UDPProtocol {
         const self = allocator.create(UDPProtocol) catch unreachable;
         self.* = .{
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 131072),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 131072),
-            .packet_node_pool = buffer.Pool(std.TailQueue(UDPEndpoint.Packet).Node).init(allocator, 131072),
+            .packet_node_pool = buffer.Pool(std.DoublyLinkedList(UDPEndpoint.Packet).Node).init(allocator, 131072),
         };
         return self;
     }
@@ -97,7 +97,7 @@ pub const UDPEndpoint = struct {
     stack: *stack.Stack,
     proto: *UDPProtocol,
     waiter_queue: *waiter.Queue,
-    rcv_list: std.TailQueue(Packet),
+    rcv_list: std.DoublyLinkedList(Packet),
     ref_count: usize = 1,
     retry_timer: @import("../time.zig").Timer = undefined,
 

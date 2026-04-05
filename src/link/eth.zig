@@ -10,11 +10,23 @@ pub const EthernetEndpoint = struct {
     addr: tcpip.LinkAddress,
     dispatcher: ?*stack.NetworkDispatcher = null,
     wrapped_dispatcher: stack.NetworkDispatcher = undefined,
+    allocator: ?std.mem.Allocator = null,
+    owns_self: bool = false,
+    closed: bool = false,
 
     pub fn init(lower: stack.LinkEndpoint, addr: tcpip.LinkAddress) EthernetEndpoint {
         return .{
             .lower = lower,
             .addr = addr,
+        };
+    }
+
+    pub fn initOwned(lower: stack.LinkEndpoint, addr: tcpip.LinkAddress, allocator: std.mem.Allocator) EthernetEndpoint {
+        return .{
+            .lower = lower,
+            .addr = addr,
+            .allocator = allocator,
+            .owns_self = true,
         };
     }
 
@@ -28,12 +40,12 @@ pub const EthernetEndpoint = struct {
     const VTableImpl = stack.LinkEndpoint.VTable{
         .writePacket = writePacket,
         .writePackets = writePackets,
+        .flush = flush,
         .attach = attach,
         .linkAddress = linkAddress,
         .mtu = mtu,
         .setMTU = setMTU,
         .capabilities = capabilities,
-        .flush = flush,
         .close = close,
     };
 
@@ -44,7 +56,14 @@ pub const EthernetEndpoint = struct {
 
     fn close(ptr: *anyopaque) void {
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
+        if (self.closed) return;
+        self.closed = true;
         self.lower.close();
+        if (self.owns_self) {
+            if (self.allocator) |allocator| {
+                allocator.destroy(self);
+            }
+        }
     }
 
     fn writePackets(ptr: *anyopaque, r: ?*const stack.Route, protocol: tcpip.NetworkProtocolNumber, packets: []const tcpip.PacketBuffer) tcpip.Error!void {
