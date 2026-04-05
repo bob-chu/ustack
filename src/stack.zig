@@ -483,6 +483,8 @@ const RouteTable = struct {
 
 pub const TransportTable = struct {
     shards: [256]std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
+    bind_index: std.HashMap(BindKey, std.ArrayListUnmanaged(TransportEndpointID), BindKeyContext, 80),
+    allocator: std.mem.Allocator,
 
     const TransportContext = struct {
         pub fn hash(_: TransportContext, key: TransportEndpointID) u64 {
@@ -493,15 +495,41 @@ pub const TransportTable = struct {
         }
     };
 
+    const BindKey = struct {
+        local_port: u16,
+        transport_protocol: tcpip.TransportProtocolNumber,
+    };
+
+    const BindKeyContext = struct {
+        pub fn hash(_: BindKeyContext, key: BindKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&key.transport_protocol));
+            h.update(std.mem.asBytes(&key.local_port));
+            return h.final();
+        }
+
+        pub fn eql(_: BindKeyContext, a: BindKey, b: BindKey) bool {
+            return a.local_port == b.local_port and a.transport_protocol == b.transport_protocol;
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator) TransportTable {
         var self: TransportTable = undefined;
+        self.allocator = allocator;
         for (&self.shards) |*shard| {
             shard.* = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator);
         }
+        self.bind_index = std.HashMap(BindKey, std.ArrayListUnmanaged(TransportEndpointID), BindKeyContext, 80).init(allocator);
         return self;
     }
 
     pub fn deinit(self: *TransportTable) void {
+        var idx_it = self.bind_index.iterator();
+        while (idx_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.bind_index.deinit();
+
         for (&self.shards) |*shard| {
             shard.deinit();
         }
@@ -513,14 +541,25 @@ pub const TransportTable = struct {
 
     pub fn put(self: *TransportTable, id: TransportEndpointID, ep: TransportEndpoint) !void {
         try self.getShard(id).put(id, ep);
+        if (id.remote_port == 0) {
+            try self.indexBoundEndpoint(id);
+        }
     }
 
     pub fn fetchRemove(self: *TransportTable, id: TransportEndpointID) ?std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).KV {
-        return self.getShard(id).fetchRemove(id);
+        const kv = self.getShard(id).fetchRemove(id);
+        if (kv != null and id.remote_port == 0) {
+            self.unindexBoundEndpoint(id);
+        }
+        return kv;
     }
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
-        return self.getShard(id).remove(id);
+        const removed = self.getShard(id).remove(id);
+        if (removed and id.remote_port == 0) {
+            self.unindexBoundEndpoint(id);
+        }
+        return removed;
     }
 
     pub fn get(self: *TransportTable, id: TransportEndpointID) ?TransportEndpoint {
@@ -531,23 +570,47 @@ pub const TransportTable = struct {
 
     pub fn hasConflict(self: *TransportTable, addr: tcpip.Address, port: u16, transport: tcpip.TransportProtocolNumber) ?TransportEndpoint {
         const is_any = addr.isAny();
-        for (&self.shards) |*shard| {
-            var it = shard.iterator();
-            while (it.next()) |kv| {
-                const id = kv.key_ptr;
-                if (id.local_port == port and id.transport_protocol == transport and id.remote_port == 0) {
-                    if (is_any or id.local_address.isAny() or id.local_address.eq(addr)) {
-                        // For TCP, we can reuse ports in TIME_WAIT or CLOSED state.
-                        // We need a way to check state without circular dependency.
-                        // For now, let's just return the endpoint and let the caller decide.
-                        const ep = kv.value_ptr.*;
-                        ep.incRef();
-                        return ep;
-                    }
+        const key = BindKey{ .local_port = port, .transport_protocol = transport };
+        const ids = self.bind_index.get(key) orelse return null;
+
+        for (ids.items) |id| {
+            if (is_any or id.local_address.isAny() or id.local_address.eq(addr)) {
+                if (self.getShard(id).get(id)) |ep| {
+                    // For TCP, we can reuse ports in TIME_WAIT or CLOSED state.
+                    // We need a way to check state without circular dependency.
+                    // For now, let's just return the endpoint and let the caller decide.
+                    ep.incRef();
+                    return ep;
                 }
             }
         }
         return null;
+    }
+
+    fn indexBoundEndpoint(self: *TransportTable, id: TransportEndpointID) !void {
+        const key = BindKey{ .local_port = id.local_port, .transport_protocol = id.transport_protocol };
+        var gop = try self.bind_index.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(self.allocator, id);
+    }
+
+    fn unindexBoundEndpoint(self: *TransportTable, id: TransportEndpointID) void {
+        const key = BindKey{ .local_port = id.local_port, .transport_protocol = id.transport_protocol };
+        const ids = self.bind_index.getPtr(key) orelse return;
+
+        for (ids.items, 0..) |existing_id, i| {
+            if (existing_id.eq(id)) {
+                _ = ids.swapRemove(i);
+                break;
+            }
+        }
+
+        if (ids.items.len == 0) {
+            ids.deinit(self.allocator);
+            _ = self.bind_index.remove(key);
+        }
     }
 };
 
