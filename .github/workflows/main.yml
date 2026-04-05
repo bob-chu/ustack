@@ -31,4 +31,5 @@ jobs:
         run: zig build example -Dtarget=x86_64-linux-gnu
 
       - name: Run Tests
+        if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
         run: zig build test -Dtarget=x86_64-linux-gnu

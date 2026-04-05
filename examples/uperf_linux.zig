@@ -101,7 +101,7 @@ pub fn main() !void {
         const is_udp = global_config.protocol == .udp;
         const sock_type: u32 = if (is_udp) std.posix.SOCK.DGRAM else std.posix.SOCK.STREAM;
         const sockfd = try std.posix.socket(std.posix.AF.INET, sock_type | std.posix.SOCK.NONBLOCK, 0);
-        
+
         const addr = std.posix.sockaddr.in{
             .family = std.posix.AF.INET,
             .port = std.mem.nativeToBig(u16, global_config.port),
@@ -225,7 +225,7 @@ fn ioCb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
             return;
         };
     }
-    
+
     if (revents & c.EV_READ != 0) {
         var buf: [65536]u8 = undefined;
         while (true) {
@@ -262,7 +262,8 @@ fn ioCb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
 }
 
 fn statsCb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
-    _ = watcher; _ = revents;
+    _ = watcher;
+    _ = revents;
     const now = std.time.milliTimestamp();
 
     var total_rx_bytes: u64 = 0;
@@ -289,16 +290,16 @@ fn statsCb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) v
 
     if (total_rx_bytes > 0) {
         const mbps = (@as(f64, @floatFromInt(total_rx_bytes)) * 8.0) / 1000000.0;
-        std.debug.print("[RX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{ mbps });
+        std.debug.print("[RX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{mbps});
     }
     if (total_tx_bytes > 0) {
         const mbps = (@as(f64, @floatFromInt(total_tx_bytes)) * 8.0) / 1000000.0;
-        std.debug.print("[TX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{ mbps });
+        std.debug.print("[TX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{mbps});
     }
 }
 
 fn parseIp(str: []const u8) ![4]u8 {
-    var it = std.mem.split(u8, str, ".");
+    var it = std.mem.splitSequence(u8, str, ".");
     var out: [4]u8 = undefined;
     for (0..4) |j| {
         const s = it.next() orelse return error.InvalidIP;

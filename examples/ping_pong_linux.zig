@@ -272,7 +272,7 @@ fn statsCb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) v
 }
 
 fn parseIp(str: []const u8) ![4]u8 {
-    var it = std.mem.split(u8, str, ".");
+    var it = std.mem.splitSequence(u8, str, ".");
     var out: [4]u8 = undefined;
     for (0..4) |j| out[j] = try std.fmt.parseInt(u8, it.next() orelse return error.InvalidIP, 10);
     return out;

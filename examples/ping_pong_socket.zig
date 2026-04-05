@@ -216,7 +216,7 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
         last_tick_time = now;
         global_stack.flush();
         perform_cleanup();
-        
+
         if (global_client) |client| {
             client.report(now);
             client.refill();
@@ -263,7 +263,7 @@ const PingServer = struct {
         const self = try allocator.create(PingServer);
 
         const sock = try Socket.create(s, .inet, .stream, .tcp);
-        try sock.setOption(.{ .ts_enabled = true });
+        try sock.setOption(@as(tcpip.EndpointOption, .{ .ts_enabled = true }));
         try sock.bind(.{ .nic = 0, .addr = .{ .v4 = .{ 0, 0, 0, 0 } }, .port = config.port });
         try sock.listen(8192);
 
@@ -274,7 +274,7 @@ const PingServer = struct {
             .config = config,
         };
         sock.setHandler(mux, self, onSocketEvent);
-        
+
         global_server = self;
         global_stack.flush();
         return self;
@@ -294,13 +294,13 @@ const PingServer = struct {
                 if (err == tcpip.Error.WouldBlock) return;
                 return;
             };
-            
+
             const now = std.time.milliTimestamp();
             if (self.conn_count == 0) {
                 self.start_time = now;
                 self.last_report_time = now;
             }
-            
+
             self.conn_count += 1;
             self.active_conns += 1;
 
@@ -373,7 +373,7 @@ const PingClient = struct {
 
         const sock = try Socket.create(self.stack_obj, .inet, .stream, .tcp);
         errdefer sock.deinit();
-        try sock.setOption(.{ .ts_enabled = true });
+        try sock.setOption(@as(tcpip.EndpointOption, .{ .ts_enabled = true }));
 
         const conn = try PingConnection.init(self.allocator, sock, self.mux, self.config, self, id);
 

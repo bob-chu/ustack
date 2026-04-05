@@ -53,7 +53,7 @@ pub fn main() !void {
     global_config.interface = ifname;
     global_config.mode = mode;
 
-    var parts = std.mem.split(u8, ip_cidr, "/");
+    var parts = std.mem.splitSequence(u8, ip_cidr, "/");
     global_config.local_ip = try parseIp(parts.first());
     const prefix_len = try std.fmt.parseInt(u8, parts.next() orelse "24", 10);
 
@@ -256,7 +256,7 @@ fn handle_server_event(fd: i32, mask: i16) void {
 
                 const ft = posix.getGlobalFileTable(std.heap.c_allocator);
                 const file = ft.get(accepted_fd).?;
-                file.socket.setOption(.{ .congestion_control = global_config.cc_alg }) catch {};
+                file.socket.setOption(@as(tcpip.EndpointOption, .{ .congestion_control = global_config.cc_alg })) catch {};
 
                 const conn = Connection.init(std.heap.c_allocator, accepted_fd, false) catch continue;
 
@@ -351,7 +351,7 @@ const Connection = struct {
         if (!is_udp) {
             const ft = posix.getGlobalFileTable(allocator);
             const file = ft.get(fd).?;
-            file.socket.setOption(.{ .congestion_control = global_config.cc_alg }) catch {};
+            file.socket.setOption(@as(tcpip.EndpointOption, .{ .congestion_control = global_config.cc_alg })) catch {};
         }
 
         const self = try Connection.init(allocator, fd, true);
@@ -450,7 +450,7 @@ const Connection = struct {
 };
 
 fn parseIp(str: []const u8) ![4]u8 {
-    var it = std.mem.split(u8, str, ".");
+    var it = std.mem.splitSequence(u8, str, ".");
     var out: [4]u8 = undefined;
     for (0..4) |j| out[j] = try std.fmt.parseInt(u8, it.next() orelse return error.InvalidIP, 10);
     return out;

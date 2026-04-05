@@ -57,7 +57,6 @@ pub const Socket = struct {
 
         self.endpoint.decRef(); // Release Socket's reference; endpoint stays alive via transport table
 
-
     }
 
     pub fn setOption(self: *Socket, opt: tcpip.EndpointOption) !void {
@@ -468,7 +467,7 @@ pub const FileTable = struct {
     }
 
     pub fn alloc(self: *FileTable, file: File) !i32 {
-        if (self.free_list.popOrNull()) |fd| {
+        if (self.free_list.pop()) |fd| {
             self.files.items[@intCast(fd - fd_start)] = file;
             return fd;
         }

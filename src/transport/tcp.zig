@@ -47,12 +47,12 @@ pub const TCPProtocol = struct {
         self.* = .{
             .allocator = allocator,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 1048576),
-            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 131072),
-            .segment_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Segment).Node).init(allocator, 131072),
-            .packet_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Packet).Node).init(allocator, 131072),
-            .accept_node_pool = buffer.Pool(std.DoublyLinkedList(tcpip.AcceptReturn).Node).init(allocator, 131072),
-            .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 131072),
-            .waiter_queue_pool = buffer.Pool(waiter.Queue).init(allocator, 131072),
+            .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 65536),
+            .segment_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Segment).Node).init(allocator, 65536),
+            .packet_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Packet).Node).init(allocator, 65536),
+            .accept_node_pool = buffer.Pool(std.DoublyLinkedList(tcpip.AcceptReturn).Node).init(allocator, 65536),
+            .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 65536),
+            .waiter_queue_pool = buffer.Pool(waiter.Queue).init(allocator, 32768),
         };
 
         self.view_pool.prewarm(131072) catch {};
