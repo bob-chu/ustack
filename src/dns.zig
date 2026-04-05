@@ -72,7 +72,7 @@ pub const Resolver = struct {
         idx += header.DNSHeaderSize;
 
         // Question: Name
-        var it = std.mem.split(u8, hostname, ".");
+        var it = std.mem.splitSequence(u8, hostname, ".");
         while (it.next()) |label| {
             if (label.len > 63) return error.LabelTooLong;
             dns_buf[idx] = @intCast(label.len);

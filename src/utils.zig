@@ -13,7 +13,7 @@ pub fn parseIp(str: []const u8) !tcpip.Address {
         return tcpip.Address{ .v6 = out };
     } else {
         // Parse IPv4
-        var it = std.mem.split(u8, str, ".");
+        var it = std.mem.splitSequence(u8, str, ".");
         var out: [4]u8 = undefined;
         for (0..4) |i| {
             const part = it.next() orelse return error.InvalidIP;
@@ -29,7 +29,7 @@ pub const Cidr = struct {
 };
 
 pub fn parseCidr(str: []const u8) !Cidr {
-    var it = std.mem.split(u8, str, "/");
+    var it = std.mem.splitSequence(u8, str, "/");
     const ip_part = it.first();
     const prefix_part = it.next();
 

@@ -126,7 +126,7 @@ pub const AfPacket = struct {
 
     pub fn deinit(self: *AfPacket) void {
         const total_ring_size = self.frame_size * self.frame_nr * 2;
-        const mmap_ptr = @as([*]align(std.mem.page_size) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
+        const mmap_ptr = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(self.rx_ring.ptr)));
         std.posix.munmap(mmap_ptr[0..total_ring_size]);
         std.posix.close(self.fd);
     }

@@ -10,7 +10,7 @@ pub const Loopback = struct {
     dispatcher: ?*stack.NetworkDispatcher = null,
     mtu_val: u32 = 65536,
     address: tcpip.LinkAddress = .{ .addr = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } },
-    queue: std.TailQueue(Packet),
+    queue: std.DoublyLinkedList(Packet),
     allocator: std.mem.Allocator,
 
     const Packet = struct {
@@ -50,7 +50,7 @@ pub const Loopback = struct {
         const self = @as(*Loopback, @ptrCast(@alignCast(ptr)));
         _ = r;
 
-        const node = self.allocator.create(std.TailQueue(Packet).Node) catch return tcpip.Error.OutOfMemory;
+        const node = self.allocator.create(std.DoublyLinkedList(Packet).Node) catch return tcpip.Error.OutOfMemory;
         node.data = .{
             .protocol = protocol,
             .pkt = pkt.clone(self.allocator) catch {

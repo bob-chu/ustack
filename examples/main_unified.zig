@@ -49,7 +49,7 @@ pub fn main() !void {
 
     const driver_type = if (std.mem.eql(u8, driver_str, "xdp")) interface.DriverType.af_xdp else if (std.mem.eql(u8, driver_str, "tap")) interface.DriverType.tap else interface.DriverType.af_packet;
 
-    var parts = std.mem.split(u8, ip_cidr, "/");
+    var parts = std.mem.splitSequence(u8, ip_cidr, "/");
     const ip_str = parts.first();
     const prefix_str = parts.next() orelse "24";
     const prefix_len = try std.fmt.parseInt(u8, prefix_str, 10);

@@ -3,6 +3,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const static_link = b.option(bool, "static", "Build static binaries") orelse false;
+    const libev_prefix_opt = b.option([]const u8, "libev_prefix", "Prefix path for libev headers/libs (e.g. /usr/local/musl)");
+
+    const resolved_target = target.result;
+    const is_linux_x86_64_gnu = resolved_target.os.tag == .linux and
+        resolved_target.cpu.arch == .x86_64 and
+        resolved_target.abi == .gnu;
+    const is_linux_x86_64_musl = resolved_target.os.tag == .linux and
+        resolved_target.cpu.arch == .x86_64 and
+        resolved_target.abi == .musl;
+    const exe_linkage: ?std.builtin.LinkMode = if (static_link or is_linux_x86_64_musl) .static else null;
+
+    const libev_prefix = libev_prefix_opt orelse if (is_linux_x86_64_musl) "/usr/local/musl" else "";
+    const libev_include_path = if (libev_prefix.len > 0) b.pathJoin(&.{ libev_prefix, "include" }) else "";
+    const libev_lib_path = if (libev_prefix.len > 0) b.pathJoin(&.{ libev_prefix, "lib" }) else "";
 
     const LogLevel = enum {
         err,
@@ -47,8 +62,18 @@ pub fn build(b: *std.Build) void {
     });
     main_tests.root_module.addImport("build_options", options_mod);
     main_tests.linkLibC();
+    if (is_linux_x86_64_gnu) {
+        main_tests.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+        main_tests.addIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+        main_tests.root_module.addIncludePath(.{ .cwd_relative = "/usr/include" });
+        main_tests.root_module.addIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+    } else if (is_linux_x86_64_musl and libev_prefix.len > 0) {
+        main_tests.addLibraryPath(.{ .cwd_relative = libev_lib_path });
+        main_tests.addIncludePath(.{ .cwd_relative = libev_include_path });
+        main_tests.root_module.addIncludePath(.{ .cwd_relative = libev_include_path });
+    }
     main_tests.linkSystemLibrary("ev");
-    main_tests.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
+    main_tests.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/include/x86_64-linux-gnu", "-I/usr/local/include" } });
 
     const run_main_tests = b.addRunArtifact(main_tests);
 
@@ -77,10 +102,21 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(ex.path),
             .target = target,
             .optimize = optimize,
+            .linkage = exe_linkage,
         });
         exe.root_module.addImport("ustack", ustack_mod);
         // exe.linkLibrary(lib);
         exe.linkLibC();
+        if (is_linux_x86_64_gnu) {
+            exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+            exe.addIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+            exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/include" });
+            exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+        } else if (is_linux_x86_64_musl and libev_prefix.len > 0) {
+            exe.addLibraryPath(.{ .cwd_relative = libev_lib_path });
+            exe.addIncludePath(.{ .cwd_relative = libev_include_path });
+            exe.root_module.addIncludePath(.{ .cwd_relative = libev_include_path });
+        }
 
         exe.linkSystemLibrary(ex.lib);
         if (std.mem.eql(u8, ex.name, "example_tap_libev") or
@@ -94,7 +130,7 @@ pub fn build(b: *std.Build) void {
             std.mem.eql(u8, ex.name, "example_af_xdp_libev") or
             std.mem.eql(u8, ex.name, "example_ping_pong"))
         {
-            exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/local/include" } });
+            exe.addCSourceFile(.{ .file = b.path("examples/wrapper.c"), .flags = &.{ "-I/usr/include", "-I/usr/include/x86_64-linux-gnu", "-I/usr/local/include" } });
         }
         const install = b.addInstallArtifact(exe, .{});
         example_step.dependOn(&install.step);
