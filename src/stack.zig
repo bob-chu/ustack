@@ -1154,7 +1154,7 @@ test "Stack Transport Demux" {
         fn decRef(ptr: *anyopaque) void {
             const self = @as(*@This(), @ptrCast(@alignCast(ptr)));
             if (self.ref_count.fetchSub(1, .release) == 1) {
-                self.ref_count.fence(.acquire);
+                _ = self.ref_count.load(.acquire);
                 self.stack.allocator.destroy(self);
             }
         }
