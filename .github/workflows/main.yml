@@ -16,7 +16,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.13.0
+          version: 0.14.0
 
       - name: Install dependencies
         run: |
@@ -24,10 +24,10 @@ jobs:
           sudo apt-get install -y libev-dev
 
       - name: Build
-        run: zig build
+        run: zig build -Dtarget=x86_64-linux-gnu
 
       - name: Build Examples
-        run: zig build example
+        run: zig build example -Dtarget=x86_64-linux-gnu
 
       - name: Run Tests
-        run: zig build test
+        run: zig build test -Dtarget=x86_64-linux-gnu
