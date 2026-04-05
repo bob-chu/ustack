@@ -58,7 +58,7 @@ pub fn main() !void {
     global_config.interface = ifname;
     global_config.mode = mode;
 
-    var parts = std.mem.split(u8, ip_cidr, "/");
+    var parts = std.mem.splitSequence(u8, ip_cidr, "/");
     global_config.local_ip = try parseIp(parts.first());
     const prefix_len = try std.fmt.parseInt(u8, parts.next() orelse "24", 10);
 
@@ -134,7 +134,7 @@ pub fn main() !void {
     }
 
     my_ev_run(loop);
-    
+
     std.debug.print("--- Final Summary ---\n", .{});
     for (global_connections.items) |conn| {
         const end = if (conn.end_time > 0) conn.end_time else std.time.milliTimestamp();
@@ -150,14 +150,18 @@ pub fn main() !void {
 }
 
 fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     _ = global_af_packet.readPacket() catch {};
     global_stack.flush();
 }
 
 var last_tick: i64 = 0;
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     const now = std.time.milliTimestamp();
     if (last_tick == 0) last_tick = now;
     const diff = now - last_tick;
@@ -177,7 +181,8 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
 }
 
 fn libev_stats_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
-    _ = watcher; _ = revents;
+    _ = watcher;
+    _ = revents;
     const now = std.time.milliTimestamp();
 
     var total_rx_bytes: u64 = 0;
@@ -203,16 +208,18 @@ fn libev_stats_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
 
     if (total_rx_bytes > 0) {
         const mbps = (@as(f64, @floatFromInt(total_rx_bytes)) * 8.0) / 1000000.0;
-        std.debug.print("[RX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{ mbps });
+        std.debug.print("[RX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{mbps});
     }
     if (total_tx_bytes > 0) {
         const mbps = (@as(f64, @floatFromInt(total_tx_bytes)) * 8.0) / 1000000.0;
-        std.debug.print("[TX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{ mbps });
+        std.debug.print("[TX ] 1.00 sec {d: >7.2} Mbits/sec\n", .{mbps});
     }
 }
 
 fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C) void {
-    _ = loop; _ = watcher; _ = revents;
+    _ = loop;
+    _ = watcher;
+    _ = revents;
     if (global_mux) |mux| {
         const ready = mux.pollReady() catch return;
         for (ready) |entry| {
@@ -248,7 +255,7 @@ const PerfServer = struct {
         if (events & waiter.EventIn != 0 and global_config.protocol == .tcp) {
             while (true) {
                 const accepted = sock_obj.accept() catch break;
-                accepted.setOption(.{ .congestion_control = global_config.cc_alg }) catch {};
+                accepted.setOption(@as(tcpip.EndpointOption, .{ .congestion_control = global_config.cc_alg })) catch {};
                 _ = Connection.init(self.allocator, accepted, self.mux, false) catch continue;
             }
         }
@@ -300,7 +307,7 @@ const Connection = struct {
     pub fn initClient(s: *stack.Stack, allocator: std.mem.Allocator, mux: *EventMultiplexer, target: [4]u8, local: [4]u8) !*Connection {
         const is_udp = global_config.protocol == .udp;
         const sock_obj = try socket.Socket.create(s, .inet, if (is_udp) .dgram else .stream, if (is_udp) .udp else .tcp);
-        if (!is_udp) try sock_obj.setOption(.{ .congestion_control = global_config.cc_alg });
+        if (!is_udp) try sock_obj.setOption(@as(tcpip.EndpointOption, .{ .congestion_control = global_config.cc_alg }));
         const self = try Connection.init(allocator, sock_obj, mux, true);
         try sock_obj.bind(.{ .nic = 1, .addr = .{ .v4 = local }, .port = 0 });
         _ = sock_obj.connect(.{ .nic = 1, .addr = .{ .v4 = target }, .port = global_config.port }) catch |err| {
@@ -327,13 +334,17 @@ const Connection = struct {
             while (true) {
                 var vview = self.sock.endpoint.read(null) catch break;
                 if (self.first_packet_time == 0) self.first_packet_time = std.time.milliTimestamp();
-                if (vview.size == 0) { vview.deinit(); if (global_config.protocol == .tcp) self.close(); break; }
+                if (vview.size == 0) {
+                    vview.deinit();
+                    if (global_config.protocol == .tcp) self.close();
+                    break;
+                }
                 self.bytes_rx += vview.size;
                 self.bytes_since_last_report += vview.size;
                 vview.deinit();
             }
         }
-        
+
         // Handle TX
         if (self.is_client and (mask & waiter.EventOut != 0)) {
             if (self.first_packet_time == 0) self.first_packet_time = std.time.milliTimestamp();
@@ -370,7 +381,7 @@ const Connection = struct {
 };
 
 fn parseIp(str: []const u8) ![4]u8 {
-    var it = std.mem.split(u8, str, ".");
+    var it = std.mem.splitSequence(u8, str, ".");
     var out: [4]u8 = undefined;
     for (0..4) |j| out[j] = try std.fmt.parseInt(u8, it.next() orelse return error.InvalidIP, 10);
     return out;

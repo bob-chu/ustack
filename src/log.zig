@@ -43,7 +43,7 @@ pub fn debug(comptime format: []const u8, args: anytype) void {
 }
 
 /// Helper for conditional logging based on a scope
-pub fn scoped(comptime scope: @Type(.EnumLiteral)) type {
+pub fn scoped(comptime scope: anytype) type {
     return struct {
         pub fn err(comptime format: []const u8, args: anytype) void {
             if (@intFromEnum(log_level) >= @intFromEnum(Level.err)) {

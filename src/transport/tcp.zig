@@ -35,9 +35,9 @@ pub const TCPProtocol = struct {
     allocator: std.mem.Allocator,
     view_pool: buffer.BufferPool,
     header_pool: buffer.BufferPool,
-    segment_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node),
-    packet_node_pool: buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node),
-    accept_node_pool: buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node),
+    segment_node_pool: buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Segment).Node),
+    packet_node_pool: buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Packet).Node),
+    accept_node_pool: buffer.Pool(std.DoublyLinkedList(tcpip.AcceptReturn).Node),
     endpoint_pool: buffer.Pool(TCPEndpoint),
 
     waiter_queue_pool: buffer.Pool(waiter.Queue),
@@ -48,9 +48,9 @@ pub const TCPProtocol = struct {
             .allocator = allocator,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 1048576),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 65536),
-            .segment_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Segment).Node).init(allocator, 65536),
-            .packet_node_pool = buffer.Pool(std.TailQueue(TCPEndpoint.Packet).Node).init(allocator, 65536),
-            .accept_node_pool = buffer.Pool(std.TailQueue(tcpip.AcceptReturn).Node).init(allocator, 65536),
+            .segment_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Segment).Node).init(allocator, 65536),
+            .packet_node_pool = buffer.Pool(std.DoublyLinkedList(TCPEndpoint.Packet).Node).init(allocator, 65536),
+            .accept_node_pool = buffer.Pool(std.DoublyLinkedList(tcpip.AcceptReturn).Node).init(allocator, 65536),
             .endpoint_pool = buffer.Pool(TCPEndpoint).init(allocator, 65536),
             .waiter_queue_pool = buffer.Pool(waiter.Queue).init(allocator, 32768),
         };
@@ -200,10 +200,10 @@ pub const TCPEndpoint = struct {
     owns_waiter_queue: bool = false,
     stack_ref: bool = false,
 
-    accepted_queue: std.TailQueue(tcpip.AcceptReturn) = .{},
-    rcv_list: std.TailQueue(Packet) = .{},
-    ooo_list: std.TailQueue(Packet) = .{},
-    snd_queue: std.TailQueue(Segment) = .{},
+    accepted_queue: std.DoublyLinkedList(tcpip.AcceptReturn) = .{},
+    rcv_list: std.DoublyLinkedList(Packet) = .{},
+    ooo_list: std.DoublyLinkedList(Packet) = .{},
+    snd_queue: std.DoublyLinkedList(Segment) = .{},
     retransmit_timer: time.Timer = undefined,
     time_wait_timer: time.Timer = undefined,
     delayed_ack_timer: time.Timer = undefined,
@@ -1378,7 +1378,7 @@ pub const TCPEndpoint = struct {
             if (existing_tcp.state != .time_wait and existing_tcp.state != .closed) {
                 return tcpip.Error.AddressInUse;
             }
-            
+
             // Reconstruct ID to unregister
             const la = existing_tcp.local_addr.?;
             const ra = existing_tcp.remote_addr orelse tcpip.FullAddress{ .nic = 0, .addr = switch (la.addr) {

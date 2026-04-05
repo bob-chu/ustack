@@ -77,7 +77,7 @@ pub const NetworkInterface = struct {
         };
 
         self.eth_endpoint = try allocator.create(EthernetEndpoint);
-        self.eth_endpoint.* = EthernetEndpoint.init(link_ep, mac);
+        self.eth_endpoint.* = EthernetEndpoint.initOwned(link_ep, mac, allocator);
 
         // 3. Create NIC in Stack
         try s.createNIC(self.nic_id, self.eth_endpoint.linkEndpoint());
@@ -132,17 +132,8 @@ pub const NetworkInterface = struct {
     }
 
     pub fn deinit(self: *NetworkInterface) void {
-        switch (self.driver) {
-            .af_packet => |*d| _ = d, // AfPacket struct has no deinit, just closes fd on destroy if owned? No, wait.
-            .af_xdp => |*d| d.deinit(),
-            .tap => |*d| _ = d,
-            .loopback => |*d| _ = d,
-        }
-        // Ideally we should close FDs here for packet/tap too if not handled.
-        // Currently existing drivers don't have consistent deinit patterns.
-        // Let's rely on OS cleanup for now or add deinit to them later.
-
-        self.allocator.destroy(self.eth_endpoint);
+        // NIC/link endpoint/driver lifecycle is owned by Stack through NIC.deinit().
+        // This handle only owns the wrapper object itself.
         self.allocator.destroy(self);
     }
 

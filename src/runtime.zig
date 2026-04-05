@@ -40,7 +40,7 @@ pub const Runtime = struct {
         const cidr = try utils.parseCidr(config.address);
         const ip_str = blk: {
             // Extract the IP portion before the '/' for InterfaceConfig.address
-            var it = std.mem.split(u8, config.address, "/");
+            var it = std.mem.splitSequence(u8, config.address, "/");
             break :blk it.first();
         };
 
@@ -87,11 +87,11 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
-        // Order matters: mux → iface → stack → free heap
+        // Order matters: mux → stack (owns NIC/driver lifecycle) → iface handle.
         self.mux.deinit();
-        self.iface.deinit();
         self.stack.deinit();
         self.allocator.destroy(self.stack);
+        self.iface.deinit();
     }
 
     // ── Primitives (fds for user's event loop) ──
