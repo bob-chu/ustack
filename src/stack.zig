@@ -492,6 +492,8 @@ const RouteTable = struct {
 
 pub const TransportTable = struct {
     shards: [256]std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80),
+    bind_index: std.HashMap(BindKey, std.ArrayListUnmanaged(TransportEndpointID), BindKeyContext, 80),
+    allocator: std.mem.Allocator,
 
     const TransportContext = struct {
         pub fn hash(_: TransportContext, key: TransportEndpointID) u64 {
@@ -502,15 +504,41 @@ pub const TransportTable = struct {
         }
     };
 
+    const BindKey = struct {
+        local_port: u16,
+        transport_protocol: tcpip.TransportProtocolNumber,
+    };
+
+    const BindKeyContext = struct {
+        pub fn hash(_: BindKeyContext, key: BindKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&key.transport_protocol));
+            h.update(std.mem.asBytes(&key.local_port));
+            return h.final();
+        }
+
+        pub fn eql(_: BindKeyContext, a: BindKey, b: BindKey) bool {
+            return a.local_port == b.local_port and a.transport_protocol == b.transport_protocol;
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator) TransportTable {
         var self: TransportTable = undefined;
+        self.allocator = allocator;
         for (&self.shards) |*shard| {
             shard.* = std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).init(allocator);
         }
+        self.bind_index = std.HashMap(BindKey, std.ArrayListUnmanaged(TransportEndpointID), BindKeyContext, 80).init(allocator);
         return self;
     }
 
     pub fn deinit(self: *TransportTable) void {
+        var idx_it = self.bind_index.iterator();
+        while (idx_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.bind_index.deinit();
+
         for (&self.shards) |*shard| {
             var it = shard.valueIterator();
             while (it.next()) |ep| {
@@ -526,14 +554,25 @@ pub const TransportTable = struct {
 
     pub fn put(self: *TransportTable, id: TransportEndpointID, ep: TransportEndpoint) !void {
         try self.getShard(id).put(id, ep);
+        if (id.remote_port == 0) {
+            try self.indexBoundEndpoint(id);
+        }
     }
 
     pub fn fetchRemove(self: *TransportTable, id: TransportEndpointID) ?std.HashMap(TransportEndpointID, TransportEndpoint, TransportContext, 80).KV {
-        return self.getShard(id).fetchRemove(id);
+        const kv = self.getShard(id).fetchRemove(id);
+        if (kv != null and id.remote_port == 0) {
+            self.unindexBoundEndpoint(id);
+        }
+        return kv;
     }
 
     pub fn remove(self: *TransportTable, id: TransportEndpointID) bool {
-        return self.getShard(id).remove(id);
+        const removed = self.getShard(id).remove(id);
+        if (removed and id.remote_port == 0) {
+            self.unindexBoundEndpoint(id);
+        }
+        return removed;
     }
 
     pub fn contains(self: *TransportTable, id: TransportEndpointID) bool {
@@ -544,6 +583,51 @@ pub const TransportTable = struct {
         const ep = self.getShard(id).get(id);
         if (ep) |e| e.incRef();
         return ep;
+    }
+
+    pub fn hasConflict(self: *TransportTable, addr: tcpip.Address, port: u16, transport: tcpip.TransportProtocolNumber) ?TransportEndpoint {
+        const is_any = addr.isAny();
+        const key = BindKey{ .local_port = port, .transport_protocol = transport };
+        const ids = self.bind_index.get(key) orelse return null;
+
+        for (ids.items) |id| {
+            if (is_any or id.local_address.isAny() or id.local_address.eq(addr)) {
+                if (self.getShard(id).get(id)) |ep| {
+                    // For TCP, we can reuse ports in TIME_WAIT or CLOSED state.
+                    // We need a way to check state without circular dependency.
+                    // For now, let's just return the endpoint and let the caller decide.
+                    ep.incRef();
+                    return ep;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn indexBoundEndpoint(self: *TransportTable, id: TransportEndpointID) !void {
+        const key = BindKey{ .local_port = id.local_port, .transport_protocol = id.transport_protocol };
+        var gop = try self.bind_index.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(self.allocator, id);
+    }
+
+    fn unindexBoundEndpoint(self: *TransportTable, id: TransportEndpointID) void {
+        const key = BindKey{ .local_port = id.local_port, .transport_protocol = id.transport_protocol };
+        const ids = self.bind_index.getPtr(key) orelse return;
+
+        for (ids.items, 0..) |existing_id, i| {
+            if (existing_id.eq(id)) {
+                _ = ids.swapRemove(i);
+                break;
+            }
+        }
+
+        if (ids.items.len == 0) {
+            ids.deinit(self.allocator);
+            _ = self.bind_index.remove(key);
+        }
     }
 };
 
@@ -757,26 +841,8 @@ pub const Stack = struct {
         }
     }
 
-    pub fn isPortUsed(self: *Stack, addr: tcpip.Address, port: u16, transport: tcpip.TransportProtocolNumber) bool {
-        // We need to check if ANY endpoint is using this local port/addr.
-        // Since TransportTable is indexed by full ID, we have to iterate or use a secondary index.
-        // For performance, let's just check the most common case: a listening socket or a bound-only socket.
-        const id = TransportEndpointID{
-            .local_port = port,
-            .local_address = addr,
-            .remote_port = 0,
-            .remote_address = .{ .v4 = .{ 0, 0, 0, 0 } },
-            .transport_protocol = transport,
-        };
-        if (self.endpoints.contains(id)) return true;
-
-        // Also check if ANY shard has an endpoint with this local port.
-        // This is slow (O(N)), but getNextEphemeralPort is not in the hot path for ESTABLISHED connections.
-        // Actually, for 30k CPS, it IS in the hot path.
-        // TODO: Add a local port usage bitmap or secondary hash map.
-        // For now, let's just rely on the fact that if we use the full ID in connect(),
-        // it will fail if the 4-tuple is already taken.
-        return false;
+    pub fn isPortUsed(self: *Stack, addr: tcpip.Address, port: u16, transport: tcpip.TransportProtocolNumber) ?TransportEndpoint {
+        return self.endpoints.hasConflict(addr, port, transport);
     }
 
     pub fn getNextEphemeralPort(self: *Stack, addr: tcpip.Address, transport: tcpip.TransportProtocolNumber) u16 {
@@ -789,7 +855,9 @@ pub const Stack = struct {
                 self.ephemeral_port += 1;
             }
 
-            if (!self.isPortUsed(addr, port, transport)) {
+            if (self.isPortUsed(addr, port, transport)) |ep| {
+                ep.decRef();
+            } else {
                 return port;
             }
 
