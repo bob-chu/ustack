@@ -116,11 +116,11 @@ pub const EthernetEndpoint = struct {
     }
 
     fn deliverNetworkPacket(ptr: *anyopaque, remote: *const tcpip.LinkAddress, local: *const tcpip.LinkAddress, protocol: tcpip.NetworkProtocolNumber, pkt: tcpip.PacketBuffer) void {
-        const start = std.time.nanoTimestamp();
-        defer {
-            const end = std.time.nanoTimestamp();
-            stats.global_stats.latency.link_layer.record(@as(i64, @intCast(end - start)));
-        }
+        // const start = std.time.nanoTimestamp();
+        // defer {
+        //     const end = std.time.nanoTimestamp();
+        //     stats.global_stats.latency.link_layer.record(@as(i64, @intCast(end - start)));
+        // }
         const self = @as(*EthernetEndpoint, @ptrCast(@alignCast(ptr)));
         _ = remote;
         _ = local;

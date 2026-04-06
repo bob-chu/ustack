@@ -204,6 +204,7 @@ fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callco
         };
         if (!ok) break;
     }
+    global_stack.flush();
 }
 
 fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callconv(.C) void {
@@ -222,6 +223,7 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
             client.refill();
         }
     }
+    global_stack.flush();
 
     if (global_mark_done) {
         if (std.time.milliTimestamp() - global_done_time >= 1000) {
@@ -249,6 +251,7 @@ fn libev_mux_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callconv(.C)
             }
         }
     }
+    global_stack.flush();
     perform_cleanup();
 }
 

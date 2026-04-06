@@ -29,6 +29,7 @@ pub const Entry = struct {
     queue: ?*Queue = null,
     is_queued: bool = false,
     active: bool = false,
+    magic: u64 = 0x1122334455667788,
 
     pub fn init(context: ?*anyopaque, callback: ?*const fn (e: *Entry) void) Entry {
         return .{
@@ -52,6 +53,7 @@ pub const Queue = struct {
     head: ?*Entry = null,
     tail: ?*Entry = null,
     ready_mask: EventMask = 0,
+    magic: u64 = 0x8877665544332211,
 
     pub fn eventRegister(self: *Queue, e: *Entry, mask: EventMask) void {
         if (e.active) {
@@ -102,36 +104,39 @@ pub const Queue = struct {
     pub fn notify(self: *Queue, mask: EventMask) void {
         self.ready_mask |= mask;
 
-        // Snapshot-and-iterate: callbacks may modify the list, so snapshot first.
-        // 256 entries = 2KB stack — safe for deep call chains.
-        // If queue exceeds 256 entries, we re-scan in batches.
-        const SNAPSHOT_SIZE = 256;
-        var snapshot: [SNAPSHOT_SIZE]*Entry = undefined;
+        // Optimized path for single waiter (common case)
+        if (self.head) |e| {
+            if (e.next == null) {
+                if (e.active and e.queue == self and (mask & e.mask) != 0) {
+                    if (e.callback) |cb| cb(e);
+                }
+                return;
+            }
+        } else return;
 
-        var remaining = true;
-        var scan_start: ?*Entry = self.head;
+        var it_count: usize = 0;
+        var current = self.head;
+        while (current) |_| {
+            var snapshot: [16]*Entry = undefined;
+            var len: usize = 0;
 
-        while (remaining) {
-            var count: usize = 0;
-            var current = scan_start;
-            while (current) |e| {
-                if (count >= SNAPSHOT_SIZE) break;
-                snapshot[count] = e;
-                count += 1;
-                current = e.next;
+            var it = current;
+            while (it) |e| {
+                if (it_count > 10000) std.debug.panic("Queue.notify: cycle in list!", .{});
+                it_count += 1;
+
+                snapshot[len] = e;
+                len += 1;
+                it = e.next;
+                if (len == snapshot.len) break;
             }
 
-            remaining = (current != null);
-            scan_start = current;
+            current = it;
 
-            for (snapshot[0..count]) |e| {
-                // Check if the entry is still active and in the same queue.
+            for (snapshot[0..len]) |e| {
                 if (!e.active or e.queue != self) continue;
-
                 if ((mask & e.mask) != 0) {
-                    if (e.callback) |cb| {
-                        cb(e);
-                    }
+                    if (e.callback) |cb| cb(e);
                 }
             }
         }
@@ -139,6 +144,21 @@ pub const Queue = struct {
 
     pub fn clear(self: *Queue, mask: EventMask) void {
         self.ready_mask &= ~mask;
+    }
+
+    pub fn clearAll(self: *Queue) void {
+        var it = self.head;
+        while (it) |e| {
+            const next = e.next;
+            e.next = null;
+            e.prev = null;
+            e.active = false;
+            e.queue = null;
+            it = next;
+        }
+        self.head = null;
+        self.tail = null;
+        self.ready_mask = 0;
     }
 
     pub fn interests(self: *Queue) EventMask {

@@ -69,11 +69,11 @@ pub const ClusterPool = struct {
     pub fn acquire(self: *ClusterPool) !*Cluster {
         if (self.free_list) |c| {
             self.free_list = c.next;
-            if (self.count > 0) self.count -= 1;
             c.ref_count = 1;
+            c.next = null;
+            self.count -= 1;
             return c;
         }
-
         stats.global_stats.pool.cluster_fallback += 1;
         const c = try self.allocator.create(Cluster);
         c.* = .{
@@ -119,7 +119,11 @@ pub fn Pool(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            std.debug.print("[Pool] {s} deinit count={}\n", .{ @typeName(T), self.free_list.items.len });
             for (self.free_list.items) |node| {
+                if (@hasDecl(T, "deinit")) {
+                    node.deinit();
+                }
                 self.allocator.destroy(node);
             }
             self.free_list.deinit();
@@ -127,31 +131,26 @@ pub fn Pool(comptime T: type) type {
 
         pub fn acquire(self: *Self) !*T {
             if (self.free_list.pop()) |node| {
+                @memset(std.mem.asBytes(node), 0);
                 return node;
             }
-            stats.global_stats.pool.generic_fallback += 1;
+            stats.global_stats.tcp.pool_exhausted += 1;
             const node = try self.allocator.create(T);
             @memset(std.mem.asBytes(node), 0);
             return node;
         }
 
         pub fn release(self: *Self, node: *T) void {
-            if (self.free_list.items.len >= self.capacity) {
-                self.allocator.destroy(node);
-                return;
-            }
             self.free_list.append(node) catch {
+                if (@hasDecl(T, "deinit")) {
+                    node.deinit();
+                }
                 self.allocator.destroy(node);
             };
         }
 
         pub fn tryRelease(self: *Self, node: *T) bool {
-            if (self.free_list.items.len >= self.capacity) {
-                return false;
-            }
-            self.free_list.append(node) catch {
-                return false;
-            };
+            self.release(node);
             return true;
         }
     };
@@ -191,17 +190,15 @@ pub const BufferPool = struct {
 
     pub fn acquire(self: *BufferPool) ![]u8 {
         if (self.free_list.pop()) |buf| {
+            @memset(buf, 0);
             return buf;
         }
-        stats.global_stats.pool.buffer_fallback += 1;
-        return try self.allocator.alloc(u8, self.buffer_size);
+        const buf = try self.allocator.alloc(u8, self.buffer_size);
+        @memset(buf, 0);
+        return buf;
     }
 
     pub fn release(self: *BufferPool, buf: []u8) void {
-        if (self.free_list.items.len >= self.capacity) {
-            self.allocator.free(buf);
-            return;
-        }
         self.free_list.append(buf) catch {
             self.allocator.free(buf);
         };
@@ -396,7 +393,6 @@ pub const VectorisedView = struct {
         for (views) |v| total += v.view.len;
         return .{
             .views = views,
-            .original_views = views,
             .size = total,
         };
     }
@@ -419,7 +415,6 @@ pub const VectorisedView = struct {
         views_buffer[0] = .{ .cluster = null, .view = data };
         return .{
             .views = views_buffer[0..1],
-            .original_views = views_buffer[0..1],
             .size = data.len,
         };
     }
@@ -476,14 +471,16 @@ pub const VectorisedView = struct {
 
     pub fn deinit(self: *VectorisedView) void {
         const total_size = self.size;
-        for (self.views) |cv| {
+        const ov = if (self.original_views.len > 0) self.original_views else self.views;
+        for (ov) |cv| {
             if (cv.cluster) |c| c.release();
         }
-        const ov = self.original_views;
-        if (self.view_pool) |pool| {
-            pool.release(std.mem.sliceAsBytes(ov));
-        } else if (self.allocator) |alloc| {
-            if (ov.len > 0) alloc.free(ov);
+        if (self.original_views.len > 0) {
+            if (self.view_pool) |pool| {
+                pool.release(std.mem.sliceAsBytes(self.original_views));
+            } else if (self.allocator) |alloc| {
+                alloc.free(self.original_views);
+            }
         }
 
         if (self.consumption_callback) |cb| {
@@ -530,7 +527,9 @@ pub const VectorisedView = struct {
 
     pub fn removeFirst(self: *VectorisedView) void {
         if (self.views.len == 0) return;
-        if (self.views[0].cluster) |c| c.release();
+        if (self.original_views.len == 0) {
+            if (self.views[0].cluster) |c| c.release();
+        }
         self.size -= self.views[0].view.len;
         self.views = self.views[1..];
     }

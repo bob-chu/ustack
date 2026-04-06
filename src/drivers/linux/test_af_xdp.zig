@@ -37,6 +37,8 @@ test "AfXdp functional init" {
 
     // This test only works if run as root and veth_test0 exists.
     // We use a guard to skip if not available.
+    std.fs.cwd().access("/sys/class/net/veth_test0", .{}) catch return;
+
     var cp = buffer.ClusterPool.init(allocator);
     defer cp.deinit();
     var xdp = AfXdp.init(allocator, &cp, "veth_test0", 0) catch |err| {
