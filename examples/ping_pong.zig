@@ -363,6 +363,7 @@ const PingClient = struct {
         while (i < concurrency and i < total) : (i += 1) {
             try self.startConnection();
         }
+        global_stack.flush();
     }
 
     pub fn startConnection(self: *PingClient) !void {
@@ -386,6 +387,7 @@ const PingClient = struct {
         };
 
         conn.onEvent();
+        global_stack.flush();
     }
 
     pub fn refill(self: *PingClient) void {
@@ -403,15 +405,17 @@ const PingClient = struct {
         }
 
         if (!reached_limit) {
+            var refill_count: usize = 0;
             while (self.active_conns < self.config.concurrency) {
                 self.startConnection() catch |err| {
                     if (err == tcpip.Error.AddressInUse) break;
                     std.debug.print("startConnection error: {}\n", .{err});
                     break;
                 };
-
+                refill_count += 1;
                 if (self.next_conn_id > total) break;
             }
+            if (refill_count > 0) global_stack.flush();
         } else if (self.active_conns == 0 and !global_mark_done) {
             self.end_time = now;
             const duration_ms = @as(f64, @floatFromInt(self.end_time - self.start_time));
@@ -519,6 +523,7 @@ const PingConnection = struct {
             var p = SimplePayload{ .data = "ping" };
             _ = self.ep.write(p.payloader(), .{}) catch return;
             self.sent = true;
+            global_stack.flush();
         }
 
         var buf = self.ep.read(null) catch |err| {
@@ -540,6 +545,7 @@ const PingConnection = struct {
             defer self.allocator.free(view);
             if (std.mem.eql(u8, view, "pong")) {
                 _ = self.ep.shutdown(0) catch {}; // Shutdown write side
+                global_stack.flush();
             }
         }
     }
@@ -558,6 +564,7 @@ const PingConnection = struct {
             if (std.mem.eql(u8, view, "ping")) {
                 var p = SimplePayload{ .data = "pong" };
                 _ = self.ep.write(p.payloader(), .{}) catch {};
+                global_stack.flush();
             }
         } else {
             self.close();
@@ -572,6 +579,7 @@ const PingConnection = struct {
         self.wait_entry.context = null; // Mark entry as invalid for any pending ready_queue processing
         self.wq.eventUnregister(&self.wait_entry);
         self.ep.close();
+        global_stack.flush();
 
         if (self.config.mode == .client) {
             const client = @as(*PingClient, @ptrCast(@alignCast(self.parent)));
