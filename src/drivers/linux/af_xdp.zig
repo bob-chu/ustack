@@ -137,7 +137,7 @@ pub const AfXdp = struct {
         var fm = try FrameManager.init(allocator, NUM_FRAMES);
         errdefer fm.deinit(allocator);
 
-        var self = AfXdp{
+        var self_xdp = AfXdp{
             .fd = fd,
             .allocator = allocator,
             .mtu_val = 1500,
@@ -157,18 +157,20 @@ pub const AfXdp = struct {
             .rx_map_slice = rx_map,
             .tx_map_slice = tx_map,
         };
+        try self_xdp.view_pool.prewarm(4096);
+        try self_xdp.header_pool.prewarm(4096);
 
         // 8. Populate Fill Ring
-        var prod = self.fill_ring.producer.*;
+        var prod = self_xdp.fill_ring.producer.*;
         for (0..RING_SIZE) |_| {
-            if (self.frame_manager.alloc()) |idx| {
-                self.fill_ring.addr[prod & self.fill_ring.mask] = @as(u64, idx) * FRAME_SIZE;
+            if (self_xdp.frame_manager.alloc()) |idx| {
+                self_xdp.fill_ring.addr[prod & self_xdp.fill_ring.mask] = @as(u64, idx) * FRAME_SIZE;
                 prod += 1;
             }
         }
-        self.fill_ring.producer.* = prod;
+        self_xdp.fill_ring.producer.* = prod;
 
-        return self;
+        return self_xdp;
     }
 
     pub fn deinit(self: *AfXdp) void {
@@ -364,7 +366,7 @@ pub const AfXdp = struct {
         const self = @as(*AfXdp, @ptrCast(@alignCast(ptr)));
         self.dispatcher = dispatcher;
         const nic = @as(*stack.NIC, @ptrCast(@alignCast(dispatcher.ptr)));
-        self.cluster_pool = &nic.stack.cluster_pool;
+        self.cluster_pool = nic.stack.cluster_pool;
     }
 
     fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {

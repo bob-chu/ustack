@@ -49,10 +49,10 @@ pub const NetworkInterface = struct {
         // 1. Init Driver
         switch (cfg.driver) {
             .af_packet => {
-                self.driver = .{ .af_packet = try AfPacket.init(allocator, &s.cluster_pool, cfg.name) };
+                self.driver = .{ .af_packet = try AfPacket.init(allocator, s.cluster_pool, cfg.name) };
             },
             .af_xdp => {
-                self.driver = .{ .af_xdp = try AfXdp.init(allocator, &s.cluster_pool, cfg.name, cfg.queue_id) };
+                self.driver = .{ .af_xdp = try AfXdp.init(allocator, s.cluster_pool, cfg.name, cfg.queue_id) };
             },
             .tap => {
                 self.driver = .{ .tap = try Tap.init(allocator, cfg.name) };

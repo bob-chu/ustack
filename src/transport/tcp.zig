@@ -603,7 +603,7 @@ pub const TCPEndpoint = struct {
         var uio = buffer.Uio.init(&iov);
         // We use toClusters for writeRaw to ensure the data is safely copied
         // since the caller might free payload_raw immediately.
-        const view = try buffer.Uio.toClusters(&uio, &self.stack.cluster_pool, self.stack.allocator);
+        const view = try buffer.Uio.toClusters(&uio, self.stack.cluster_pool, self.stack.allocator);
         var mut_view = view;
         defer mut_view.deinit();
         return self.writeInternal(mut_view);
@@ -1091,6 +1091,7 @@ pub const TCPEndpoint = struct {
 
     pub fn experimentalReset(self: *TCPEndpoint) void {
         if (!self.initialized) return;
+        stats.global_stats.tcp.active_endpoints -= 1;
 
         // Clear timers immediately to stop any timer-driven callbacks
         self.stack.timer_queue.cancel(&self.retransmit_timer);
@@ -1164,10 +1165,7 @@ pub const TCPEndpoint = struct {
     }
 
     fn experimentalDestroy(self: *TCPEndpoint) void {
-        if (self.initialized) {
-            stats.global_stats.tcp.active_endpoints -= 1;
-            self.experimentalReset(); // Drain everything but keep heap resources for reuse
-        }
+        self.experimentalReset(); // Drain everything but keep heap resources for reuse
 
         if (!self.proto.endpoint_pool.tryRelease(self)) {
             self.deinit(); // Free everything including heap resources

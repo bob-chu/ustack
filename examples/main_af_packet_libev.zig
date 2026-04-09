@@ -40,7 +40,7 @@ pub fn main() !void {
     const ip_cidr = args[3];
 
     global_stack = try ustack.init(allocator);
-    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, ifname);
+    global_af_packet = try AfPacket.init(allocator, global_stack.cluster_pool, ifname);
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     try global_stack.createNIC(1, global_eth.linkEndpoint());
 

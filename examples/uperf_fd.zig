@@ -88,7 +88,7 @@ pub fn main() !void {
     }
 
     global_stack = try ustack.init(allocator);
-    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, global_config.interface);
+    global_af_packet = try AfPacket.init(allocator, global_stack.cluster_pool, global_config.interface);
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     global_eth.linkEndpoint().setMTU(global_config.mtu);
     try global_stack.createNIC(1, global_eth.linkEndpoint());

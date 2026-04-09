@@ -48,7 +48,7 @@ pub fn main() !void {
 
     global_stack = try ustack.init(allocator);
     global_stack.tcp_msl = 100; // Set MSL to 100ms for benchmark recycling
-    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
+    global_af_packet = try AfPacket.init(allocator, global_stack.cluster_pool, config.interface);
 
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     global_eth.linkEndpoint().setMTU(config.mtu);
