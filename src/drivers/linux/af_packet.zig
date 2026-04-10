@@ -74,7 +74,7 @@ pub const AfPacket = struct {
         try std.posix.bind(fd, @as(*const std.posix.sockaddr, @ptrCast(&ll_addr)), @sizeOf(std.posix.sockaddr.ll));
         const mac = try getIfMac(fd, dev_name);
 
-        return AfPacket{
+        var self_ap = AfPacket{
             .fd = fd,
             .allocator = allocator,
             .cluster_pool = pool,
@@ -87,6 +87,10 @@ pub const AfPacket = struct {
             .frame_size = frame_size,
             .frame_nr = frame_nr,
         };
+        try self_ap.view_pool.prewarm(131072);
+        try self_ap.header_pool.prewarm(131072);
+
+        return self_ap;
     }
 
     pub fn linkEndpoint(self: *AfPacket) stack.LinkEndpoint {

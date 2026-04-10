@@ -79,7 +79,7 @@ test "TCP 2MSL TIME_WAIT Expiration" {
     var fin = header.TCP.init(fin_buf);
     fin.encode(sa.port, ca.port, 5001, ep_client.snd_nxt, header.TCPFlagFin | header.TCPFlagAck, 65535);
     const r_to_client = stack.Route{ .local_address = ca.addr, .remote_address = sa.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
-    var fin_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fin_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var fin_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fin_buf, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     defer fin_pkt.data.deinit();
 
     ep_client.handlePacket(&r_to_client, id, fin_pkt);
@@ -164,7 +164,7 @@ test "TCP RFC 1337 RST in TIME_WAIT" {
     var rst = header.TCP.init(rst_buf);
     rst.encode(sa.port, ca.port, 5001, ep_client.snd_nxt, header.TCPFlagRst, 65535);
     const r_to_client = stack.Route{ .local_address = ca.addr, .remote_address = sa.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
-    var rst_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(rst_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var rst_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(rst_buf, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     defer rst_pkt.data.deinit();
 
     ep_client.handlePacket(&r_to_client, id, rst_pkt);

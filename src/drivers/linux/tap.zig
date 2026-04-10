@@ -42,12 +42,16 @@ pub const Tap = struct {
         _ = my_set_if_up(name_c);
         _ = my_set_if_addr(name_c, "10.0.0.1");
 
-        return Tap{
+        var self_tap = Tap{
             .fd = fd,
             .allocator = allocator,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 4096),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 4096),
         };
+        self_tap.view_pool.prewarm(4096) catch {};
+        self_tap.header_pool.prewarm(4096) catch {};
+
+        return self_tap;
     }
 
     extern fn my_set_if_up(name: [*:0]const u8) i32;
@@ -56,12 +60,16 @@ pub const Tap = struct {
     /// Initialize from an existing file descriptor.
     /// Useful if the FD is passed from a privileged parent process.
     pub fn initFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) Tap {
-        return Tap{
+        var self_tap = Tap{
             .fd = fd,
             .allocator = allocator,
             .view_pool = buffer.BufferPool.init(allocator, @sizeOf(buffer.ClusterView) * header.MaxViewsPerPacket, 4096),
             .header_pool = buffer.BufferPool.init(allocator, header.ReservedHeaderSize, 4096),
         };
+        self_tap.view_pool.prewarm(4096) catch {};
+        self_tap.header_pool.prewarm(4096) catch {};
+
+        return self_tap;
     }
 
     /// Returns the link endpoint interface to register with the Stack.
@@ -117,7 +125,7 @@ pub const Tap = struct {
         const self = @as(*Tap, @ptrCast(@alignCast(ptr)));
         self.dispatcher = dispatcher;
         const nic = @as(*stack.NIC, @ptrCast(@alignCast(dispatcher.ptr)));
-        self.cluster_pool = &nic.stack.cluster_pool;
+        self.cluster_pool = nic.stack.cluster_pool;
     }
 
     fn linkAddress(ptr: *anyopaque) tcpip.LinkAddress {

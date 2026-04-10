@@ -43,7 +43,7 @@ pub fn main() !void {
 
     global_stack = try ustack.init(allocator);
     global_stack.tcp_msl = 100; // Set MSL to 100ms for benchmark recycling
-    global_af_packet = try AfPacket.init(allocator, &global_stack.cluster_pool, config.interface);
+    global_af_packet = try AfPacket.init(allocator, global_stack.cluster_pool, config.interface);
 
     global_eth = ustack.link.eth.EthernetEndpoint.init(global_af_packet.linkEndpoint(), global_af_packet.address);
     global_eth.linkEndpoint().setMTU(config.mtu);
@@ -200,6 +200,14 @@ fn libev_af_packet_cb(loop: ?*anyopaque, watcher: *c.ev_io, revents: i32) callco
         };
         if (!ok) break;
     }
+
+    if (global_mux) |mux| {
+        const ready = mux.pollReady() catch return;
+        for (ready) |entry| {
+            Socket.dispatch(entry);
+        }
+    }
+
     global_stack.flush();
 }
 
@@ -223,6 +231,13 @@ fn libev_timer_cb(loop: ?*anyopaque, watcher: *c.ev_timer, revents: i32) callcon
         }
         if (global_server) |server| {
             server.report(now);
+        }
+    }
+
+    if (global_mux) |mux| {
+        const ready = mux.pollReady() catch return;
+        for (ready) |entry| {
+            Socket.dispatch(entry);
         }
     }
 
@@ -384,7 +399,6 @@ const PingClient = struct {
 
         // Initial event check
         conn.onEvent(waiter.EventOut);
-        global_stack.flush();
     }
 
     pub fn report(self: *PingClient, now: i64) void {
@@ -426,7 +440,6 @@ const PingClient = struct {
                 refill_count += 1;
                 if (self.next_conn_id > total) break;
             }
-            if (refill_count > 0) global_stack.flush();
         } else if (self.active_conns == 0 and !global_mark_done) {
             const duration_ms = @as(f64, @floatFromInt(now - self.start_time));
             const duration_s = duration_ms / 1000.0;
@@ -499,7 +512,6 @@ const PingConnection = struct {
         if (!self.sent and tcp_ep.state == .established) {
             _ = self.socket.write("ping") catch return;
             self.sent = true;
-            global_stack.flush();
         }
 
         if (events & waiter.EventIn != 0) {
@@ -520,7 +532,6 @@ const PingConnection = struct {
                 defer self.allocator.free(view);
                 if (std.mem.eql(u8, view, "pong")) {
                     _ = self.socket.shutdown(0) catch {};
-                    global_stack.flush();
                 }
             }
         }
@@ -540,7 +551,6 @@ const PingConnection = struct {
                 defer self.allocator.free(view);
                 if (std.mem.eql(u8, view, "ping")) {
                     _ = self.socket.write("pong") catch {};
-                    global_stack.flush();
                 }
             } else {
                 self.close();
@@ -554,7 +564,6 @@ const PingConnection = struct {
         self.pending_cleanup = true;
 
         self.socket.close();
-        global_stack.flush();
 
         if (self.config.mode == .client) {
             const client = @as(*PingClient, @ptrCast(@alignCast(self.parent)));

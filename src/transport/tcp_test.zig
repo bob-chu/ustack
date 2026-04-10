@@ -68,13 +68,13 @@ test "TCP Fast Retransmit" {
     defer ep_client.close();
     try ep_client.endpoint().bind(ca);
     try ep_client.endpoint().connect(sa);
-    const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_syn = syn_pkt;
     defer mut_syn.data.deinit();
     const r_to_server = stack.Route{ .local_address = sa.addr, .remote_address = ca.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
     const id_to_server = stack.TransportEndpointID{ .local_port = 80, .local_address = sa.addr, .remote_port = 1234, .remote_address = ca.addr, .transport_protocol = 6 };
     ep_server.handlePacket(&r_to_server, id_to_server, mut_syn);
-    const syn_ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    const syn_ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(fake_ep.last_pkt.?[20..], allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_syn_ack = syn_ack_pkt;
     defer mut_syn_ack.data.deinit();
     const r_to_client = stack.Route{ .local_address = ca.addr, .remote_address = sa.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
@@ -246,7 +246,7 @@ test "TCP Retransmission" {
     @memset(syn_buf, 0);
     var syn = header.TCP.init(syn_buf);
     syn.encode(ca.port, sa.port, 1000, 0, header.TCPFlagSyn, 65535);
-    const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(syn_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    const syn_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(syn_buf, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_syn = syn_pkt;
     defer mut_syn.data.deinit();
     const r_to_server = stack.Route{ .local_address = sa.addr, .remote_address = ca.addr, .local_link_address = .{ .addr = [_]u8{0} ** 6 }, .net_proto = 0x0800, .nic = nic };
@@ -258,7 +258,7 @@ test "TCP Retransmission" {
     var ack = header.TCP.init(ack_buf);
     const server_initial_seq = header.TCP.init(fake_ep.last_pkt.?[20..]).sequenceNumber();
     ack.encode(ca.port, sa.port, 1001, server_initial_seq +% 1, header.TCPFlagAck, 65535);
-    const ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(ack_buf, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    const ack_pkt = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(ack_buf, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_ack = ack_pkt;
     defer mut_ack.data.deinit();
     ep_server.handlePacket(&r_to_server, id_to_server, mut_ack);
@@ -318,14 +318,14 @@ test "TCP CWND Enforcement" {
     ep.rcv_nxt = 1000;
 
     var data1 = [_]u8{'B'} ** 100;
-    var mut_pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     defer mut_pkt1.data.deinit();
     try ep.insertOOO(2000, mut_pkt1.data);
     try std.testing.expectEqual(@as(usize, 1), ep.ooo_list.len);
     try std.testing.expectEqual(@as(u32, 2000), ep.ooo_list.first.?.data.seq);
 
     var data2 = [_]u8{'A'} ** 100;
-    const pkt2 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data2, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    const pkt2 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data2, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_pkt2 = pkt2;
     const node2 = try tcp_proto.packet_node_pool.acquire();
     node2.data = .{ .data = try mut_pkt2.data.clone(allocator), .seq = 1000 };
@@ -337,7 +337,7 @@ test "TCP CWND Enforcement" {
     try std.testing.expectEqual(@as(u32, 1100), ep.rcv_nxt);
 
     var data3 = [_]u8{'C'} ** 900;
-    const pkt3 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data3, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    const pkt3 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data3, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     var mut_pkt3 = pkt3;
     const node3 = try tcp_proto.packet_node_pool.acquire();
     node3.data = .{ .data = try mut_pkt3.data.clone(allocator), .seq = 1100 };
@@ -368,7 +368,7 @@ test "TCP SACK Blocks Generation" {
     ep.rcv_nxt = 1000;
 
     var data1 = [_]u8{'B'} ** 100;
-    var mut_pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, &s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
+    var mut_pkt1 = tcpip.PacketBuffer{ .data = try buffer.VectorisedView.fromSlice(&data1, allocator, s.cluster_pool), .header = buffer.Prependable.init(&[_]u8{}) };
     defer mut_pkt1.data.deinit();
     try ep.insertOOO(2000, mut_pkt1.data);
     try std.testing.expectEqual(@as(usize, 1), ep.sack_blocks.items.len);
@@ -457,7 +457,7 @@ test "TCP readv/writev zero-copy" {
     // Inject data into rcv_list
     const inject_data = "readv test";
     const node = try tcp_proto.packet_node_pool.acquire();
-    node.data = .{ .data = try buffer.VectorisedView.fromSlice(inject_data, allocator, &s.cluster_pool), .seq = 1000 };
+    node.data = .{ .data = try buffer.VectorisedView.fromSlice(inject_data, allocator, s.cluster_pool), .seq = 1000 };
     ep.rcv_list.append(node);
     ep.rcv_buf_used = inject_data.len;
     ep.rcv_view_count = 1;

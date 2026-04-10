@@ -646,7 +646,7 @@ pub const Stack = struct {
     network_protocols: std.AutoHashMap(tcpip.NetworkProtocolNumber, NetworkProtocol),
     route_table: RouteTable,
     timer_queue: time.TimerQueue,
-    cluster_pool: buffer.ClusterPool,
+    cluster_pool: *buffer.ClusterPool,
     ephemeral_port: u16,
     tcp_msl: u64 = 30000,
     next_nic_id: tcpip.NICID = 1,
@@ -665,7 +665,8 @@ pub const Stack = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
-        var cluster_pool = buffer.ClusterPool.init(allocator);
+        const cluster_pool = try allocator.create(buffer.ClusterPool);
+        cluster_pool.* = buffer.ClusterPool.init(allocator);
         try cluster_pool.prewarm(131072);
         return .{
             .allocator = allocator,
@@ -731,6 +732,7 @@ pub const Stack = struct {
 
         self.route_table.deinit();
         self.cluster_pool.deinit();
+        self.allocator.destroy(self.cluster_pool);
     }
 
     pub fn registerNetworkProtocol(self: *Stack, proto: NetworkProtocol) !void {
